@@ -2,6 +2,8 @@
 
 ## Grafana Mimir - main / unreleased
 
+* [ENHANCEMENT] Querier: Reduce allocations on query stream response unmarshal. #3295
+
 ## 2.5.0
 
 ### Grafana Mimir
