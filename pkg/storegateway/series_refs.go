@@ -755,9 +755,10 @@ func (s *loadingSeriesChunkRefsSetIterator) Next() bool {
 	// This can be released by the caller because loadingSeriesChunkRefsSetIterator doesn't retain it
 	// after Next() will be called again.
 	nextSet := newSeriesChunkRefsSet(len(nextPostings), true)
+	var builder labels.ScratchBuilder
 
 	for _, id := range nextPostings {
-		lset, chks, err := s.loadSeriesForTime(id, loadedSeries, loadStats)
+		lset, chks, err := s.loadSeriesForTime(id, loadedSeries, loadStats, &builder)
 		if err != nil {
 			s.err = errors.Wrap(err, "read series")
 			return false
@@ -800,13 +801,13 @@ func (s *loadingSeriesChunkRefsSetIterator) Err() error {
 	return s.err
 }
 
-func (s *loadingSeriesChunkRefsSetIterator) loadSeriesForTime(ref storage.SeriesRef, loadedSeries *bucketIndexLoadedSeries, stats *queryStats) (labels.Labels, []seriesChunkRef, error) {
+func (s *loadingSeriesChunkRefsSetIterator) loadSeriesForTime(ref storage.SeriesRef, loadedSeries *bucketIndexLoadedSeries, stats *queryStats, builder *labels.ScratchBuilder) (labels.Labels, []seriesChunkRef, error) {
 	ok, err := loadedSeries.unsafeLoadSeriesForTime(ref, &s.symbolizedLsetBuffer, &s.chksBuffer, s.skipChunks, s.minTime, s.maxTime, stats)
 	if !ok || err != nil {
 		return labels.EmptyLabels(), nil, errors.Wrap(err, "inflateSeriesForTime")
 	}
 
-	lset, err := s.indexr.LookupLabelsSymbols(s.symbolizedLsetBuffer)
+	lset, err := s.indexr.LookupLabelsSymbols(s.symbolizedLsetBuffer, builder)
 	if err != nil {
 		return labels.EmptyLabels(), nil, errors.Wrap(err, "lookup labels symbols")
 	}
