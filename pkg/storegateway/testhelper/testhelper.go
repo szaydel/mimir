@@ -18,8 +18,10 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/tsdb/chunks"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/grafana/mimir/pkg/storage/sharding"
 	"github.com/grafana/mimir/pkg/storage/tsdb/metadata"
 )
 
@@ -87,7 +89,7 @@ func CreateBlock(
 	if err := g.Wait(); err != nil {
 		return id, err
 	}
-	c, err := tsdb.NewLeveledCompactor(ctx, nil, log.NewNopLogger(), []int64{maxt - mint}, nil, nil, true)
+	c, err := tsdb.NewLeveledCompactorWithChunkSize(ctx, nil, log.NewNopLogger(), []int64{maxt - mint}, nil, chunks.DefaultChunkSegmentSize, nil, true, sharding.ShardFunc)
 	if err != nil {
 		return id, errors.Wrap(err, "create compactor")
 	}
