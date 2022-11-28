@@ -2097,7 +2097,7 @@ receivers:
 
 func TestMultitenantAlertmanager_computeFallbackConfig(t *testing.T) {
 	// If no fallback config is set, it should return a valid empty config.
-	fallbackConfig, err := computeFallbackConfig("")
+	fallbackConfig, err := ComputeFallbackConfig("")
 	require.NoError(t, err)
 
 	_, err = amconfig.Load(string(fallbackConfig))
@@ -2109,7 +2109,7 @@ func TestMultitenantAlertmanager_computeFallbackConfig(t *testing.T) {
 	err = os.WriteFile(configFile, []byte(simpleConfigOne), 0664)
 	assert.NoError(t, err)
 
-	fallbackConfig, err = computeFallbackConfig(configFile)
+	fallbackConfig, err = ComputeFallbackConfig(configFile)
 	require.NoError(t, err)
 	require.Equal(t, simpleConfigOne, string(fallbackConfig))
 }
