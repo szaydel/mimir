@@ -263,12 +263,11 @@ func CopyTimeSeriesChunk(ts TimeSeriesChunk) TimeSeriesChunk {
 	copy(lbs, ts.Labels)
 
 	chunks := make([]Chunk, len(ts.Chunks))
-	for j := 0; j < len(ts.Chunks); j++ {
-		chunks[j].Encoding = ts.Chunks[j].Encoding
-		chunks[j].StartTimestampMs = ts.Chunks[j].StartTimestampMs
-		chunks[j].EndTimestampMs = ts.Chunks[j].EndTimestampMs
-		chunks[j].Data = make([]byte, len(ts.Chunks[j].Data))
-		copy(chunks[j].Data, ts.Chunks[j].Data)
+	copy(chunks, ts.Chunks)
+
+	for i := 0; i < len(ts.Chunks); i++ {
+		chunks[i].Data = make([]byte, len(ts.Chunks[i].Data))
+		copy(chunks[i].Data, ts.Chunks[i].Data)
 	}
 	return TimeSeriesChunk{
 		FromIngesterId: ts.FromIngesterId,

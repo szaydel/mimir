@@ -4497,7 +4497,7 @@ func TestDistributor_QueryStreamCorrectness(t *testing.T) {
 		maxSamplesPerSeries  = 480 // 2 hours at 1 sample every 15 seconds.
 	)
 
-	orgID := "user"
+	const orgID = "user"
 	ctx := user.InjectOrgID(context.Background(), orgID)
 
 	// Prepare matchers sets and series.
@@ -4517,7 +4517,7 @@ func TestDistributor_QueryStreamCorrectness(t *testing.T) {
 			},
 		}
 		totalSamples := rand.Int31n(maxSamplesPerSeries)
-		now := time.Now().Add(time.Hour * 2 * -1)
+		now := time.Now().Add(-2 * time.Hour)
 
 		for j := int32(0); j < totalSamples; j++ {
 			ss.Samples = append(ss.Samples, mimirpb.Sample{
@@ -4547,7 +4547,8 @@ func TestDistributor_QueryStreamCorrectness(t *testing.T) {
 	wg := sync.WaitGroup{}
 	wg.Add(totalQueries)
 
-	// Run total queries concurrently asking for all possible series.
+	// Run total queries concurrently asking for all possible series
+	// to validate that nothing messes up when querying multiple ingesters.
 	type queryResult struct {
 		seriesIdx int
 		resp      *client.QueryStreamResponse
