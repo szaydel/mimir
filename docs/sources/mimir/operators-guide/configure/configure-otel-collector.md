@@ -102,3 +102,25 @@ service:
       processors: [...]
       exporters: [..., otlphttp]
 ```
+
+## Format considerations
+
+We currently follow the official specification described here: [OTLP Metric points to Prometheus](https://opentelemetry.io/docs/reference/specification/metrics/data-model/#otlp-metric-points-to-prometheus).
+
+The following sections describe common issues you might experience.
+
+#### Dots (.) are converted to _
+
+Because Prometheus metrics don't support `.` and `-` in metric or label names, they are converted to `_` in Prometheus.
+
+For example:
+
+`requests.duration{http.status_code=500, cloud.region=us-central1}` in OTLP becomes `requests_duration{http_status_code=”500”, cloud_region=”us-central1”}` in Prometheus.
+
+#### Resource attributes are added to `target_info` metric
+
+As described in the [Resource Attributes](https://opentelemetry.io/docs/reference/specification/metrics/data-model/#resource-attributes-1) specification, we add resource attributes to a special `target_info` metric.
+
+However, `<service.namespace>/<service.name>` or `<service.name>` (if namespace is empty), is added as `job` label and
+`service.instance.id` is added as `instance` label to every metric.
+
