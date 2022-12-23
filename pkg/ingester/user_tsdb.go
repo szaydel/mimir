@@ -85,8 +85,9 @@ type userTSDB struct {
 	ingestedRuleSamples *util_math.EwmaRate
 
 	// Cached shipped blocks.
-	shippedBlocksMtx sync.Mutex
-	shippedBlocks    map[ulid.ULID]time.Time
+	shippedBlocksMtx  sync.Mutex
+	shippedBlocks     map[ulid.ULID]time.Time
+	blockMinRetention time.Duration
 }
 
 // Explicitly wrapping the tsdb.DB functions that we use.
@@ -245,9 +246,11 @@ func (u *userTSDB) blocksToDelete(blocks []*tsdb.Block) map[ulid.ULID]struct{} {
 	shippedBlocks := u.getCachedShippedBlocks()
 
 	result := map[ulid.ULID]struct{}{}
-	for shippedID := range shippedBlocks {
-		if _, ok := deletable[shippedID]; ok {
-			result[shippedID] = struct{}{}
+	for blockID, blockShippedTime := range shippedBlocks {
+		if blockShippedTime.Before(time.Now().Add(-u.blockMinRetention)) {
+			if _, ok := deletable[blockID]; ok {
+				result[blockID] = struct{}{}
+			}
 		}
 	}
 	return result
