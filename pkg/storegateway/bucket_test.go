@@ -41,7 +41,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/encoding"
 	"github.com/prometheus/prometheus/tsdb/hashcache"
-	"github.com/prometheus/prometheus/tsdb/wal"
+	"github.com/prometheus/prometheus/tsdb/wlog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
@@ -694,7 +694,7 @@ func TestBucketIndexReader_ExpandedPostings(t *testing.T) {
 	})
 }
 
-func newInMemoryIndexCache(t *testing.T) indexcache.IndexCache {
+func newInMemoryIndexCache(t testing.TB) indexcache.IndexCache {
 	cache, err := indexcache.NewInMemoryIndexCacheWithConfig(log.NewNopLogger(), nil, indexcache.DefaultInMemoryIndexCacheConfig)
 	require.NoError(t, err)
 	return cache
@@ -1045,6 +1045,12 @@ func benchBucketSeries(t test.TB, skipChunk bool, samplesPerSeries, totalSeries 
 	runTestWithStore := func(t test.TB, st *BucketStore) {
 		if !t.IsBenchmark() {
 			st.chunkPool = &trackedBytesPool{parent: st.chunkPool}
+
+			// Reset the memory pool tracker (only if streaming store-gateway is enabled).
+			if st.maxSeriesPerBatch > 0 {
+				seriesEntrySlicePool.(*pool.TrackedPool).Reset()
+				seriesChunksSlicePool.(*pool.TrackedPool).Reset()
+			}
 		}
 
 		assert.NoError(t, st.SyncBlocks(context.Background()))
@@ -1083,9 +1089,17 @@ func benchBucketSeries(t test.TB, skipChunk bool, samplesPerSeries, totalSeries 
 
 		if !t.IsBenchmark() {
 			if !skipChunk {
-				// TODO(bwplotka): This is wrong negative for large number of samples (1mln). Investigate.
-				assert.Equal(t, 0, int(st.chunkPool.(*trackedBytesPool).balance.Load()))
+				assert.Zero(t, st.chunkPool.(*trackedBytesPool).balance.Load())
 				st.chunkPool.(*trackedBytesPool).gets.Store(0)
+
+				// Only if streaming store-gateway is enabled.
+				if st.maxSeriesPerBatch > 0 {
+					assert.Zero(t, seriesEntrySlicePool.(*pool.TrackedPool).Balance.Load())
+					assert.Zero(t, seriesChunksSlicePool.(*pool.TrackedPool).Balance.Load())
+
+					assert.Greater(t, int(seriesEntrySlicePool.(*pool.TrackedPool).Gets.Load()), 0)
+					assert.Greater(t, int(seriesChunksSlicePool.(*pool.TrackedPool).Gets.Load()), 0)
+				}
 			}
 
 			for _, b := range st.blocks {
@@ -1096,9 +1110,10 @@ func benchBucketSeries(t test.TB, skipChunk bool, samplesPerSeries, totalSeries 
 	}
 
 	for testName, bucketStoreOpts := range map[string][]BucketStoreOption{
-		"with default options":                  {WithLogger(logger), WithChunkPool(chunkPool)},
-		"with series streaming (1K per batch)":  {WithLogger(logger), WithChunkPool(chunkPool), WithStreamingSeriesPerBatch(1000)},
-		"with series streaming (10K per batch)": {WithLogger(logger), WithChunkPool(chunkPool), WithStreamingSeriesPerBatch(10000)},
+		"with default options":                                 {WithLogger(logger), WithChunkPool(chunkPool)},
+		"with series streaming (1K per batch)":                 {WithLogger(logger), WithChunkPool(chunkPool), WithStreamingSeriesPerBatch(1000)},
+		"with series streaming (10K per batch)":                {WithLogger(logger), WithChunkPool(chunkPool), WithStreamingSeriesPerBatch(10000)},
+		"with series streaming and index cache (1K per batch)": {WithLogger(logger), WithChunkPool(chunkPool), WithStreamingSeriesPerBatch(10000), WithIndexCache(newInMemoryIndexCache(t))},
 	} {
 		st, err := NewBucketStore(
 			"test",
@@ -1213,7 +1228,7 @@ func TestBucket_Series_Concurrency(t *testing.T) {
 	for _, batchSize := range []int{len(expectedSeries) / 100, len(expectedSeries) * 2} {
 		t.Run(fmt.Sprintf("batch size: %d", batchSize), func(t *testing.T) {
 			// Reset the memory pool tracker.
-			seriesChunkRefsSetPool.(*trackedPool).reset()
+			seriesChunkRefsSetPool.(*pool.TrackedPool).Reset()
 
 			metaFetcher, err := block.NewRawMetaFetcher(logger, instrumentedBucket)
 			assert.NoError(t, err)
@@ -1267,8 +1282,8 @@ func TestBucket_Series_Concurrency(t *testing.T) {
 
 			// Ensure the seriesChunkRefsSet memory pool has been used and all slices pulled from
 			// pool have put back.
-			assert.Greater(t, seriesChunkRefsSetPool.(*trackedPool).gets.Load(), int64(0))
-			assert.Equal(t, int64(0), seriesChunkRefsSetPool.(*trackedPool).balance.Load())
+			assert.Greater(t, seriesChunkRefsSetPool.(*pool.TrackedPool).Gets.Load(), int64(0))
+			assert.Equal(t, int64(0), seriesChunkRefsSetPool.(*pool.TrackedPool).Balance.Load())
 		})
 	}
 }
@@ -1292,28 +1307,6 @@ func (m *trackedBytesPool) Get(sz int) (*[]byte, error) {
 func (m *trackedBytesPool) Put(b *[]byte) {
 	m.balance.Sub(uint64(cap(*b)))
 	m.parent.Put(b)
-}
-
-type trackedPool struct {
-	parent  pool.Interface
-	balance atomic.Int64
-	gets    atomic.Int64
-}
-
-func (p *trackedPool) Get() any {
-	p.balance.Inc()
-	p.gets.Inc()
-	return p.parent.Get()
-}
-
-func (p *trackedPool) Put(x any) {
-	p.balance.Dec()
-	p.parent.Put(x)
-}
-
-func (p *trackedPool) reset() {
-	p.balance.Store(0)
-	p.gets.Store(0)
 }
 
 // Regression test against: https://github.com/thanos-io/thanos/issues/2147.
@@ -2386,10 +2379,10 @@ func createHeadWithSeries(t testing.TB, j int, opts headGenOptions) (*tsdb.Head,
 		opts.TSDBDir,
 	)
 
-	var w *wal.WAL
+	var w *wlog.WL
 	var err error
 	if opts.WithWAL {
-		w, err = wal.New(nil, nil, filepath.Join(opts.TSDBDir, "wal"), true)
+		w, err = wlog.New(nil, nil, filepath.Join(opts.TSDBDir, "wal"), true)
 		assert.NoError(t, err)
 	} else {
 		assert.NoError(t, os.MkdirAll(filepath.Join(opts.TSDBDir, "wal"), os.ModePerm))
