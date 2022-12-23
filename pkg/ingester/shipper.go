@@ -101,7 +101,7 @@ func NewShipper(
 //
 // It is not concurrency-safe, however it is compactor-safe (running concurrently with compactor is ok).
 func (s *Shipper) Sync(ctx context.Context) (uploaded int, err error) {
-	meta, err := readShipperMetaFile(s.dir)
+	meta, err := readThanosShipperMetaFile(s.dir)
 	if err != nil {
 		// If we encounter any error, proceed with an empty meta file and overwrite it later.
 		// The meta file is only used to avoid unnecessary bucket.Exists call,
@@ -109,7 +109,7 @@ func (s *Shipper) Sync(ctx context.Context) (uploaded int, err error) {
 		if !os.IsNotExist(err) {
 			level.Warn(s.logger).Log("msg", "reading meta file failed, will override it", "err", err)
 		}
-		meta = &shipperMeta{Version: shipperMetaVersion1}
+		meta = &thanosShipperMeta{Version: shipperMetaVersion1}
 	}
 
 	// Build a map of blocks we already uploaded.
@@ -169,7 +169,7 @@ func (s *Shipper) Sync(ctx context.Context) (uploaded int, err error) {
 		s.metrics.uploads.Inc()
 		s.metrics.lastSuccessfulUploadTime.SetToCurrentTime()
 	}
-	if err := writeShipperMetaFile(s.logger, s.dir, meta); err != nil {
+	if err := writeThanosShipperMetaFile(s.logger, s.dir, meta); err != nil {
 		level.Warn(s.logger).Log("msg", "updating meta file failed", "err", err)
 	}
 
@@ -234,10 +234,10 @@ func (s *Shipper) blockMetasFromOldest() (metas []*metadata.Meta, _ error) {
 }
 
 func readShippedBlocks(dir string) (map[ulid.ULID]struct{}, error) {
-	meta, err := readShipperMetaFile(dir)
+	meta, err := readThanosShipperMetaFile(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		// If the meta file doesn't exist it means the shipper hasn't run yet.
-		meta = &shipperMeta{}
+		meta = &thanosShipperMeta{}
 	} else if err != nil {
 		return nil, err
 	}
@@ -251,24 +251,24 @@ func readShippedBlocks(dir string) (map[ulid.ULID]struct{}, error) {
 	return shippedBlocks, nil
 }
 
-// shipperMeta defines the format thanos.shipper.json file that the shipper places in the data directory.
-type shipperMeta struct {
+// thanosShipperMeta defines the format thanos.shipper.json file that the shipper places in the data directory.
+type thanosShipperMeta struct {
 	Version  int         `json:"version"`
 	Uploaded []ulid.ULID `json:"uploaded"`
 }
 
 const (
-	// shipperMetaFilename is the known JSON filename for meta information.
-	shipperMetaFilename = "thanos.shipper.json"
+	// thanosShipperMetaFilename is the known JSON filename for meta information.
+	thanosShipperMetaFilename = "thanos.shipper.json"
 
 	// shipperMetaVersion1 represents 1 version of meta.
 	shipperMetaVersion1 = 1
 )
 
-// writeShipperMetaFile writes the given meta into <dir>/thanos.shipper.json.
-func writeShipperMetaFile(logger log.Logger, dir string, meta *shipperMeta) error {
-	// Make any changes to the file appear atomic.
-	path := filepath.Join(dir, shipperMetaFilename)
+// writeThanosShipperMetaFile writes the given meta into <dir>/thanos.shipper.json.
+func writeThanosShipperMetaFile(logger log.Logger, dir string, meta *thanosShipperMeta) error {
+
+	path := filepath.Join(dir, thanosShipperMetaFilename)
 	tmp := path + ".tmp"
 
 	f, err := os.Create(tmp)
@@ -289,15 +289,15 @@ func writeShipperMetaFile(logger log.Logger, dir string, meta *shipperMeta) erro
 	return renameFile(logger, tmp, path)
 }
 
-// readShipperMetaFile reads the given meta from <dir>/thanos.shipper.json.
-func readShipperMetaFile(dir string) (*shipperMeta, error) {
-	fpath := filepath.Join(dir, filepath.Clean(shipperMetaFilename))
+// readThanosShipperMetaFile reads the given meta from <dir>/thanos.shipper.json.
+func readThanosShipperMetaFile(dir string) (*thanosShipperMeta, error) {
+	fpath := filepath.Join(dir, filepath.Clean(thanosShipperMetaFilename))
 	b, err := os.ReadFile(fpath)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to read %s", fpath)
 	}
 
-	var m shipperMeta
+	var m thanosShipperMeta
 	if err := json.Unmarshal(b, &m); err != nil {
 		return nil, errors.Wrapf(err, "failed to parse %s as JSON: %q", fpath, string(b))
 	}

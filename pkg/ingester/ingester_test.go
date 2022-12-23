@@ -3263,7 +3263,7 @@ func TestIngester_closeAndDeleteUserTSDBIfIdle_shouldNotCloseTSDBIfShippingIsInP
 
 	// Mock the shipper meta (no blocks).
 	db := i.getTSDB(userID)
-	require.NoError(t, writeShipperMetaFile(log.NewNopLogger(), db.db.Dir(), &shipperMeta{
+	require.NoError(t, writeThanosShipperMetaFile(log.NewNopLogger(), db.db.Dir(), &thanosShipperMeta{
 		Version: shipperMetaVersion1,
 	}))
 
@@ -4182,7 +4182,7 @@ func TestIngesterNotDeleteUnshippedBlocks(t *testing.T) {
 	`, oldBlocks[0].Meta().ULID.Time()/1000)), "cortex_ingester_oldest_unshipped_block_timestamp_seconds"))
 
 	// Saying that we have shipped the second block, so only that should get deleted.
-	require.Nil(t, writeShipperMetaFile(nil, db.db.Dir(), &shipperMeta{
+	require.Nil(t, writeThanosShipperMetaFile(nil, db.db.Dir(), &thanosShipperMeta{
 		Version:  shipperMetaVersion1,
 		Uploaded: []ulid.ULID{oldBlocks[1].Meta().ULID},
 	}))
@@ -4210,7 +4210,7 @@ func TestIngesterNotDeleteUnshippedBlocks(t *testing.T) {
 	`, newBlocks[0].Meta().ULID.Time()/1000)), "cortex_ingester_oldest_unshipped_block_timestamp_seconds"))
 
 	// Shipping 2 more blocks, hence all the blocks from first round.
-	require.Nil(t, writeShipperMetaFile(nil, db.db.Dir(), &shipperMeta{
+	require.Nil(t, writeThanosShipperMetaFile(nil, db.db.Dir(), &thanosShipperMeta{
 		Version:  shipperMetaVersion1,
 		Uploaded: []ulid.ULID{oldBlocks[1].Meta().ULID, newBlocks[0].Meta().ULID, newBlocks[1].Meta().ULID},
 	}))
