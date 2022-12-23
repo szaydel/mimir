@@ -86,7 +86,7 @@ type userTSDB struct {
 
 	// Cached shipped blocks.
 	shippedBlocksMtx sync.Mutex
-	shippedBlocks    map[ulid.ULID]struct{}
+	shippedBlocks    map[ulid.ULID]time.Time
 }
 
 // Explicitly wrapping the tsdb.DB functions that we use.
@@ -269,7 +269,7 @@ func (u *userTSDB) updateCachedShippedBlocks() error {
 }
 
 // getCachedShippedBlocks returns the cached shipped blocks.
-func (u *userTSDB) getCachedShippedBlocks() map[ulid.ULID]struct{} {
+func (u *userTSDB) getCachedShippedBlocks() map[ulid.ULID]time.Time {
 	u.shippedBlocksMtx.Lock()
 	defer u.shippedBlocksMtx.Unlock()
 
