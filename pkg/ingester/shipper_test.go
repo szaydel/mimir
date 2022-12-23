@@ -300,7 +300,7 @@ func TestShipperAddsSegmentFiles(t *testing.T) {
 	require.Equal(t, []string{segmentFile}, meta.Thanos.SegmentFiles)
 }
 
-func TestReadMetaFile(t *testing.T) {
+func TestReadThanosMetaFile(t *testing.T) {
 	t.Run("Missing meta file", func(t *testing.T) {
 		// Create TSDB directory without meta file
 		dpath := t.TempDir()

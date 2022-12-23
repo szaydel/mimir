@@ -246,8 +246,9 @@ func (u *userTSDB) blocksToDelete(blocks []*tsdb.Block) map[ulid.ULID]struct{} {
 	shippedBlocks := u.getCachedShippedBlocks()
 
 	result := map[ulid.ULID]struct{}{}
+	deadline := time.Now().Add(-u.blockMinRetention)
 	for blockID, blockShippedTime := range shippedBlocks {
-		if blockShippedTime.Before(time.Now().Add(-u.blockMinRetention)) {
+		if blockShippedTime.Before(deadline) {
 			if _, ok := deletable[blockID]; ok {
 				result[blockID] = struct{}{}
 			}
