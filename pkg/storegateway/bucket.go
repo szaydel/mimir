@@ -62,7 +62,10 @@ const (
 	// because you barely get any improvements in compression when the number of samples is beyond this.
 	// Take a look at Figure 6 in this whitepaper http://www.vldb.org/pvldb/vol8/p1816-teller.pdf.
 	MaxSamplesPerChunk = 120
-	maxSeriesSize      = 64 * 1024
+	// TODO assume block size 24h; 100 labels per series; scrape interval of 5s;
+	// 		the size of the series is 8 (for seris len) + 100*2*8 (for labels symbols) + 144*8*3 (for chunk min/max/ref) + 8 (for num chunks) + 4 (CRC)
+	// 		which gives up to 5076B per series, not 64K
+	maxSeriesSize = 64 * 1024
 	// Relatively large in order to reduce memory waste, yet small enough to avoid excessive allocations.
 	chunkBytesPoolMinSize = 64 * 1024        // 64 KiB
 	chunkBytesPoolMaxSize = 64 * 1024 * 1024 // 64 MiB

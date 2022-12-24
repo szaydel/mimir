@@ -333,6 +333,9 @@ func (c *loadingSeriesChunksSetIterator) Next() (retHasNext bool) {
 		nextSet.series[i].chks = nextSet.newSeriesAggrChunkSlice(len(s.chunks))
 
 		for j, chunk := range s.chunks {
+			// TODO since each series will now have groups of chunks instead of individual chunks,
+			// 		first check the cache for each group; if we have a cache miss, then use the chunkReaders (and their partitioner)
+			//		to fetch them from the bucket
 			nextSet.series[i].chks[j].MinTime = chunk.minTime
 			nextSet.series[i].chks[j].MaxTime = chunk.maxTime
 

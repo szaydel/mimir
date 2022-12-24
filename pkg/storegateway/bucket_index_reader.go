@@ -480,6 +480,7 @@ func (r *bucketIndexReader) preloadSeries(ctx context.Context, ids []storage.Ser
 	}
 
 	parts := r.block.partitioner.Partition(len(ids), func(i int) (start, end uint64) {
+		// TODO fetch uint64(ids[i] + maxSeriesSize*2), so we can see the offset of the first chunk of the next series
 		return uint64(ids[i]), uint64(ids[i] + maxSeriesSize)
 	})
 	g, ctx := errgroup.WithContext(ctx)
@@ -528,6 +529,7 @@ func (r *bucketIndexReader) loadSeries(ctx context.Context, ids []storage.Series
 			// Fetch plus to get the size of next one if exists.
 			return r.loadSeries(ctx, ids[i:], true, uint64(id), uint64(id)+uint64(n+int(l)+1), loaded, stats)
 		}
+		// TODO also include the next series here so we can get the offset of the next chunk (so we know exactly how long our chunks are in the bucket)
 		c = c[n : n+int(l)]
 
 		loaded.addSeries(id, c)
@@ -589,6 +591,7 @@ func (l *bucketIndexLoadedSeries) addSeries(ref storage.SeriesRef, data []byte) 
 // Error is returned on decoding error or if the reference does not resolve to a known series.
 //
 // It's NOT safe to call this function concurrently with addSeries().
+// TODO add another method which returns the chunk refs of this series + the first chunk refs of the next series. The bytes for the next series should have already been fetched from the bucket and included in the stored bytes in the series map; we just need to keep reading form the slice, discarding the symbolized labels and reading only the chunk ref.
 func (l *bucketIndexLoadedSeries) unsafeLoadSeriesForTime(ref storage.SeriesRef, lset *[]symbolizedLabel, chks *[]chunks.Meta, skipChunks bool, mint, maxt int64, stats *queryStats) (ok bool, err error) {
 	b, ok := l.series[ref]
 	if !ok {

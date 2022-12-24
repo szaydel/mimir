@@ -103,7 +103,8 @@ func (b seriesChunkRefsSet) release() {
 
 // seriesChunkRefs holds a series with a list of chunk references.
 type seriesChunkRefs struct {
-	lset   labels.Labels
+	lset labels.Labels
+	// TODO use chunk groups instead of chunks here
 	chunks []seriesChunkRef
 }
 
@@ -404,6 +405,9 @@ func (s *mergedSeriesChunkRefsSet) nextUniqueEntry(a, b *seriesChunkRefsIterator
 	toReturn.chunks = make([]seriesChunkRef, 0, len(chksA)+len(chksB))
 
 	bChunksOffset := 0
+	// TODO if we have to be working with chunk ref groups, then we may not be able to merge them as fine-grained as that.
+	// 		This is perfectly ok since the querier will first sort the chunks by min time and then start merging the samples from them.
+	//		see implementation of blockQuerierSeriesSet
 Outer:
 	for aChunksOffset := range chksA {
 		for {
@@ -757,6 +761,8 @@ func (s *loadingSeriesChunkRefsSetIterator) Next() bool {
 	nextSet := newSeriesChunkRefsSet(len(nextPostings), true)
 
 	for _, id := range nextPostings {
+		// TODO After receiving the length of each chunk, group them into chunk groups of 16K size each;
+		//		These groups will be used as a unit to store in the cache and to fetch form the bucket.
 		lset, chks, err := s.loadSeriesForTime(id, loadedSeries, loadStats)
 		if err != nil {
 			s.err = errors.Wrap(err, "read series")
@@ -801,6 +807,15 @@ func (s *loadingSeriesChunkRefsSetIterator) Err() error {
 }
 
 func (s *loadingSeriesChunkRefsSetIterator) loadSeriesForTime(ref storage.SeriesRef, loadedSeries *bucketIndexLoadedSeries, stats *queryStats) (labels.Labels, []seriesChunkRef, error) {
+	// TODO call another method which returns the chunk ref of the next series as well;
+	// 		then use that next chunk ref to infer the size of the last chunk in our chunk refs;
+	//		if we do not have the chunk ref of the next series
+	// 		(for example because the labels of that series were too long and what we overfetched wasn't enough)
+	// 		then we can make an estimation for the len of our last chunk
+	// 		┌───────────────┬───────────────────┬──────────────┬────────────────┐
+	// 		| len <uvarint> │ encoding <1 byte> │ data <bytes> │ CRC32 <4 byte> │
+	// 		└───────────────┴───────────────────┴──────────────┴────────────────┘
+	//		- 120 samples * 1.5B each = 180B will be the length of our next chunk; +8+1+4 for miscellaneous = 193B
 	ok, err := loadedSeries.unsafeLoadSeriesForTime(ref, &s.symbolizedLsetBuffer, &s.chksBuffer, s.skipChunks, s.minTime, s.maxTime, stats)
 	if !ok || err != nil {
 		return labels.EmptyLabels(), nil, errors.Wrap(err, "inflateSeriesForTime")
