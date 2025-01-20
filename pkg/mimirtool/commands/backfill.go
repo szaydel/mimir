@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/sirupsen/logrus"
-	"gopkg.in/alecthomas/kingpin.v2"
 
 	"github.com/grafana/mimir/pkg/mimirtool/client"
 )
@@ -54,20 +54,25 @@ func (c *BackfillCommand) Register(app *kingpin.Application, envVars EnvVarNames
 		StringVar(&c.clientConfig.Address)
 
 	cmd.Flag("user",
-		fmt.Sprintf("API user to use when contacting Grafana Mimir; alternatively, set %s. If empty, %s is used instead.", envVars.APIUser, envVars.TenantID)).
+		fmt.Sprintf("Basic auth username to use when contacting Grafana Mimir; alternatively, set %s. If empty, %s is used instead.", envVars.APIUser, envVars.TenantID)).
 		Default("").
 		Envar(envVars.APIUser).
 		StringVar(&c.clientConfig.User)
 
-	cmd.Flag("id", "Grafana Mimir tenant ID; alternatively, set "+envVars.TenantID+".").
+	cmd.Flag("id", "Grafana Mimir tenant ID. Used for X-Scope-OrgID HTTP header. Also used for basic auth if --user is not provided. Alternatively, set "+envVars.TenantID+".").
 		Envar(envVars.TenantID).
 		Required().
 		StringVar(&c.clientConfig.ID)
 
-	cmd.Flag("key", "API key to use when contacting Grafana Mimir; alternatively, set "+envVars.APIKey+".").
+	cmd.Flag("key", "Basic auth password to use when contacting Grafana Mimir; alternatively, set "+envVars.APIKey+".").
 		Default("").
 		Envar(envVars.APIKey).
 		StringVar(&c.clientConfig.Key)
+
+	c.clientConfig.ExtraHeaders = map[string]string{}
+	cmd.Flag("extra-headers", "Extra headers to add to the requests in header=value format, alternatively set newline separated "+envVars.ExtraHeaders+".").
+		Envar(envVars.ExtraHeaders).
+		StringMapVar(&c.clientConfig.ExtraHeaders)
 
 	cmd.Flag("tls-ca-path", "TLS CA certificate to verify Grafana Mimir API as part of mTLS; alternatively, set "+envVars.TLSCAPath+".").
 		Default("").
@@ -94,7 +99,7 @@ func (c *BackfillCommand) Register(app *kingpin.Application, envVars EnvVarNames
 		DurationVar(&c.sleepTime)
 }
 
-func (c *BackfillCommand) backfill(k *kingpin.ParseContext) error {
+func (c *BackfillCommand) backfill(_ *kingpin.ParseContext) error {
 	logrus.WithFields(logrus.Fields{
 		"blocks": c.blocks.String(),
 		"user":   c.clientConfig.ID,

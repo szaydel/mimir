@@ -39,7 +39,7 @@ func (f *subtreeFolder) MapExpr(expr parser.Expr) (mapped parser.Expr, finished 
 
 	// Change the expr if it contains vector selectors, as only those need to be embedded.
 	if hasVectorSelector {
-		expr, err := vectorSquasher(expr)
+		expr, err := VectorSquasher(NewEmbeddedQuery(expr.String(), nil))
 		return expr, true, err
 	}
 	return expr, false, nil
@@ -91,7 +91,7 @@ type visitor struct {
 }
 
 // Visit implements parser.Visitor
-func (v *visitor) Visit(node parser.Node, path []parser.Node) (parser.Visitor, error) {
+func (v *visitor) Visit(node parser.Node, _ []parser.Node) (parser.Visitor, error) {
 	// if the visitor has already seen a predicate success, don't overwrite
 	if v.result {
 		return nil, nil

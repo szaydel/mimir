@@ -32,6 +32,10 @@ func NewDelayedBucketClient(wrapped objstore.Bucket, minDelay, maxDelay time.Dur
 	}
 }
 
+func (m *DelayedBucketClient) Provider() objstore.ObjProvider {
+	return m.wrapped.Provider()
+}
+
 func (m *DelayedBucketClient) Upload(ctx context.Context, name string, r io.Reader) error {
 	m.delay()
 	defer m.delay()
@@ -57,6 +61,20 @@ func (m *DelayedBucketClient) Iter(ctx context.Context, dir string, f func(strin
 	return m.wrapped.Iter(ctx, dir, f, options...)
 }
 
+func (m *DelayedBucketClient) IterWithAttributes(ctx context.Context, dir string, f func(attrs objstore.IterObjectAttributes) error, options ...objstore.IterOption) error {
+	m.delay()
+	defer m.delay()
+
+	return m.wrapped.IterWithAttributes(ctx, dir, f, options...)
+}
+
+func (m *DelayedBucketClient) SupportedIterOptions() []objstore.IterOptionType {
+	m.delay()
+	defer m.delay()
+
+	return m.wrapped.SupportedIterOptions()
+}
+
 func (m *DelayedBucketClient) Get(ctx context.Context, name string) (io.ReadCloser, error) {
 	m.delay()
 	defer m.delay()
@@ -79,6 +97,10 @@ func (m *DelayedBucketClient) Exists(ctx context.Context, name string) (bool, er
 
 func (m *DelayedBucketClient) IsObjNotFoundErr(err error) bool {
 	return m.wrapped.IsObjNotFoundErr(err)
+}
+
+func (m *DelayedBucketClient) IsAccessDeniedErr(err error) bool {
+	return m.wrapped.IsAccessDeniedErr(err)
 }
 
 func (m *DelayedBucketClient) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {

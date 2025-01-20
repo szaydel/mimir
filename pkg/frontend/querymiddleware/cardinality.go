@@ -34,23 +34,23 @@ const (
 	cacheErrorToleranceFraction = 0.1
 )
 
-// cardinalityEstimation is a Handler that caches estimates for a query's
+// cardinalityEstimation is a MetricsQueryHandler that caches estimates for a query's
 // cardinality based on similar queries seen previously.
 type cardinalityEstimation struct {
 	cache  cache.Cache
-	next   Handler
+	next   MetricsQueryHandler
 	logger log.Logger
 
 	estimationError prometheus.Histogram
 }
 
-func newCardinalityEstimationMiddleware(cache cache.Cache, logger log.Logger, registerer prometheus.Registerer) Middleware {
+func newCardinalityEstimationMiddleware(cache cache.Cache, logger log.Logger, registerer prometheus.Registerer) MetricsQueryMiddleware {
 	estimationError := promauto.With(registerer).NewHistogram(prometheus.HistogramOpts{
 		Name:    "cortex_query_frontend_cardinality_estimation_difference",
 		Help:    "Difference between estimated and actual query cardinality",
 		Buckets: prometheus.ExponentialBuckets(100, 2, 10),
 	})
-	return MiddlewareFunc(func(next Handler) Handler {
+	return MetricsQueryMiddlewareFunc(func(next MetricsQueryHandler) MetricsQueryHandler {
 		return &cardinalityEstimation{
 			cache:  cache,
 			next:   next,
@@ -63,9 +63,8 @@ func newCardinalityEstimationMiddleware(cache cache.Cache, logger log.Logger, re
 
 // Do injects a cardinality estimate into the query hints (if available) and
 // caches the actual cardinality observed for this query.
-func (c *cardinalityEstimation) Do(ctx context.Context, request Request) (Response, error) {
-	spanLog, ctx := spanlogger.NewWithLogger(ctx, c.logger, "cardinalityEstimation.Do")
-	defer spanLog.Finish()
+func (c *cardinalityEstimation) Do(ctx context.Context, request MetricsQueryRequest) (Response, error) {
+	spanLog := spanlogger.FromContext(ctx, c.logger)
 
 	tenants, err := tenant.TenantIDs(ctx)
 	if err != nil {
@@ -77,7 +76,11 @@ func (c *cardinalityEstimation) Do(ctx context.Context, request Request) (Respon
 
 	estimatedCardinality, estimateAvailable := c.lookupCardinalityForKey(ctx, k)
 	if estimateAvailable {
-		request = request.WithEstimatedSeriesCountHint(estimatedCardinality)
+		newRequest, err := request.WithEstimatedSeriesCountHint(estimatedCardinality)
+		if err != nil {
+			return c.next.Do(ctx, request)
+		}
+		request = newRequest
 		spanLog.LogFields(
 			otlog.Bool("estimate available", true),
 			otlog.Uint64("estimated cardinality", estimatedCardinality),
@@ -96,7 +99,7 @@ func (c *cardinalityEstimation) Do(ctx context.Context, request Request) (Respon
 	spanLog.LogFields(otlog.Uint64("actual cardinality", actualCardinality))
 
 	if !estimateAvailable || !isCardinalitySimilar(actualCardinality, estimatedCardinality) {
-		c.storeCardinalityForKey(ctx, k, actualCardinality)
+		c.storeCardinalityForKey(k, actualCardinality)
 		spanLog.LogFields(otlog.Bool("cache updated", true))
 	}
 
@@ -116,7 +119,7 @@ func (c *cardinalityEstimation) lookupCardinalityForKey(ctx context.Context, key
 	if c.cache == nil {
 		return 0, false
 	}
-	res := c.cache.Fetch(ctx, []string{key})
+	res := c.cache.GetMulti(ctx, []string{key})
 	if val, ok := res[key]; ok {
 		qs := &QueryStatistics{}
 		err := proto.Unmarshal(val, qs)
@@ -131,7 +134,7 @@ func (c *cardinalityEstimation) lookupCardinalityForKey(ctx context.Context, key
 
 // storeCardinalityForKey stores a cardinality estimate for the given key in the
 // results cache.
-func (c *cardinalityEstimation) storeCardinalityForKey(ctx context.Context, key string, count uint64) {
+func (c *cardinalityEstimation) storeCardinalityForKey(key string, count uint64) {
 	if c.cache == nil {
 		return
 	}
@@ -143,7 +146,7 @@ func (c *cardinalityEstimation) storeCardinalityForKey(ctx context.Context, key 
 	}
 	// The store is executed asynchronously, potential errors are logged and not
 	// propagated back up the stack.
-	c.cache.Store(ctx, map[string][]byte{key: marshaled}, cardinalityEstimateTTL)
+	c.cache.SetMultiAsync(map[string][]byte{key: marshaled}, cardinalityEstimateTTL)
 }
 
 func isCardinalitySimilar(actualCardinality, estimatedCardinality uint64) bool {
@@ -163,7 +166,7 @@ func isCardinalitySimilar(actualCardinality, estimatedCardinality uint64) bool {
 // with respect to both start time and range size. To avoid expiry of all
 // estimates at the bucket boundary, an offset is added based on the hash of the
 // query string.
-func generateCardinalityEstimationCacheKey(userID string, r Request, bucketSize time.Duration) string {
+func generateCardinalityEstimationCacheKey(userID string, r MetricsQueryRequest, bucketSize time.Duration) string {
 	hasher := fnv.New64a()
 	_, _ = hasher.Write([]byte(r.GetQuery()))
 

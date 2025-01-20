@@ -8,6 +8,8 @@ package commands
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/prometheus/prometheus/model/rulefmt"
@@ -113,6 +115,187 @@ func TestCheckDuplicates(t *testing.T) {
 			assert.Equal(t, tc.want, checkDuplicates(tc.in))
 		})
 	}
+}
+
+func TestRuleCommand_checkRules(t *testing.T) {
+	completelyBadRuleName := rulefmt.RuleNode{
+		Record: yaml.Node{Value: "up", Kind: yaml.ScalarNode},
+		Expr:   yaml.Node{Value: "up==1", Kind: yaml.ScalarNode},
+	}
+	strictlyBadRuleName := rulefmt.RuleNode{
+		Record: yaml.Node{Value: "up:onecolonmissing", Kind: yaml.ScalarNode},
+		Expr:   yaml.Node{Value: "up==1", Kind: yaml.ScalarNode},
+	}
+	validRule1 := rulefmt.RuleNode{
+		Record: yaml.Node{Value: "rule:up:nothing", Kind: yaml.ScalarNode},
+		Expr:   yaml.Node{Value: "up==1", Kind: yaml.ScalarNode},
+	}
+	validRule2 := rulefmt.RuleNode{
+		Record: yaml.Node{Value: "rule:down:nothing", Kind: yaml.ScalarNode},
+		Expr:   yaml.Node{Value: "up==0", Kind: yaml.ScalarNode},
+	}
+	for _, tc := range []struct {
+		name       string
+		rules      []rulefmt.RuleNode
+		strict     bool
+		shouldFail bool
+	}{
+		{
+			name:       "completely bad rule name, not strict fails too",
+			rules:      []rulefmt.RuleNode{validRule1, completelyBadRuleName, validRule2},
+			strict:     false,
+			shouldFail: true,
+		},
+		{
+			name:       "strictly bad rule name, strict",
+			rules:      []rulefmt.RuleNode{validRule1, strictlyBadRuleName, validRule2},
+			strict:     true,
+			shouldFail: true,
+		},
+		{
+			name:       "strictly bad rule name, not strict",
+			rules:      []rulefmt.RuleNode{validRule1, strictlyBadRuleName, validRule2},
+			strict:     false,
+			shouldFail: false,
+		},
+		{
+			name:       "no duplicates, strict",
+			rules:      []rulefmt.RuleNode{validRule1, validRule2},
+			strict:     true,
+			shouldFail: false,
+		},
+		{
+			name:       "with duplicates, not strict",
+			rules:      []rulefmt.RuleNode{validRule1, validRule1},
+			strict:     false,
+			shouldFail: false,
+		},
+		{
+			name:       "with duplicates, strict",
+			rules:      []rulefmt.RuleNode{validRule1, validRule1},
+			strict:     true,
+			shouldFail: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "rules.yaml")
+			{
+				// Setup.
+				f, err := os.Create(file)
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = f.Close() })
+
+				contents := rules.RuleNamespace{
+					Namespace: "test",
+					Groups: []rwrulefmt.RuleGroup{{
+						RuleGroup: rulefmt.RuleGroup{
+							Name:  "rulegroup",
+							Rules: tc.rules,
+						},
+					}},
+				}
+				require.NoError(t, yaml.NewEncoder(f).Encode(contents))
+				require.NoError(t, f.Close())
+			}
+
+			{
+				// Test.
+				cmd := &RuleCommand{Strict: tc.strict, RuleFilesList: []string{file}, Backend: rules.MimirBackend}
+				err := cmd.checkRules(nil)
+				if tc.shouldFail {
+					require.Error(t, err)
+				} else {
+					require.NoError(t, err)
+				}
+			}
+		})
+	}
+}
+
+func TestRuleSaveToFile_NamespaceRuleGroup(t *testing.T) {
+	t.Run("Fail save because marshal need node Kind defined", func(t *testing.T) {
+		namespace := "ns1"
+		rule1 := []rwrulefmt.RuleGroup{{
+			RuleGroup: rulefmt.RuleGroup{
+				Name: "group-1",
+				Rules: []rulefmt.RuleNode{
+					{
+						Record: yaml.Node{Value: "up"},
+						Expr:   yaml.Node{Value: "up==1"},
+					},
+				},
+			},
+		}}
+		tempDir := t.TempDir()
+		err := saveNamespaceRuleGroup(namespace, rule1, tempDir)
+		assert.ErrorContains(t, err, "yaml: cannot encode node with unknown kind")
+	})
+	t.Run("Successful save", func(t *testing.T) {
+		namespace := "ns1"
+		rule1 := []rwrulefmt.RuleGroup{{
+			RuleGroup: rulefmt.RuleGroup{
+				Name: "group-1",
+				Rules: []rulefmt.RuleNode{
+					{
+						Record: yaml.Node{Value: "up", Kind: yaml.ScalarNode},
+						Expr:   yaml.Node{Value: "up==1", Kind: yaml.ScalarNode},
+					},
+				},
+			},
+		}}
+		tempDir := t.TempDir()
+		err := saveNamespaceRuleGroup(namespace, rule1, tempDir)
+		assert.NoError(t, err)
+	})
+	t.Run("Successful save with a modified namespace", func(t *testing.T) {
+		namespace := "a/b/c"
+		rule1 := []rwrulefmt.RuleGroup{{
+			RuleGroup: rulefmt.RuleGroup{
+				Name: "group-1",
+				Rules: []rulefmt.RuleNode{
+					{
+						Record: yaml.Node{Value: "up", Kind: yaml.ScalarNode},
+						Expr:   yaml.Node{Value: "up==1", Kind: yaml.ScalarNode},
+					},
+				},
+			},
+		}}
+
+		tempDir := t.TempDir()
+		err := saveNamespaceRuleGroup(namespace, rule1, tempDir)
+		assert.NoError(t, err)
+
+		assert.NoFileExists(t, filepath.Join(tempDir, "a/b/c.yaml"))
+		assert.FileExists(t, filepath.Join(tempDir, "a_b_c.yaml"))
+	})
+	t.Run("Successful save and load", func(t *testing.T) {
+		expected := `namespace: ns1
+groups:
+    - name: group-1
+      rules:
+        - alert: up
+          expr: up==1
+`
+		namespace := "ns1"
+		rule1 := []rwrulefmt.RuleGroup{{
+			RuleGroup: rulefmt.RuleGroup{
+				Name: "group-1",
+				Rules: []rulefmt.RuleNode{
+					{
+						Alert: yaml.Node{Value: "up", Kind: yaml.ScalarNode},
+						Expr:  yaml.Node{Value: "up==1", Kind: yaml.ScalarNode},
+					},
+				},
+			},
+		}}
+		tempDir := t.TempDir()
+		err := saveNamespaceRuleGroup(namespace, rule1, tempDir)
+		assert.NoError(t, err)
+		savedFile := filepath.Join(tempDir, fmt.Sprintf("%s.yaml", namespace))
+		content, err := os.ReadFile(savedFile)
+		require.NoError(t, err)
+		assert.Equal(t, expected, string(content))
+	})
 }
 
 type ruleCommandClientMock struct {

@@ -16,6 +16,8 @@ import (
 
 	e2e "github.com/grafana/e2e"
 	e2edb "github.com/grafana/e2e/db"
+
+	"github.com/grafana/mimir/pkg/querier/api"
 )
 
 const (
@@ -53,6 +55,28 @@ receivers:
   - name: "example_receiver"
 `
 
+	mimirAlertmanagerUserClassicConfigYaml = `route:
+  receiver: test
+  group_by: [foo]
+  routes:
+    - matchers:
+      - foo=bar
+      - bar=baz
+receivers:
+  - name: test
+`
+
+	mimirAlertmanagerUserUTF8ConfigYaml = `route:
+  receiver: test
+  group_by: [bar🙂]
+  routes:
+    - matchers:
+      - foo=bar
+      - bar🙂=baz
+receivers:
+  - name: test
+`
+
 	mimirRulerUserConfigYaml = `groups:
 - name: rule
   interval: 100s
@@ -63,14 +87,6 @@ receivers:
     for: 0s
     labels: {}
     annotations: {}
-`
-
-	mimirRulerEvalStaleNanConfigYaml = `groups:
-- name: rule
-  interval: 1s
-  rules:
-  - record: stale_nan_eval
-    expr: a_sometimes_stale_nan_series * 2
 `
 )
 
@@ -114,9 +130,16 @@ var (
 		}
 	}
 
+	AlertmanagerGrafanaCompatibilityFlags = func() map[string]string {
+		return map[string]string{
+			"-alertmanager.grafana-alertmanager-compatibility-enabled": "true",
+		}
+	}
+
 	RulerFlags = func() map[string]string {
 		return map[string]string{
-			"-ruler.poll-interval": "2s",
+			"-ruler.poll-interval":             "2s",
+			"-ruler.evaluation-delay-duration": "0",
 		}
 	}
 
@@ -141,13 +164,13 @@ var (
 	BlocksStorageFlags = func() map[string]string {
 		return map[string]string{
 			"-blocks-storage.tsdb.block-ranges-period":          "1m",
-			"-blocks-storage.bucket-store.bucket-index.enabled": "false",
 			"-blocks-storage.bucket-store.ignore-blocks-within": "0",
 			"-blocks-storage.bucket-store.sync-interval":        "5s",
 			"-blocks-storage.tsdb.retention-period":             "5m",
 			"-blocks-storage.tsdb.ship-interval":                "1m",
 			"-blocks-storage.tsdb.head-compaction-interval":     "1s",
 			"-querier.query-store-after":                        "0",
+			"-compactor.cleanup-interval":                       "2s",
 		}
 	}
 
@@ -171,7 +194,7 @@ var (
 			"-querier.frontend-client.backoff-min-period": "100ms",
 			"-querier.frontend-client.backoff-max-period": "100ms",
 			"-querier.frontend-client.backoff-retries":    "1",
-			"-querier.max-concurrent":                     "1",
+			"-querier.max-concurrent":                     "4",
 			// Distributor.
 			"-distributor.ring.store": "memberlist",
 			// Ingester.
@@ -191,8 +214,6 @@ blocks_storage:
 
   bucket_store:
     sync_interval: 5s
-    bucket_index:
-      enabled: false 
 
   s3:
     bucket_name:       mimir-blocks
@@ -209,6 +230,32 @@ blocks_storage:
 		MinioSecretKey: e2edb.MinioSecretKey,
 		MinioEndpoint:  fmt.Sprintf("%s-minio-9000:9000", networkName),
 	})
+
+	IngestStorageFlags = func() map[string]string {
+		return map[string]string{
+			"-ingest-storage.enabled":       "true",
+			"-ingest-storage.kafka.topic":   "ingest",
+			"-ingest-storage.kafka.address": fmt.Sprintf("%s-kafka:9092", networkName),
+
+			// To simplify integration tests, we use strong read consistency by default.
+			// Integration tests that want to test the eventual consistency can override it.
+			"-ingest-storage.read-consistency": api.ReadConsistencyStrong,
+
+			// Frequently poll last produced offset in order to have a low end-to-end latency
+			// and faster integration tests.
+			"-ingest-storage.kafka.last-produced-offset-poll-interval": "50ms",
+			"-ingest-storage.kafka.last-produced-offset-retry-timeout": "1s",
+
+			// Do not wait before switching an INACTIVE partition to ACTIVE.
+			"-ingester.partition-ring.min-partition-owners-count":    "0",
+			"-ingester.partition-ring.min-partition-owners-duration": "0s",
+
+			// Enable ingestion and fetch concurrency
+			"-ingest-storage.kafka.fetch-concurrency-max":                "12",
+			"-ingest-storage.kafka.ingestion-concurrency-max":            "8",
+			"-ingest-storage.kafka.auto-create-topic-default-partitions": "10",
+		}
+	}
 )
 
 func buildConfigFromTemplate(tmpl string, data interface{}) string {

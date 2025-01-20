@@ -115,6 +115,40 @@ func TestStats_AddSplitQueries(t *testing.T) {
 	})
 }
 
+func TestStats_QueueTime(t *testing.T) {
+	t.Run("add and load queue time", func(t *testing.T) {
+		stats, _ := ContextWithEmptyStats(context.Background())
+		stats.AddQueueTime(time.Second)
+		stats.AddQueueTime(time.Second)
+
+		assert.Equal(t, 2*time.Second, stats.LoadQueueTime())
+	})
+
+	t.Run("add and load queue time nil receiver", func(t *testing.T) {
+		var stats *Stats
+		stats.AddQueueTime(time.Second)
+
+		assert.Equal(t, time.Duration(0), stats.LoadQueueTime())
+	})
+}
+
+func TestStats_SamplesProcessed(t *testing.T) {
+	t.Run("add and load samples processed", func(t *testing.T) {
+		stats, _ := ContextWithEmptyStats(context.Background())
+		stats.AddSamplesProcessed(10)
+		stats.AddSamplesProcessed(20)
+
+		assert.Equal(t, uint64(30), stats.LoadSamplesProcessed())
+	})
+
+	t.Run("add and load samples processed nil receiver", func(t *testing.T) {
+		var stats *Stats
+		stats.AddSamplesProcessed(10)
+
+		assert.Equal(t, uint64(0), stats.LoadSamplesProcessed())
+	})
+}
+
 func TestStats_Merge(t *testing.T) {
 	t.Run("merge two stats objects", func(t *testing.T) {
 		stats1 := &Stats{}
@@ -124,6 +158,8 @@ func TestStats_Merge(t *testing.T) {
 		stats1.AddFetchedChunks(10)
 		stats1.AddShardedQueries(20)
 		stats1.AddSplitQueries(10)
+		stats1.AddQueueTime(5 * time.Second)
+		stats1.AddSamplesProcessed(10)
 
 		stats2 := &Stats{}
 		stats2.AddWallTime(time.Second)
@@ -132,6 +168,8 @@ func TestStats_Merge(t *testing.T) {
 		stats2.AddFetchedChunks(11)
 		stats2.AddShardedQueries(21)
 		stats2.AddSplitQueries(11)
+		stats2.AddQueueTime(10 * time.Second)
+		stats2.AddSamplesProcessed(20)
 
 		stats1.Merge(stats2)
 
@@ -141,6 +179,8 @@ func TestStats_Merge(t *testing.T) {
 		assert.Equal(t, uint64(21), stats1.LoadFetchedChunks())
 		assert.Equal(t, uint32(41), stats1.LoadShardedQueries())
 		assert.Equal(t, uint32(21), stats1.LoadSplitQueries())
+		assert.Equal(t, 15*time.Second, stats1.LoadQueueTime())
+		assert.Equal(t, uint64(30), stats1.LoadSamplesProcessed())
 	})
 
 	t.Run("merge two nil stats objects", func(t *testing.T) {
@@ -155,5 +195,27 @@ func TestStats_Merge(t *testing.T) {
 		assert.Equal(t, uint64(0), stats1.LoadFetchedChunks())
 		assert.Equal(t, uint32(0), stats1.LoadShardedQueries())
 		assert.Equal(t, uint32(0), stats1.LoadSplitQueries())
+		assert.Equal(t, time.Duration(0), stats1.LoadQueueTime())
+		assert.Equal(t, uint64(0), stats1.LoadSamplesProcessed())
 	})
+}
+
+func TestStats_Copy(t *testing.T) {
+	s1 := &Stats{
+		WallTime:             1,
+		FetchedSeriesCount:   2,
+		FetchedChunkBytes:    3,
+		FetchedChunksCount:   4,
+		ShardedQueries:       5,
+		SplitQueries:         6,
+		FetchedIndexBytes:    7,
+		EstimatedSeriesCount: 8,
+		QueueTime:            9,
+		SamplesProcessed:     10,
+	}
+	s2 := s1.Copy()
+	assert.NotSame(t, s1, s2)
+	assert.EqualValues(t, s1, s2)
+
+	assert.Nil(t, (*Stats)(nil).Copy())
 }

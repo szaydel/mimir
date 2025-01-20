@@ -12,10 +12,11 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/gate"
+	"github.com/grafana/dskit/services"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
-
 	"github.com/thanos-io/objstore"
 )
 
@@ -38,47 +39,42 @@ func NewReaderPoolMetrics(reg prometheus.Registerer) *ReaderPoolMetrics {
 // and automatically close them once the idle timeout is reached. A closed lazy reader
 // will be automatically re-opened upon next usage.
 type ReaderPool struct {
+	services.Service
+
 	lazyReaderEnabled     bool
 	lazyReaderIdleTimeout time.Duration
 	logger                log.Logger
 	metrics               *ReaderPoolMetrics
 
-	// Channel used to signal once the pool is closing.
-	close chan struct{}
+	// Gate used to limit the number of concurrent index-header loads.
+	lazyLoadingGate gate.Gate
 
 	// Keep track of all readers managed by the pool.
 	lazyReadersMx sync.Mutex
 	lazyReaders   map[*LazyBinaryReader]struct{}
 }
 
-// NewReaderPool makes a new ReaderPool.
-func NewReaderPool(logger log.Logger, lazyReaderEnabled bool, lazyReaderIdleTimeout time.Duration, metrics *ReaderPoolMetrics) *ReaderPool {
-	p := &ReaderPool{
+// NewReaderPool makes a new ReaderPool. If lazy-loading is enabled, NewReaderPool also starts a background task for unloading idle Readers.
+func NewReaderPool(logger log.Logger, indexHeaderConfig Config, lazyLoadingGate gate.Gate, metrics *ReaderPoolMetrics) *ReaderPool {
+	p := newReaderPool(logger, indexHeaderConfig, lazyLoadingGate, metrics)
+	if !p.lazyReaderEnabled || p.lazyReaderIdleTimeout <= 0 {
+		p.Service = services.NewIdleService(nil, nil)
+	} else {
+		p.Service = services.NewTimerService(p.lazyReaderIdleTimeout/10, nil, p.unloadIdleReaders, nil)
+	}
+	return p
+}
+
+// newReaderPool makes a new ReaderPool.
+func newReaderPool(logger log.Logger, indexHeaderConfig Config, lazyLoadingGate gate.Gate, metrics *ReaderPoolMetrics) *ReaderPool {
+	return &ReaderPool{
 		logger:                logger,
 		metrics:               metrics,
-		lazyReaderEnabled:     lazyReaderEnabled,
-		lazyReaderIdleTimeout: lazyReaderIdleTimeout,
+		lazyReaderEnabled:     indexHeaderConfig.LazyLoadingEnabled,
+		lazyReaderIdleTimeout: indexHeaderConfig.LazyLoadingIdleTimeout,
 		lazyReaders:           make(map[*LazyBinaryReader]struct{}),
-		close:                 make(chan struct{}),
+		lazyLoadingGate:       lazyLoadingGate,
 	}
-
-	// Start a goroutine to close idle readers (only if required).
-	if p.lazyReaderEnabled && p.lazyReaderIdleTimeout > 0 {
-		checkFreq := p.lazyReaderIdleTimeout / 10
-
-		go func() {
-			for {
-				select {
-				case <-p.close:
-					return
-				case <-time.After(checkFreq):
-					p.closeIdleReaders()
-				}
-			}
-		}()
-	}
-
-	return p
 }
 
 // NewBinaryReader creates and returns a new binary reader. If the pool has been configured
@@ -89,18 +85,12 @@ func (p *ReaderPool) NewBinaryReader(ctx context.Context, logger log.Logger, bkt
 	var reader Reader
 	var err error
 
-	if cfg.StreamReaderEnabled {
-		readerFactory = func() (Reader, error) {
-			return NewStreamBinaryReader(ctx, logger, bkt, dir, id, postingOffsetsInMemSampling, p.metrics.streamReader, cfg)
-		}
-	} else {
-		readerFactory = func() (Reader, error) {
-			return NewBinaryReader(ctx, logger, bkt, dir, id, postingOffsetsInMemSampling, cfg)
-		}
+	readerFactory = func() (Reader, error) {
+		return NewStreamBinaryReader(ctx, logger, bkt, dir, id, postingOffsetsInMemSampling, p.metrics.streamReader, cfg)
 	}
 
 	if p.lazyReaderEnabled {
-		reader, err = NewLazyBinaryReader(ctx, readerFactory, logger, bkt, dir, id, p.metrics.lazyReader, p.onLazyReaderClosed)
+		reader, err = NewLazyBinaryReader(ctx, readerFactory, logger, bkt, dir, id, p.metrics.lazyReader, p.onLazyReaderClosed, p.lazyLoadingGate)
 	} else {
 		reader, err = readerFactory()
 	}
@@ -119,13 +109,7 @@ func (p *ReaderPool) NewBinaryReader(ctx context.Context, logger log.Logger, bkt
 	return reader, err
 }
 
-// Close the pool and stop checking for idle readers. No reader tracked by this pool
-// will be closed. It's the caller responsibility to close readers.
-func (p *ReaderPool) Close() {
-	close(p.close)
-}
-
-func (p *ReaderPool) closeIdleReaders() {
+func (p *ReaderPool) unloadIdleReaders(context.Context) error {
 	idleTimeoutAgo := time.Now().Add(-p.lazyReaderIdleTimeout).UnixNano()
 
 	for _, r := range p.getIdleReadersSince(idleTimeoutAgo) {
@@ -133,6 +117,7 @@ func (p *ReaderPool) closeIdleReaders() {
 			level.Warn(p.logger).Log("msg", "failed to close idle index-header reader", "err", err)
 		}
 	}
+	return nil // always return nil to avoid stopping the service
 }
 
 func (p *ReaderPool) getIdleReadersSince(ts int64) []*LazyBinaryReader {
@@ -141,7 +126,7 @@ func (p *ReaderPool) getIdleReadersSince(ts int64) []*LazyBinaryReader {
 
 	var idle []*LazyBinaryReader
 	for r := range p.lazyReaders {
-		if r.isIdleSince(ts) {
+		if r.IsIdleSince(ts) {
 			idle = append(idle, r)
 		}
 	}
@@ -165,4 +150,20 @@ func (p *ReaderPool) onLazyReaderClosed(r *LazyBinaryReader) {
 	// but because the consumer closed it. By contract, a reader closed by the consumer can't
 	// be used anymore, so we can automatically remove it from the pool.
 	delete(p.lazyReaders, r)
+}
+
+// LoadedBlocks returns a new map of lazy-loaded block IDs and the last time they were used in milliseconds.
+func (p *ReaderPool) LoadedBlocks() map[ulid.ULID]int64 {
+	p.lazyReadersMx.Lock()
+	defer p.lazyReadersMx.Unlock()
+
+	blocks := make(map[ulid.ULID]int64, len(p.lazyReaders))
+	for r := range p.lazyReaders {
+		usedAt := r.usedAt.Load()
+		if usedAt != 0 {
+			blocks[r.blockID] = usedAt / int64(time.Millisecond)
+		}
+	}
+
+	return blocks
 }

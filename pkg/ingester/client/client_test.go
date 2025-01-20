@@ -15,7 +15,12 @@ import (
 
 	"github.com/grafana/mimir/pkg/mimirpb"
 	"github.com/grafana/mimir/pkg/util"
+	"github.com/grafana/mimir/pkg/util/test"
 )
+
+func TestMain(m *testing.M) {
+	test.VerifyNoLeakTestMain(m)
+}
 
 // TestMarshall is useful to try out various optimisation on the unmarshalling code.
 func TestMarshall(t *testing.T) {
@@ -49,6 +54,6 @@ func TestMarshall(t *testing.T) {
 		require.Error(t, err)
 		_, err = util.ParseProtoReader(context.Background(), recorder.Body, recorder.Body.Len(), plentySize, nil, &req, util.RawSnappy)
 		require.NoError(t, err)
-		require.Equal(t, numSeries, len(req.Timeseries))
+		require.Len(t, req.Timeseries, numSeries)
 	}
 }

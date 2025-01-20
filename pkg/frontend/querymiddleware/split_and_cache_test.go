@@ -20,16 +20,17 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/grafana/dskit/cache"
 	"github.com/grafana/dskit/concurrency"
+	"github.com/grafana/dskit/middleware"
+	"github.com/grafana/dskit/user"
 	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/weaveworks/common/middleware"
-	"github.com/weaveworks/common/user"
 	"go.uber.org/atomic"
 
 	apierror "github.com/grafana/mimir/pkg/api/error"
@@ -38,24 +39,96 @@ import (
 	"github.com/grafana/mimir/pkg/util"
 )
 
+const resultsCacheTTL = 24 * time.Hour
+const resultsCacheLowerTTL = 10 * time.Minute
+
 func TestSplitAndCacheMiddleware_SplitByInterval(t *testing.T) {
 	var (
-		startTime    = parseTimeRFC3339(t, "2021-10-14T00:00:00Z")
-		endTime      = parseTimeRFC3339(t, "2021-10-15T23:59:59Z")
-		queryURL     = mockQueryRangeURL(startTime, endTime, `{__name__=~".+"}`)
-		seriesLabels = []mimirpb.LabelAdapter{{Name: "__name__", Value: "test_metric"}}
+		dayOneStartTime   = parseTimeRFC3339(t, "2021-10-14T00:00:00Z")
+		dayTwoEndTime     = parseTimeRFC3339(t, "2021-10-15T23:59:59Z")
+		dayThreeStartTime = parseTimeRFC3339(t, "2021-10-16T00:00:00Z")
+		dayFourEndTime    = parseTimeRFC3339(t, "2021-10-17T23:59:59Z")
+		queryURL          = mockQueryRangeURL(dayOneStartTime, dayFourEndTime, `{__name__=~".+"}`)
+		seriesLabels      = []mimirpb.LabelAdapter{{Name: "__name__", Value: "test_metric"}}
 
 		// Mock the downstream responses.
-		firstDayDownstreamResponse = encodePrometheusResponse(t,
-			mockPrometheusResponseSingleSeries(seriesLabels, mimirpb.Sample{TimestampMs: startTime.Unix() * 1000, Value: 10}))
+		firstDayDownstreamResponse = jsonEncodePrometheusResponse(t,
+			mockPrometheusResponseSingleSeries(seriesLabels, mimirpb.Sample{TimestampMs: dayOneStartTime.Unix() * 1000, Value: 10}))
 
-		secondDayDownstreamResponse = encodePrometheusResponse(t,
-			mockPrometheusResponseSingleSeries(seriesLabels, mimirpb.Sample{TimestampMs: endTime.Unix() * 1000, Value: 20}))
+		secondDayDownstreamResponse = jsonEncodePrometheusResponse(t,
+			mockPrometheusResponseSingleSeries(seriesLabels, mimirpb.Sample{TimestampMs: dayTwoEndTime.Unix() * 1000, Value: 20}))
+
+		thirdDayHistogram = mimirpb.FloatHistogram{
+			CounterResetHint: histogram.GaugeType,
+			Schema:           3,
+			ZeroThreshold:    1.23,
+			ZeroCount:        456,
+			Count:            9001,
+			Sum:              789.1,
+			PositiveSpans: []mimirpb.BucketSpan{
+				{Offset: 4, Length: 1},
+				{Offset: 3, Length: 2},
+			},
+			NegativeSpans: []mimirpb.BucketSpan{
+				{Offset: 7, Length: 3},
+				{Offset: 9, Length: 1},
+			},
+			PositiveBuckets: []float64{100, 200, 300},
+			NegativeBuckets: []float64{400, 500, 600, 700},
+		}
+
+		thirdDayDownstreamResponse = protobufEncodePrometheusResponse(t,
+			mockProtobufResponseWithSamplesAndHistograms(seriesLabels, nil, []mimirpb.FloatHistogramPair{
+				{
+					TimestampMs: dayThreeStartTime.Unix() * 1000,
+					Histogram:   &thirdDayHistogram,
+				},
+			}))
+
+		fourthDayHistogram = mimirpb.FloatHistogram{
+			CounterResetHint: histogram.GaugeType,
+			Schema:           3,
+			ZeroThreshold:    1.23,
+			ZeroCount:        456,
+			Count:            9001,
+			Sum:              100789.1,
+			PositiveSpans: []mimirpb.BucketSpan{
+				{Offset: 4, Length: 1},
+				{Offset: 3, Length: 2},
+			},
+			NegativeSpans: []mimirpb.BucketSpan{
+				{Offset: 7, Length: 3},
+				{Offset: 9, Length: 1},
+			},
+			PositiveBuckets: []float64{100, 200, 300},
+			NegativeBuckets: []float64{400, 500, 600, 700},
+		}
+
+		fourthDayDownstreamResponse = protobufEncodePrometheusResponse(t,
+			mockProtobufResponseWithSamplesAndHistograms(seriesLabels, nil, []mimirpb.FloatHistogramPair{
+				{
+					TimestampMs: dayFourEndTime.Unix() * 1000,
+					Histogram:   &fourthDayHistogram,
+				},
+			}))
 
 		// Build the expected response (which is the merge of the two downstream responses).
-		expectedResponse = encodePrometheusResponse(t, mockPrometheusResponseSingleSeries(seriesLabels,
-			mimirpb.Sample{TimestampMs: startTime.Unix() * 1000, Value: 10},
-			mimirpb.Sample{TimestampMs: endTime.Unix() * 1000, Value: 20}))
+		expectedResponse = jsonEncodePrometheusResponse(t, mockPrometheusResponseWithSamplesAndHistograms(seriesLabels,
+			[]mimirpb.Sample{
+				{TimestampMs: dayOneStartTime.Unix() * 1000, Value: 10},
+				{TimestampMs: dayTwoEndTime.Unix() * 1000, Value: 20},
+			},
+			[]mimirpb.FloatHistogramPair{
+				{
+					TimestampMs: dayThreeStartTime.Unix() * 1000,
+					Histogram:   &thirdDayHistogram,
+				},
+				{
+					TimestampMs: dayFourEndTime.Unix() * 1000,
+					Histogram:   &fourthDayHistogram,
+				},
+			},
+		))
 
 		codec = newTestPrometheusCodec()
 	)
@@ -66,13 +139,21 @@ func TestSplitAndCacheMiddleware_SplitByInterval(t *testing.T) {
 			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				actualCount.Inc()
 
-				req, err := codec.DecodeRequest(r.Context(), r)
+				req, err := codec.DecodeMetricsQueryRequest(r.Context(), r)
 				require.NoError(t, err)
 
-				if req.GetStart() == startTime.Unix()*1000 {
+				if req.GetStart() == dayOneStartTime.Unix()*1000 {
+					w.Header().Set("Content-Type", jsonMimeType)
 					_, _ = w.Write([]byte(firstDayDownstreamResponse))
-				} else if req.GetStart() == startTime.Add(24*time.Hour).Unix()*1000 {
+				} else if req.GetStart() == dayOneStartTime.Add(24*time.Hour).Unix()*1000 {
+					w.Header().Set("Content-Type", jsonMimeType)
 					_, _ = w.Write([]byte(secondDayDownstreamResponse))
+				} else if req.GetStart() == dayThreeStartTime.Unix()*1000 {
+					w.Header().Set("Content-Type", mimirpb.QueryResponseMimeType)
+					_, _ = w.Write(thirdDayDownstreamResponse)
+				} else if req.GetStart() == dayThreeStartTime.Add(24*time.Hour).Unix()*1000 {
+					w.Header().Set("Content-Type", mimirpb.QueryResponseMimeType)
+					_, _ = w.Write(fourthDayDownstreamResponse)
 				} else {
 					_, _ = w.Write([]byte("unexpected request"))
 				}
@@ -89,7 +170,6 @@ func TestSplitAndCacheMiddleware_SplitByInterval(t *testing.T) {
 		true,
 		false, // Cache disabled.
 		24*time.Hour,
-		false,
 		mockLimits{},
 		codec,
 		nil,
@@ -101,10 +181,10 @@ func TestSplitAndCacheMiddleware_SplitByInterval(t *testing.T) {
 	)
 
 	// Chain middlewares together.
-	middlewares := []Middleware{
+	middlewares := []MetricsQueryMiddleware{
 		newLimitsMiddleware(mockLimits{}, log.NewNopLogger()),
 		splitCacheMiddleware,
-		newAssertHintsMiddleware(t, &Hints{TotalQueries: 2}),
+		newAssertHintsMiddleware(t, &Hints{TotalQueries: 4}),
 	}
 
 	roundtripper := newRoundTripper(singleHostRoundTripper{
@@ -125,7 +205,7 @@ func TestSplitAndCacheMiddleware_SplitByInterval(t *testing.T) {
 	actualBody, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	require.Equal(t, expectedResponse, string(actualBody))
-	require.Equal(t, int32(2), actualCount.Load())
+	require.Equal(t, int32(4), actualCount.Load())
 
 	// Assert metrics
 	assert.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
@@ -139,111 +219,32 @@ func TestSplitAndCacheMiddleware_SplitByInterval(t *testing.T) {
 		cortex_frontend_query_result_cache_skipped_total{reason="unaligned-time-range"} 0
 		# HELP cortex_frontend_split_queries_total Total number of underlying query requests after the split by interval is applied.
 		# TYPE cortex_frontend_split_queries_total counter
-		cortex_frontend_split_queries_total 2
+		cortex_frontend_split_queries_total 4
+		# HELP cortex_frontend_query_result_cache_hits_total Total number of requests (or partial requests) fetched from the results cache.
+		# TYPE cortex_frontend_query_result_cache_hits_total counter
+		cortex_frontend_query_result_cache_hits_total{request_type="query_range"} 0
+		# HELP cortex_frontend_query_result_cache_requests_total Total number of requests (or partial requests) looked up in the results cache.
+		# TYPE cortex_frontend_query_result_cache_requests_total counter
+		cortex_frontend_query_result_cache_requests_total{request_type="query_range"} 0
 	`)))
 
 	// Assert query stats from context
 	queryStats := stats.FromContext(ctx)
-	assert.Equal(t, uint32(2), queryStats.LoadSplitQueries())
+	assert.Equal(t, uint32(4), queryStats.LoadSplitQueries())
 }
 
 func TestSplitAndCacheMiddleware_ResultsCache(t *testing.T) {
 	cacheBackend := cache.NewInstrumentedMockCache()
 
-	mw := newSplitAndCacheMiddleware(
-		true,
-		true,
-		24*time.Hour,
-		false,
-		mockLimits{maxCacheFreshness: 10 * time.Minute},
-		newTestPrometheusCodec(),
-		cacheBackend,
-		ConstSplitter(day),
-		PrometheusResponseExtractor{},
-		resultsCacheAlwaysEnabled,
-		log.NewNopLogger(),
-		prometheus.NewPedanticRegistry(),
-	)
-
-	expectedResponse := &PrometheusResponse{
-		Status: "success",
-		Data: &PrometheusData{
-			ResultType: model.ValMatrix.String(),
-			Result: []SampleStream{
-				{
-					Labels: []mimirpb.LabelAdapter{
-						{Name: "foo", Value: "bar"},
-					},
-					Samples: []mimirpb.Sample{
-						{Value: 137, TimestampMs: 1634292000000},
-						{Value: 137, TimestampMs: 1634292120000},
-					},
-				},
-			},
-		},
-	}
-
-	downstreamReqs := 0
-	rc := mw.Wrap(HandlerFunc(func(_ context.Context, req Request) (Response, error) {
-		downstreamReqs++
-		return expectedResponse, nil
-	}))
-
-	step := int64(120 * 1000)
-	req := Request(&PrometheusRangeQueryRequest{
-		Path:  "/api/v1/query_range",
-		Start: parseTimeRFC3339(t, "2021-10-15T10:00:00Z").Unix() * 1000,
-		End:   parseTimeRFC3339(t, "2021-10-15T12:00:00Z").Unix() * 1000,
-		Step:  step,
-		Query: `{__name__=~".+"}`,
-	})
-
-	_, ctx := stats.ContextWithEmptyStats(context.Background())
-	ctx = user.InjectOrgID(ctx, "1")
-	resp, err := rc.Do(ctx, req)
-	require.NoError(t, err)
-
-	require.Equal(t, 1, downstreamReqs)
-	require.Equal(t, expectedResponse, resp)
-	assert.Equal(t, 1, cacheBackend.CountStoreCalls())
-	// Assert query stats from context
-	queryStats := stats.FromContext(ctx)
-	assert.Equal(t, uint32(1), queryStats.LoadSplitQueries())
-
-	// Doing same request again shouldn't change anything.
-	resp, err = rc.Do(ctx, req)
-	require.NoError(t, err)
-	require.Equal(t, 1, downstreamReqs)
-	require.Equal(t, expectedResponse, resp)
-	assert.Equal(t, 1, cacheBackend.CountStoreCalls())
-	// Assert query stats from context
-	queryStats = stats.FromContext(ctx)
-	assert.Equal(t, uint32(1), queryStats.LoadSplitQueries())
-
-	// Doing request with new end time should do one more query.
-	req = req.WithStartEnd(req.GetStart(), req.GetEnd()+step)
-	_, err = rc.Do(ctx, req)
-	require.NoError(t, err)
-	require.Equal(t, 2, downstreamReqs)
-	assert.Equal(t, 2, cacheBackend.CountStoreCalls())
-	// Assert query stats from context
-	queryStats = stats.FromContext(ctx)
-	assert.Equal(t, uint32(2), queryStats.LoadSplitQueries())
-}
-
-func TestSplitAndCacheMiddleware_ResultsCache_ShouldNotLookupCacheIfStepIsNotAligned(t *testing.T) {
-	cacheBackend := cache.NewInstrumentedMockCache()
 	reg := prometheus.NewPedanticRegistry()
-
 	mw := newSplitAndCacheMiddleware(
 		true,
 		true,
 		24*time.Hour,
-		false,
-		mockLimits{maxCacheFreshness: 10 * time.Minute},
+		mockLimits{maxCacheFreshness: 10 * time.Minute, resultsCacheTTL: resultsCacheTTL, resultsCacheOutOfOrderWindowTTL: resultsCacheLowerTTL},
 		newTestPrometheusCodec(),
 		cacheBackend,
-		ConstSplitter(day),
+		DefaultCacheKeyGenerator{interval: day},
 		PrometheusResponseExtractor{},
 		resultsCacheAlwaysEnabled,
 		log.NewNopLogger(),
@@ -263,23 +264,309 @@ func TestSplitAndCacheMiddleware_ResultsCache_ShouldNotLookupCacheIfStepIsNotAli
 						{Value: 137, TimestampMs: 1634292000000},
 						{Value: 137, TimestampMs: 1634292120000},
 					},
+					Histograms: []mimirpb.FloatHistogramPair{
+						{
+							TimestampMs: 1634292000000,
+							Histogram: &mimirpb.FloatHistogram{
+								CounterResetHint: histogram.GaugeType,
+								Schema:           3,
+								ZeroThreshold:    1.23,
+								ZeroCount:        456,
+								Count:            9001,
+								Sum:              789.1,
+								PositiveSpans: []mimirpb.BucketSpan{
+									{Offset: 4, Length: 1},
+									{Offset: 3, Length: 2},
+								},
+								NegativeSpans: []mimirpb.BucketSpan{
+									{Offset: 7, Length: 3},
+									{Offset: 9, Length: 1},
+								},
+								PositiveBuckets: []float64{100, 200, 300},
+								NegativeBuckets: []float64{400, 500, 600, 700},
+							},
+						},
+					},
 				},
 			},
 		},
 	}
 
 	downstreamReqs := 0
-	rc := mw.Wrap(HandlerFunc(func(_ context.Context, req Request) (Response, error) {
+	rc := mw.Wrap(HandlerFunc(func(context.Context, MetricsQueryRequest) (Response, error) {
 		downstreamReqs++
 		return expectedResponse, nil
 	}))
 
-	req := Request(&PrometheusRangeQueryRequest{
-		Path:  "/api/v1/query_range",
-		Start: parseTimeRFC3339(t, "2021-10-15T10:00:00Z").Unix() * 1000,
-		End:   parseTimeRFC3339(t, "2021-10-15T12:00:00Z").Unix() * 1000,
-		Step:  13 * 1000, // Not aligned to start/end.
-		Query: `{__name__=~".+"}`,
+	step := int64(120 * 1000)
+	req := MetricsQueryRequest(&PrometheusRangeQueryRequest{
+		path:      "/api/v1/query_range",
+		start:     parseTimeRFC3339(t, "2021-10-15T10:00:00Z").Unix() * 1000,
+		end:       parseTimeRFC3339(t, "2021-10-15T12:00:00Z").Unix() * 1000,
+		step:      step,
+		queryExpr: parseQuery(t, `{__name__=~".+"}`),
+	})
+
+	queryDetails, ctx := ContextWithEmptyDetails(context.Background())
+	ctx = user.InjectOrgID(ctx, "1")
+	resp, err := rc.Do(ctx, req)
+	require.NoError(t, err)
+
+	require.Equal(t, 1, downstreamReqs)
+	require.Equal(t, expectedResponse, resp)
+	assert.Equal(t, 1, cacheBackend.CountStoreCalls())
+	// Assert query stats from context
+	queryStats := stats.FromContext(ctx)
+	assert.Equal(t, uint32(1), queryStats.LoadSplitQueries())
+
+	assert.NotZero(t, queryDetails.ResultsCacheMissBytes)
+	assert.Zero(t, queryDetails.ResultsCacheHitBytes)
+
+	// Doing same request again shouldn't change anything.
+	resp, err = rc.Do(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, 1, downstreamReqs)
+	require.Equal(t, expectedResponse, resp)
+	assert.Equal(t, 1, cacheBackend.CountStoreCalls())
+	// Assert query stats from context
+	queryStats = stats.FromContext(ctx)
+	assert.Equal(t, uint32(1), queryStats.LoadSplitQueries())
+
+	// Doing request with new end time should do one more query.
+	req, err = req.WithStartEnd(req.GetStart(), req.GetEnd()+step)
+	require.NoError(t, err)
+
+	_, err = rc.Do(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, 2, downstreamReqs)
+	assert.Equal(t, 2, cacheBackend.CountStoreCalls())
+	// Assert query stats from context
+	queryStats = stats.FromContext(ctx)
+	assert.Equal(t, uint32(2), queryStats.LoadSplitQueries())
+
+	// Assert metrics
+	assert.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP cortex_frontend_query_result_cache_attempted_total Total number of queries that were attempted to be fetched from cache.
+		# TYPE cortex_frontend_query_result_cache_attempted_total counter
+		cortex_frontend_query_result_cache_attempted_total 3
+
+		# HELP cortex_frontend_query_result_cache_skipped_total Total number of times a query was not cacheable because of a reason. This metric is tracked for each partial query when time-splitting is enabled.
+		# TYPE cortex_frontend_query_result_cache_skipped_total counter
+		cortex_frontend_query_result_cache_skipped_total{reason="has-modifiers"} 0
+		cortex_frontend_query_result_cache_skipped_total{reason="too-new"} 0
+		cortex_frontend_query_result_cache_skipped_total{reason="unaligned-time-range"} 0
+
+		# HELP cortex_frontend_split_queries_total Total number of underlying query requests after the split by interval is applied.
+		# TYPE cortex_frontend_split_queries_total counter
+		cortex_frontend_split_queries_total 3
+
+		# HELP cortex_frontend_query_result_cache_requests_total Total number of requests (or partial requests) looked up in the results cache.
+		# TYPE cortex_frontend_query_result_cache_requests_total counter
+		cortex_frontend_query_result_cache_requests_total{request_type="query_range"} 3
+
+		# HELP cortex_frontend_query_result_cache_hits_total Total number of requests (or partial requests) fetched from the results cache.
+		# TYPE cortex_frontend_query_result_cache_hits_total counter
+		cortex_frontend_query_result_cache_hits_total{request_type="query_range"} 2
+	`)))
+}
+
+func TestSplitAndCacheMiddleware_ResultsCacheNoStore(t *testing.T) {
+	cacheBackend := cache.NewInstrumentedMockCache()
+
+	reg := prometheus.NewPedanticRegistry()
+	mw := newSplitAndCacheMiddleware(
+		true,
+		true,
+		24*time.Hour,
+		mockLimits{maxCacheFreshness: 10 * time.Minute, resultsCacheTTL: resultsCacheTTL, resultsCacheOutOfOrderWindowTTL: resultsCacheLowerTTL},
+		newTestPrometheusCodec(),
+		cacheBackend,
+		DefaultCacheKeyGenerator{interval: day},
+		PrometheusResponseExtractor{},
+		resultsCacheAlwaysDisabled,
+		log.NewNopLogger(),
+		reg,
+	)
+
+	expectedResponse := &PrometheusResponse{
+		Status: "success",
+		Data: &PrometheusData{
+			ResultType: model.ValMatrix.String(),
+			Result: []SampleStream{
+				{
+					Labels: []mimirpb.LabelAdapter{
+						{Name: "foo", Value: "bar"},
+					},
+					Samples: []mimirpb.Sample{
+						{Value: 137, TimestampMs: 1634292000000},
+						{Value: 137, TimestampMs: 1634292120000},
+					},
+					Histograms: []mimirpb.FloatHistogramPair{
+						{
+							TimestampMs: 1634292000000,
+							Histogram: &mimirpb.FloatHistogram{
+								CounterResetHint: histogram.GaugeType,
+								Schema:           3,
+								ZeroThreshold:    1.23,
+								ZeroCount:        456,
+								Count:            9001,
+								Sum:              789.1,
+								PositiveSpans: []mimirpb.BucketSpan{
+									{Offset: 4, Length: 1},
+									{Offset: 3, Length: 2},
+								},
+								NegativeSpans: []mimirpb.BucketSpan{
+									{Offset: 7, Length: 3},
+									{Offset: 9, Length: 1},
+								},
+								PositiveBuckets: []float64{100, 200, 300},
+								NegativeBuckets: []float64{400, 500, 600, 700},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	downstreamReqs := 0
+	rc := mw.Wrap(HandlerFunc(func(context.Context, MetricsQueryRequest) (Response, error) {
+		downstreamReqs++
+		return expectedResponse, nil
+	}))
+
+	step := int64(120 * 1000)
+	req := MetricsQueryRequest(&PrometheusRangeQueryRequest{
+		path:      "/api/v1/query_range",
+		start:     parseTimeRFC3339(t, "2021-10-15T10:00:00Z").Unix() * 1000,
+		end:       parseTimeRFC3339(t, "2021-10-15T12:00:00Z").Unix() * 1000,
+		step:      step,
+		queryExpr: parseQuery(t, `{__name__=~".+"}`),
+		options:   Options{CacheDisabled: true},
+	})
+
+	queryDetails, ctx := ContextWithEmptyDetails(context.Background())
+	ctx = user.InjectOrgID(ctx, "1")
+	resp, err := rc.Do(ctx, req)
+	require.NoError(t, err)
+
+	require.Equal(t, 1, downstreamReqs)
+	require.Equal(t, expectedResponse, resp)
+	assert.Equal(t, 0, cacheBackend.CountStoreCalls())
+	// Assert query stats from context
+	queryStats := stats.FromContext(ctx)
+	assert.Equal(t, uint32(1), queryStats.LoadSplitQueries())
+
+	assert.NotZero(t, queryDetails.ResultsCacheMissBytes)
+	assert.Zero(t, queryDetails.ResultsCacheHitBytes)
+
+	// Doing same request again shouldn't change anything.
+	resp, err = rc.Do(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, 2, downstreamReqs)
+	require.Equal(t, expectedResponse, resp)
+	assert.Equal(t, 0, cacheBackend.CountStoreCalls())
+	// Assert query stats from context
+	queryStats = stats.FromContext(ctx)
+	assert.Equal(t, uint32(2), queryStats.LoadSplitQueries())
+
+	// Assert metrics
+	assert.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP cortex_frontend_query_result_cache_attempted_total Total number of queries that were attempted to be fetched from cache.
+		# TYPE cortex_frontend_query_result_cache_attempted_total counter
+		cortex_frontend_query_result_cache_attempted_total 0
+
+		# HELP cortex_frontend_query_result_cache_skipped_total Total number of times a query was not cacheable because of a reason. This metric is tracked for each partial query when time-splitting is enabled.
+		# TYPE cortex_frontend_query_result_cache_skipped_total counter
+		cortex_frontend_query_result_cache_skipped_total{reason="has-modifiers"} 0
+		cortex_frontend_query_result_cache_skipped_total{reason="too-new"} 0
+		cortex_frontend_query_result_cache_skipped_total{reason="unaligned-time-range"} 0
+
+		# HELP cortex_frontend_split_queries_total Total number of underlying query requests after the split by interval is applied.
+		# TYPE cortex_frontend_split_queries_total counter
+		cortex_frontend_split_queries_total 2
+
+		# HELP cortex_frontend_query_result_cache_requests_total Total number of requests (or partial requests) looked up in the results cache.
+		# TYPE cortex_frontend_query_result_cache_requests_total counter
+		cortex_frontend_query_result_cache_requests_total{request_type="query_range"} 0
+
+		# HELP cortex_frontend_query_result_cache_hits_total Total number of requests (or partial requests) fetched from the results cache.
+		# TYPE cortex_frontend_query_result_cache_hits_total counter
+		cortex_frontend_query_result_cache_hits_total{request_type="query_range"} 0
+	`)))
+}
+
+func TestSplitAndCacheMiddleware_ResultsCache_ShouldNotLookupCacheIfStepIsNotAligned(t *testing.T) {
+	cacheBackend := cache.NewInstrumentedMockCache()
+	reg := prometheus.NewPedanticRegistry()
+
+	mw := newSplitAndCacheMiddleware(
+		true,
+		true,
+		24*time.Hour,
+		mockLimits{maxCacheFreshness: 10 * time.Minute},
+		newTestPrometheusCodec(),
+		cacheBackend,
+		DefaultCacheKeyGenerator{interval: day},
+		PrometheusResponseExtractor{},
+		resultsCacheAlwaysEnabled,
+		log.NewNopLogger(),
+		reg,
+	)
+
+	expectedResponse := &PrometheusResponse{
+		Status: "success",
+		Data: &PrometheusData{
+			ResultType: model.ValMatrix.String(),
+			Result: []SampleStream{
+				{
+					Labels: []mimirpb.LabelAdapter{
+						{Name: "foo", Value: "bar"},
+					},
+					Samples: []mimirpb.Sample{
+						{Value: 137, TimestampMs: 1634292000000},
+						{Value: 137, TimestampMs: 1634292120000},
+					},
+					Histograms: []mimirpb.FloatHistogramPair{
+						{
+							TimestampMs: 1634292000000,
+							Histogram: &mimirpb.FloatHistogram{
+								CounterResetHint: histogram.GaugeType,
+								Schema:           3,
+								ZeroThreshold:    1.23,
+								ZeroCount:        456,
+								Count:            9001,
+								Sum:              789.1,
+								PositiveSpans: []mimirpb.BucketSpan{
+									{Offset: 4, Length: 1},
+									{Offset: 3, Length: 2},
+								},
+								NegativeSpans: []mimirpb.BucketSpan{
+									{Offset: 7, Length: 3},
+									{Offset: 9, Length: 1},
+								},
+								PositiveBuckets: []float64{100, 200, 300},
+								NegativeBuckets: []float64{400, 500, 600, 700},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	downstreamReqs := 0
+	rc := mw.Wrap(HandlerFunc(func(context.Context, MetricsQueryRequest) (Response, error) {
+		downstreamReqs++
+		return expectedResponse, nil
+	}))
+
+	req := MetricsQueryRequest(&PrometheusRangeQueryRequest{
+		path:      "/api/v1/query_range",
+		start:     parseTimeRFC3339(t, "2021-10-15T10:00:00Z").Unix() * 1000,
+		end:       parseTimeRFC3339(t, "2021-10-15T12:00:00Z").Unix() * 1000,
+		step:      13 * 1000, // Not aligned to start/end.
+		queryExpr: parseQuery(t, `{__name__=~".+"}`),
 	})
 
 	_, ctx := stats.ContextWithEmptyStats(context.Background())
@@ -296,6 +583,7 @@ func TestSplitAndCacheMiddleware_ResultsCache_ShouldNotLookupCacheIfStepIsNotAli
 	// Assert query stats from context
 	queryStats := stats.FromContext(ctx)
 	assert.Equal(t, uint32(1), queryStats.LoadSplitQueries())
+
 	// Assert metrics
 	assert.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
 		# HELP cortex_frontend_query_result_cache_attempted_total Total number of queries that were attempted to be fetched from cache.
@@ -309,21 +597,33 @@ func TestSplitAndCacheMiddleware_ResultsCache_ShouldNotLookupCacheIfStepIsNotAli
 		# HELP cortex_frontend_split_queries_total Total number of underlying query requests after the split by interval is applied.
 		# TYPE cortex_frontend_split_queries_total counter
 		cortex_frontend_split_queries_total 1
+		# HELP cortex_frontend_query_result_cache_hits_total Total number of requests (or partial requests) fetched from the results cache.
+		# TYPE cortex_frontend_query_result_cache_hits_total counter
+		cortex_frontend_query_result_cache_hits_total{request_type="query_range"} 0
+		# HELP cortex_frontend_query_result_cache_requests_total Total number of requests (or partial requests) looked up in the results cache.
+		# TYPE cortex_frontend_query_result_cache_requests_total counter
+		cortex_frontend_query_result_cache_requests_total{request_type="query_range"} 0
 	`)))
 }
 
 func TestSplitAndCacheMiddleware_ResultsCache_EnabledCachingOfStepUnalignedRequest(t *testing.T) {
 	cacheBackend := cache.NewInstrumentedMockCache()
 
+	limits := mockLimits{
+		maxCacheFreshness:                    10 * time.Minute,
+		resultsCacheTTL:                      resultsCacheTTL,
+		resultsCacheOutOfOrderWindowTTL:      resultsCacheLowerTTL,
+		resultsCacheForUnalignedQueryEnabled: true,
+	}
+
 	mw := newSplitAndCacheMiddleware(
 		true,
 		true,
 		24*time.Hour,
-		true, // caching of step-unaligned requests is enabled in this test.
-		mockLimits{maxCacheFreshness: 10 * time.Minute},
+		limits,
 		newTestPrometheusCodec(),
 		cacheBackend,
-		ConstSplitter(day),
+		DefaultCacheKeyGenerator{interval: day},
 		PrometheusResponseExtractor{},
 		resultsCacheAlwaysEnabled,
 		log.NewNopLogger(),
@@ -349,17 +649,17 @@ func TestSplitAndCacheMiddleware_ResultsCache_EnabledCachingOfStepUnalignedReque
 	}
 
 	downstreamReqs := 0
-	rc := mw.Wrap(HandlerFunc(func(_ context.Context, req Request) (Response, error) {
+	rc := mw.Wrap(HandlerFunc(func(context.Context, MetricsQueryRequest) (Response, error) {
 		downstreamReqs++
 		return expectedResponse, nil
 	}))
 
-	req := Request(&PrometheusRangeQueryRequest{
-		Path:  "/api/v1/query_range",
-		Start: parseTimeRFC3339(t, "2021-10-15T10:00:00Z").Unix() * 1000,
-		End:   parseTimeRFC3339(t, "2021-10-15T12:00:00Z").Unix() * 1000,
-		Step:  13 * 1000, // Not aligned to start/end.
-		Query: `{__name__=~".+"}`,
+	req := MetricsQueryRequest(&PrometheusRangeQueryRequest{
+		path:      "/api/v1/query_range",
+		start:     parseTimeRFC3339(t, "2021-10-15T10:00:00Z").Unix() * 1000,
+		end:       parseTimeRFC3339(t, "2021-10-15T12:00:00Z").Unix() * 1000,
+		step:      13 * 1000, // Not aligned to start/end.
+		queryExpr: parseQuery(t, `{__name__=~".+"}`),
 	})
 
 	_, ctx := stats.ContextWithEmptyStats(context.Background())
@@ -389,7 +689,9 @@ func TestSplitAndCacheMiddleware_ResultsCache_EnabledCachingOfStepUnalignedReque
 	assert.Equal(t, uint32(1), queryStats.LoadSplitQueries())
 
 	// New request with slightly different Start time will not reuse the cached result.
-	req = req.WithStartEnd(parseTimeRFC3339(t, "2021-10-15T10:00:05Z").Unix()*1000, parseTimeRFC3339(t, "2021-10-15T12:00:05Z").Unix()*1000)
+	req, err = req.WithStartEnd(parseTimeRFC3339(t, "2021-10-15T10:00:05Z").Unix()*1000, parseTimeRFC3339(t, "2021-10-15T12:00:05Z").Unix()*1000)
+	require.NoError(t, err)
+
 	resp, err = rc.Do(ctx, req)
 	require.NoError(t, err)
 	require.Equal(t, 2, downstreamReqs)
@@ -445,6 +747,12 @@ func TestSplitAndCacheMiddleware_ResultsCache_ShouldNotCacheRequestEarlierThanMa
 				# HELP cortex_frontend_split_queries_total Total number of underlying query requests after the split by interval is applied.
 				# TYPE cortex_frontend_split_queries_total counter
 				cortex_frontend_split_queries_total 0
+				# HELP cortex_frontend_query_result_cache_hits_total Total number of requests (or partial requests) fetched from the results cache.
+				# TYPE cortex_frontend_query_result_cache_hits_total counter
+				cortex_frontend_query_result_cache_hits_total{request_type="query_range"} 0
+				# HELP cortex_frontend_query_result_cache_requests_total Total number of requests (or partial requests) looked up in the results cache.
+				# TYPE cortex_frontend_query_result_cache_requests_total counter
+				cortex_frontend_query_result_cache_requests_total{request_type="query_range"} 0
 			`,
 		},
 		"should cache a response up until max cache freshness time ago": {
@@ -468,18 +776,17 @@ func TestSplitAndCacheMiddleware_ResultsCache_ShouldNotCacheRequestEarlierThanMa
 	for testName, testData := range tests {
 		t.Run(testName, func(t *testing.T) {
 			cacheBackend := cache.NewMockCache()
-			cacheSplitter := ConstSplitter(day)
+			keyGenerator := DefaultCacheKeyGenerator{interval: day}
 			reg := prometheus.NewPedanticRegistry()
 
 			mw := newSplitAndCacheMiddleware(
 				false, // No interval splitting.
 				true,
 				24*time.Hour,
-				false,
-				mockLimits{maxCacheFreshness: maxCacheFreshness},
+				mockLimits{maxCacheFreshness: maxCacheFreshness, resultsCacheTTL: resultsCacheTTL, resultsCacheOutOfOrderWindowTTL: resultsCacheLowerTTL},
 				newTestPrometheusCodec(),
 				cacheBackend,
-				cacheSplitter,
+				keyGenerator,
 				PrometheusResponseExtractor{},
 				resultsCacheAlwaysEnabled,
 				log.NewNopLogger(),
@@ -487,7 +794,7 @@ func TestSplitAndCacheMiddleware_ResultsCache_ShouldNotCacheRequestEarlierThanMa
 			)
 
 			calls := 0
-			rc := mw.Wrap(HandlerFunc(func(_ context.Context, r Request) (Response, error) {
+			rc := mw.Wrap(HandlerFunc(func(_ context.Context, r MetricsQueryRequest) (Response, error) {
 				calls++
 
 				// Check the downstream request. We only check the 1st request because the subsequent
@@ -501,15 +808,15 @@ func TestSplitAndCacheMiddleware_ResultsCache_ShouldNotCacheRequestEarlierThanMa
 			}))
 			ctx := user.InjectOrgID(context.Background(), userID)
 
-			req := Request(&PrometheusRangeQueryRequest{
-				Path:  "/api/v1/query_range",
-				Start: testData.queryStartTime.Unix() * 1000,
-				End:   testData.queryEndTime.Unix() * 1000,
-				Step:  1000, // 1s step so it's guaranteed to be aligned.
-				Query: `{__name__=~".+"}`,
+			req := MetricsQueryRequest(&PrometheusRangeQueryRequest{
+				path:      "/api/v1/query_range",
+				start:     testData.queryStartTime.Unix() * 1000,
+				end:       testData.queryEndTime.Unix() * 1000,
+				step:      1000, // 1s step so it's guaranteed to be aligned.
+				queryExpr: parseQuery(t, `{__name__=~".+"}`),
 			})
 
-			// Request should result in a query.
+			// MetricsQueryRequest should result in a query.
 			resp, err := rc.Do(ctx, req)
 			require.NoError(t, err)
 			require.Equal(t, 1, calls)
@@ -522,8 +829,8 @@ func TestSplitAndCacheMiddleware_ResultsCache_ShouldNotCacheRequestEarlierThanMa
 			require.Equal(t, testData.downstreamResponse, resp)
 
 			// Check if the response was cached.
-			cacheKey := cacheHashKey(cacheSplitter.GenerateCacheKey(ctx, userID, req))
-			found := cacheBackend.Fetch(ctx, []string{cacheKey})
+			cacheKey := cacheHashKey(keyGenerator.QueryRequest(ctx, userID, req))
+			found := cacheBackend.GetMulti(ctx, []string{cacheKey})
 
 			if len(testData.expectedCachedResponses) == 0 {
 				assert.Empty(t, found)
@@ -615,7 +922,7 @@ func TestSplitAndCacheMiddleware_ResultsCacheFuzzy(t *testing.T) {
 
 	// Randomise the seed but log it in case we need to reproduce the test on failure.
 	seed := time.Now().UnixNano()
-	rand.Seed(seed)
+	rnd := rand.New(rand.NewSource(seed))
 	t.Log("random generator seed:", seed)
 
 	// The mocked storage contains samples within the following min/max time.
@@ -624,7 +931,7 @@ func TestSplitAndCacheMiddleware_ResultsCacheFuzzy(t *testing.T) {
 	step := 2 * time.Minute
 
 	// Generate series.
-	series := make([]*promql.StorageSeries, 0, numSeries)
+	series := make([]storage.Series, 0, numSeries)
 	for i := 0; i < numSeries; i++ {
 		series = append(series, newSeries(newTestCounterLabels(i), minTime, maxTime, step, factor(float64(i))))
 	}
@@ -639,19 +946,19 @@ func TestSplitAndCacheMiddleware_ResultsCacheFuzzy(t *testing.T) {
 	}
 
 	// Generate some random requests.
-	reqs := make([]Request, 0, numQueries)
+	reqs := make([]MetricsQueryRequest, 0, numQueries)
 	for q := 0; q < numQueries; q++ {
 		// Generate a random time range within min/max time.
-		startTime := minTime.Add(time.Duration(rand.Int63n(maxTime.Sub(minTime).Milliseconds())) * time.Millisecond)
-		endTime := startTime.Add(time.Duration(rand.Int63n(maxTime.Sub(startTime).Milliseconds())) * time.Millisecond)
+		startTime := minTime.Add(time.Duration(rnd.Int63n(maxTime.Sub(minTime).Milliseconds())) * time.Millisecond)
+		endTime := startTime.Add(time.Duration(rnd.Int63n(maxTime.Sub(startTime).Milliseconds())) * time.Millisecond)
 
 		reqs = append(reqs, &PrometheusRangeQueryRequest{
-			Id:    int64(q),
-			Path:  "/api/v1/query_range",
-			Start: startTime.Unix() * 1000,
-			End:   endTime.Unix() * 1000,
-			Step:  120 * 1000,
-			Query: fmt.Sprintf(`sum by(group_2) (rate({__name__=~".+"}[%s]))`, (2 * step).String()),
+			id:        int64(q),
+			path:      "/api/v1/query_range",
+			start:     startTime.Unix() * 1000,
+			end:       endTime.Unix() * 1000,
+			step:      120 * 1000,
+			queryExpr: parseQuery(t, fmt.Sprintf(`sum by(group_2) (rate({__name__=~".+"}[%s]))`, (2*step).String())),
 		})
 	}
 
@@ -665,7 +972,7 @@ func TestSplitAndCacheMiddleware_ResultsCacheFuzzy(t *testing.T) {
 		}
 
 		expectedResMx.Lock()
-		expectedRes[reqs[idx].GetId()] = res
+		expectedRes[reqs[idx].GetID()] = res
 		expectedResMx.Unlock()
 
 		return nil
@@ -673,10 +980,6 @@ func TestSplitAndCacheMiddleware_ResultsCacheFuzzy(t *testing.T) {
 
 	for testName, testData := range tests {
 		for _, maxConcurrency := range []int{1, numQueries} {
-			// Change scope to ensure tests work fine when run concurrently.
-			testData := testData
-			maxConcurrency := maxConcurrency
-
 			t.Run(fmt.Sprintf("%s (concurrency: %d)", testName, maxConcurrency), func(t *testing.T) {
 				t.Parallel()
 
@@ -684,14 +987,13 @@ func TestSplitAndCacheMiddleware_ResultsCacheFuzzy(t *testing.T) {
 					testData.splitEnabled,
 					testData.cacheEnabled,
 					24*time.Hour,
-					testData.cacheUnaligned,
 					mockLimits{
 						maxCacheFreshness:   testData.maxCacheFreshness,
 						maxQueryParallelism: testData.maxQueryParallelism,
 					},
 					newTestPrometheusCodec(),
 					cache.NewMockCache(),
-					ConstSplitter(day),
+					DefaultCacheKeyGenerator{interval: day},
 					PrometheusResponseExtractor{},
 					resultsCacheAlwaysEnabled,
 					log.NewNopLogger(),
@@ -702,7 +1004,7 @@ func TestSplitAndCacheMiddleware_ResultsCacheFuzzy(t *testing.T) {
 				require.NoError(t, concurrency.ForEachJob(ctx, len(reqs), maxConcurrency, func(ctx context.Context, idx int) error {
 					actual, err := mw.Do(ctx, reqs[idx])
 					require.NoError(t, err)
-					require.Equal(t, expectedRes[reqs[idx].GetId()], actual)
+					require.Equal(t, expectedRes[reqs[idx].GetID()], actual)
 
 					return nil
 				}))
@@ -714,185 +1016,242 @@ func TestSplitAndCacheMiddleware_ResultsCacheFuzzy(t *testing.T) {
 func TestSplitAndCacheMiddleware_ResultsCache_ExtentsEdgeCases(t *testing.T) {
 	const userID = "user-1"
 
+	now := time.Now().UnixMilli()
 	tests := map[string]struct {
-		req                    Request
+		req                    MetricsQueryRequest
 		cachedExtents          []Extent
 		expectedUpdatedExtents bool
 		expectedCachedExtents  []Extent
 	}{
 		"Should drop tiny extent that overlaps with non-tiny request only": {
 			req: &PrometheusRangeQueryRequest{
-				Start: 100,
-				End:   120,
-				Step:  5,
+				start:     100,
+				end:       120,
+				step:      5,
+				queryExpr: parseQuery(t, "foo"),
 			},
 			cachedExtents: []Extent{
-				mkExtentWithStep(0, 50, 5),
-				mkExtentWithStep(60, 65, 5),
-				mkExtentWithStep(100, 105, 5),
-				mkExtentWithStep(110, 150, 5),
-				mkExtentWithStep(160, 165, 5),
+				mkExtentWithStepAndQueryTime(0, 50, 5, now),
+				mkExtentWithStepAndQueryTime(60, 65, 5, now),
+				mkExtentWithStepAndQueryTime(100, 105, 5, now), // dropped
+				mkExtentWithStepAndQueryTime(110, 150, 5, now),
+				mkExtentWithStepAndQueryTime(160, 165, 5, now),
 			},
 			expectedUpdatedExtents: true,
 			expectedCachedExtents: []Extent{
-				mkExtentWithStep(0, 50, 5),
-				mkExtentWithStep(60, 65, 5),
-				mkExtentWithStep(100, 150, 5),
-				mkExtentWithStep(160, 165, 5),
+				mkExtentWithStepAndQueryTime(0, 50, 5, now),
+				mkExtentWithStepAndQueryTime(60, 65, 5, now),
+				mkExtentWithStepAndQueryTime(100, 150, 5, now),
+				mkExtentWithStepAndQueryTime(160, 165, 5, now),
 			},
 		},
-		"Should replace tiny extents that are cover by bigger request": {
+		"Should replace tiny extents that are covered by bigger request": {
 			req: &PrometheusRangeQueryRequest{
-				Start: 100,
-				End:   200,
-				Step:  5,
+				start:     100,
+				end:       200,
+				step:      5,
+				queryExpr: parseQuery(t, "foo"),
 			},
 			cachedExtents: []Extent{
-				mkExtentWithStep(0, 50, 5),
-				mkExtentWithStep(60, 65, 5),
-				mkExtentWithStep(100, 105, 5),
-				mkExtentWithStep(110, 115, 5),
-				mkExtentWithStep(120, 125, 5),
-				mkExtentWithStep(220, 225, 5),
-				mkExtentWithStep(240, 250, 5),
+				mkExtentWithStepAndQueryTime(0, 50, 5, now-10),
+				mkExtentWithStepAndQueryTime(60, 65, 5, now-20),
+				mkExtentWithStepAndQueryTime(100, 105, 5, now-30),
+				mkExtentWithStepAndQueryTime(110, 115, 5, now-40),
+				mkExtentWithStepAndQueryTime(120, 125, 5, now-50),
+				mkExtentWithStepAndQueryTime(220, 225, 5, now-60),
+				mkExtentWithStepAndQueryTime(240, 250, 5, now-70),
 			},
 			expectedUpdatedExtents: true,
 			expectedCachedExtents: []Extent{
-				mkExtentWithStep(0, 50, 5),
-				mkExtentWithStep(60, 65, 5),
-				mkExtentWithStep(100, 200, 5),
-				mkExtentWithStep(220, 225, 5),
-				mkExtentWithStep(240, 250, 5),
+				mkExtentWithStepAndQueryTime(0, 50, 5, now-10),
+				mkExtentWithStepAndQueryTime(60, 65, 5, now-20),
+				mkExtentWithStepAndQueryTime(100, 200, 5, now-50),
+				mkExtentWithStepAndQueryTime(220, 225, 5, now-60),
+				mkExtentWithStepAndQueryTime(240, 250, 5, now-70),
 			},
 		},
 		"Should not drop tiny extent that completely overlaps with tiny request": {
 			req: &PrometheusRangeQueryRequest{
-				Start: 100,
-				End:   105,
-				Step:  5,
+				start:     100,
+				end:       105,
+				step:      5,
+				queryExpr: parseQuery(t, "foo"),
 			},
 			cachedExtents: []Extent{
-				mkExtentWithStep(0, 50, 5),
-				mkExtentWithStep(60, 65, 5),
-				mkExtentWithStep(100, 105, 5),
-				mkExtentWithStep(160, 165, 5),
+				mkExtentWithStepAndQueryTime(0, 50, 5, now),
+				mkExtentWithStepAndQueryTime(60, 65, 5, now),
+				mkExtentWithStepAndQueryTime(100, 105, 5, now),
+				mkExtentWithStepAndQueryTime(160, 165, 5, now),
 			},
 			// No cache update need, request fulfilled using cache
 			expectedUpdatedExtents: false,
 			// We expect the same extents in the cache (no changes).
 			expectedCachedExtents: []Extent{
-				mkExtentWithStep(0, 50, 5),
-				mkExtentWithStep(60, 65, 5),
-				mkExtentWithStep(100, 105, 5),
-				mkExtentWithStep(160, 165, 5),
+				mkExtentWithStepAndQueryTime(0, 50, 5, now),
+				mkExtentWithStepAndQueryTime(60, 65, 5, now),
+				mkExtentWithStepAndQueryTime(100, 105, 5, now),
+				mkExtentWithStepAndQueryTime(160, 165, 5, now),
 			},
 		},
 		"Should not drop tiny extent that partially center-overlaps with tiny request": {
 			req: &PrometheusRangeQueryRequest{
-				Start: 106,
-				End:   108,
-				Step:  2,
+				start:     106,
+				end:       108,
+				step:      2,
+				queryExpr: parseQuery(t, "foo"),
 			},
 			cachedExtents: []Extent{
-				mkExtentWithStep(60, 64, 2),
-				mkExtentWithStep(104, 110, 2),
-				mkExtentWithStep(160, 166, 2),
+				mkExtentWithStepAndQueryTime(60, 64, 2, now),
+				mkExtentWithStepAndQueryTime(104, 110, 2, now),
+				mkExtentWithStepAndQueryTime(160, 166, 2, now),
 			},
 			// No cache update need, request fulfilled using cache
 			expectedUpdatedExtents: false,
 			// We expect the same extents in the cache (no changes).
 			expectedCachedExtents: []Extent{
-				mkExtentWithStep(60, 64, 2),
-				mkExtentWithStep(104, 110, 2),
-				mkExtentWithStep(160, 166, 2),
+				mkExtentWithStepAndQueryTime(60, 64, 2, now),
+				mkExtentWithStepAndQueryTime(104, 110, 2, now),
+				mkExtentWithStepAndQueryTime(160, 166, 2, now),
 			},
 		},
 		"Should not drop tiny extent that partially left-overlaps with tiny request": {
 			req: &PrometheusRangeQueryRequest{
-				Start: 100,
-				End:   106,
-				Step:  2,
+				start:     100,
+				end:       106,
+				step:      2,
+				queryExpr: parseQuery(t, "foo"),
 			},
 			cachedExtents: []Extent{
-				mkExtentWithStep(60, 64, 2),
-				mkExtentWithStep(104, 110, 2),
-				mkExtentWithStep(160, 166, 2),
+				mkExtentWithStepAndQueryTime(60, 64, 2, now),
+				mkExtentWithStepAndQueryTime(104, 110, 2, now-100),
+				mkExtentWithStepAndQueryTime(160, 166, 2, now),
 			},
 			expectedUpdatedExtents: true,
 			expectedCachedExtents: []Extent{
-				mkExtentWithStep(60, 64, 2),
-				mkExtentWithStep(100, 110, 2),
-				mkExtentWithStep(160, 166, 2),
+				mkExtentWithStepAndQueryTime(60, 64, 2, now),
+				mkExtentWithStepAndQueryTime(100, 110, 2, now-100),
+				mkExtentWithStepAndQueryTime(160, 166, 2, now),
 			},
 		},
 		"Should not drop tiny extent that partially right-overlaps with tiny request": {
 			req: &PrometheusRangeQueryRequest{
-				Start: 100,
-				End:   106,
-				Step:  2,
+				start:     100,
+				end:       106,
+				step:      2,
+				queryExpr: parseQuery(t, "foo"),
 			},
 			cachedExtents: []Extent{
-				mkExtentWithStep(60, 64, 2),
-				mkExtentWithStep(98, 102, 2),
-				mkExtentWithStep(160, 166, 2),
+				mkExtentWithStepAndQueryTime(60, 64, 2, now),
+				mkExtentWithStepAndQueryTime(98, 102, 2, now-100),
+				mkExtentWithStepAndQueryTime(160, 166, 2, now),
 			},
 			expectedUpdatedExtents: true,
 			expectedCachedExtents: []Extent{
-				mkExtentWithStep(60, 64, 2),
-				mkExtentWithStep(98, 106, 2),
-				mkExtentWithStep(160, 166, 2),
+				mkExtentWithStepAndQueryTime(60, 64, 2, now),
+				mkExtentWithStepAndQueryTime(98, 106, 2, now-100),
+				mkExtentWithStepAndQueryTime(160, 166, 2, now),
 			},
 		},
 		"Should merge fragmented extents if request fills the hole": {
 			req: &PrometheusRangeQueryRequest{
-				Start: 40,
-				End:   80,
-				Step:  20,
+				start:     40,
+				end:       80,
+				step:      20,
+				queryExpr: parseQuery(t, "foo"),
 			},
 			cachedExtents: []Extent{
-				mkExtentWithStep(0, 20, 20),
-				mkExtentWithStep(80, 100, 20),
+				mkExtentWithStepAndQueryTime(0, 20, 20, now-100),
+				mkExtentWithStepAndQueryTime(80, 100, 20, now-200),
 			},
 			expectedUpdatedExtents: true,
 			expectedCachedExtents: []Extent{
-				mkExtentWithStep(0, 100, 20),
+				mkExtentWithStepAndQueryTime(0, 100, 20, now-200),
 			},
 		},
 		"Should left-extend extent if request starts earlier than extent in cache": {
 			req: &PrometheusRangeQueryRequest{
-				Start: 40,
-				End:   80,
-				Step:  20,
+				start:     40,
+				end:       80,
+				step:      20,
+				queryExpr: parseQuery(t, "foo"),
 			},
 			cachedExtents: []Extent{
-				mkExtentWithStep(60, 160, 20),
+				mkExtentWithStepAndQueryTime(60, 160, 20, now-100),
 			},
 			expectedUpdatedExtents: true,
 			expectedCachedExtents: []Extent{
-				mkExtentWithStep(40, 160, 20),
+				mkExtentWithStepAndQueryTime(40, 160, 20, now-100),
+			},
+		},
+		"Should left-extend extent if request starts earlier than extent in cache, but keep oldest time": {
+			req: &PrometheusRangeQueryRequest{
+				start:     40,
+				end:       80,
+				step:      20,
+				queryExpr: parseQuery(t, "foo"),
+			},
+			cachedExtents: []Extent{
+				mkExtentWithStepAndQueryTime(60, 160, 20, now+100),
+			},
+			expectedUpdatedExtents: true,
+			expectedCachedExtents: []Extent{
+				// "now" is also used as query time during the test, and this is lower than "now+100"
+				mkExtentWithStepAndQueryTime(40, 160, 20, now),
+			},
+		},
+		"Should left-extend extent with zero query timestamp if request starts earlier than extent in cache and use recent query timestamp": {
+			req: &PrometheusRangeQueryRequest{
+				start:     40,
+				end:       80,
+				step:      20,
+				queryExpr: parseQuery(t, "foo"),
+			},
+			cachedExtents: []Extent{
+				mkExtentWithStepAndQueryTime(60, 160, 20, 0),
+			},
+			expectedUpdatedExtents: true,
+			expectedCachedExtents: []Extent{
+				mkExtentWithStepAndQueryTime(40, 160, 20, now),
 			},
 		},
 		"Should right-extend extent if request ends later than extent in cache": {
 			req: &PrometheusRangeQueryRequest{
-				Start: 100,
-				End:   180,
-				Step:  20,
+				start:     100,
+				end:       180,
+				step:      20,
+				queryExpr: parseQuery(t, "foo"),
 			},
 			cachedExtents: []Extent{
-				mkExtentWithStep(60, 160, 20),
+				mkExtentWithStepAndQueryTime(60, 160, 20, now-100),
 			},
 			expectedUpdatedExtents: true,
 			expectedCachedExtents: []Extent{
-				mkExtentWithStep(60, 180, 20),
+				mkExtentWithStepAndQueryTime(60, 180, 20, now-100),
+			},
+		},
+		"Should right-extend extent with zero query timestamp if request ends later than extent in cache": {
+			req: &PrometheusRangeQueryRequest{
+				start:     100,
+				end:       180,
+				step:      20,
+				queryExpr: parseQuery(t, "foo"),
+			},
+			cachedExtents: []Extent{
+				mkExtentWithStepAndQueryTime(60, 160, 20, 0),
+			},
+			expectedUpdatedExtents: true,
+			expectedCachedExtents: []Extent{
+				mkExtentWithStepAndQueryTime(60, 180, 20, now),
 			},
 		},
 		"Should not throw error if complete-overlapped smaller Extent is erroneous": {
 			req: &PrometheusRangeQueryRequest{
 				// This request is carefully crafted such that cachedEntry is not used to fulfill
 				// the request.
-				Start: 160,
-				End:   180,
-				Step:  20,
+				start:     160,
+				end:       180,
+				step:      20,
+				queryExpr: parseQuery(t, "foo"),
 			},
 			cachedExtents: []Extent{
 				{
@@ -904,11 +1263,11 @@ func TestSplitAndCacheMiddleware_ResultsCache_ExtentsEdgeCases(t *testing.T) {
 					// this bad Extent should be dropped. The good Extent below can be used instead.
 					Response: nil,
 				},
-				mkExtentWithStep(60, 160, 20),
+				mkExtentWithStepAndQueryTime(60, 160, 20, now-100),
 			},
 			expectedUpdatedExtents: true,
 			expectedCachedExtents: []Extent{
-				mkExtentWithStep(60, 180, 20),
+				mkExtentWithStepAndQueryTime(60, 180, 20, now-100),
 			},
 		},
 	}
@@ -917,28 +1276,28 @@ func TestSplitAndCacheMiddleware_ResultsCache_ExtentsEdgeCases(t *testing.T) {
 		t.Run(testName, func(t *testing.T) {
 			ctx := user.InjectOrgID(context.Background(), userID)
 			cacheBackend := cache.NewInstrumentedMockCache()
-			cacheSplitter := ConstSplitter(day)
+			keyGenerator := DefaultCacheKeyGenerator{interval: day}
 
 			mw := newSplitAndCacheMiddleware(
 				false, // No splitting.
 				true,
 				24*time.Hour,
-				false,
-				mockLimits{},
+				mockLimits{resultsCacheTTL: resultsCacheTTL, resultsCacheOutOfOrderWindowTTL: resultsCacheLowerTTL},
 				newTestPrometheusCodec(),
 				cacheBackend,
-				cacheSplitter,
+				keyGenerator,
 				PrometheusResponseExtractor{},
 				resultsCacheAlwaysEnabled,
 				log.NewNopLogger(),
 				prometheus.NewPedanticRegistry(),
-			).Wrap(HandlerFunc(func(_ context.Context, req Request) (Response, error) {
+			).Wrap(HandlerFunc(func(_ context.Context, req MetricsQueryRequest) (Response, error) {
 				return mkAPIResponse(req.GetStart(), req.GetEnd(), req.GetStep()), nil
 			})).(*splitAndCacheMiddleware)
+			mw.currentTime = func() time.Time { return time.UnixMilli(now) }
 
 			// Store all extents fixtures in the cache.
-			cacheKey := cacheSplitter.GenerateCacheKey(ctx, userID, testData.req)
-			mw.storeCacheExtents(ctx, cacheKey, []string{userID}, testData.cachedExtents)
+			cacheKey := keyGenerator.QueryRequest(ctx, userID, testData.req)
+			mw.storeCacheExtents(cacheKey, []string{userID}, testData.cachedExtents)
 
 			// Run the request.
 			actualRes, err := mw.Do(ctx, testData.req)
@@ -948,7 +1307,7 @@ func TestSplitAndCacheMiddleware_ResultsCache_ExtentsEdgeCases(t *testing.T) {
 			assert.Equal(t, expectedResponse, actualRes)
 
 			// Check the updated cached extents.
-			actualExtents := mw.fetchCacheExtents(ctx, []string{cacheKey})
+			actualExtents := mw.fetchCacheExtents(ctx, time.UnixMilli(now), []string{userID}, []string{cacheKey})
 			require.Len(t, actualExtents, 1)
 			assert.Equal(t, testData.expectedCachedExtents, actualExtents[0])
 
@@ -968,11 +1327,14 @@ func TestSplitAndCacheMiddleware_StoreAndFetchCacheExtents(t *testing.T) {
 		false,
 		true,
 		24*time.Hour,
-		false,
-		mockLimits{},
+		mockLimits{
+			resultsCacheTTL:                 1 * time.Hour,
+			resultsCacheOutOfOrderWindowTTL: 10 * time.Minute,
+			outOfOrderTimeWindow:            30 * time.Minute,
+		},
 		newTestPrometheusCodec(),
 		cacheBackend,
-		ConstSplitter(day),
+		DefaultCacheKeyGenerator{interval: day},
 		PrometheusResponseExtractor{},
 		resultsCacheAlwaysEnabled,
 		log.NewNopLogger(),
@@ -982,16 +1344,16 @@ func TestSplitAndCacheMiddleware_StoreAndFetchCacheExtents(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("fetchCacheExtents() should return a slice with the same number of input keys but empty extents on cache miss", func(t *testing.T) {
-		actual := mw.fetchCacheExtents(ctx, []string{"key-1", "key-2", "key-3"})
+		actual := mw.fetchCacheExtents(ctx, time.Now(), []string{"tenant"}, []string{"key-1", "key-2", "key-3"})
 		expected := [][]Extent{nil, nil, nil}
 		assert.Equal(t, expected, actual)
 	})
 
 	t.Run("fetchCacheExtents() should return a slice with the same number of input keys and some extends filled up on partial cache hit", func(t *testing.T) {
-		mw.storeCacheExtents(ctx, "key-1", nil, []Extent{mkExtent(10, 20)})
-		mw.storeCacheExtents(ctx, "key-3", nil, []Extent{mkExtent(20, 30), mkExtent(40, 50)})
+		mw.storeCacheExtents("key-1", []string{"tenant"}, []Extent{mkExtent(10, 20)})
+		mw.storeCacheExtents("key-3", []string{"tenant"}, []Extent{mkExtent(20, 30), mkExtent(40, 50)})
 
-		actual := mw.fetchCacheExtents(ctx, []string{"key-1", "key-2", "key-3"})
+		actual := mw.fetchCacheExtents(ctx, time.Now(), []string{"tenant"}, []string{"key-1", "key-2", "key-3"})
 		expected := [][]Extent{{mkExtent(10, 20)}, nil, {mkExtent(20, 30), mkExtent(40, 50)}}
 		assert.Equal(t, expected, actual)
 	})
@@ -1000,12 +1362,47 @@ func TestSplitAndCacheMiddleware_StoreAndFetchCacheExtents(t *testing.T) {
 		// Simulate an hash collision on "key-1".
 		buf, err := proto.Marshal(&CachedResponse{Key: "another", Extents: []Extent{mkExtent(10, 20)}})
 		require.NoError(t, err)
-		cacheBackend.Store(ctx, map[string][]byte{cacheHashKey("key-1"): buf}, 0)
+		cacheBackend.SetMultiAsync(map[string][]byte{cacheHashKey("key-1"): buf}, 0)
 
-		mw.storeCacheExtents(ctx, "key-3", nil, []Extent{mkExtent(20, 30), mkExtent(40, 50)})
+		mw.storeCacheExtents("key-3", []string{"tenant"}, []Extent{mkExtent(20, 30), mkExtent(40, 50)})
 
-		actual := mw.fetchCacheExtents(ctx, []string{"key-1", "key-2", "key-3"})
+		actual := mw.fetchCacheExtents(ctx, time.Now(), []string{"tenant"}, []string{"key-1", "key-2", "key-3"})
 		expected := [][]Extent{nil, nil, {mkExtent(20, 30), mkExtent(40, 50)}}
+		assert.Equal(t, expected, actual)
+	})
+
+	t.Run("fetchCacheExtents() should filter out extents that are outside of configured TTL", func(t *testing.T) {
+		now := time.Now().UnixMilli()
+
+		// Query time outside of TTL (1h), extent ends outside of OOO window (30m) -- will be filtered out.
+		e1 := mkExtentWithStepAndQueryTime(10, 20, 10, now-3*time.Hour.Milliseconds())
+		mw.storeCacheExtents("key-1", []string{"tenant"}, []Extent{e1})
+
+		// Query time inside of TTL (1h), extent ends outside of OOO window (30m) -- will be used.
+		e2 := mkExtentWithStepAndQueryTime(20, 30, 10, now-45*time.Minute.Milliseconds())
+		mw.storeCacheExtents("key-2", []string{"tenant"}, []Extent{e2})
+
+		// Query time outside of (short) TTL (10m), extent ends inside of OOO window (30min)
+		extentEnd := now - 25*time.Minute.Milliseconds()
+		e3 := mkExtentWithStepAndQueryTime(extentEnd-100, extentEnd, 10, now-15*time.Minute.Milliseconds())
+		mw.storeCacheExtents("key-3", []string{"tenant"}, []Extent{e3})
+
+		// Query time inside of (short) TTL (10m), extent ends inside of OOO window (30min)
+		e4 := mkExtentWithStepAndQueryTime(extentEnd-100, extentEnd, 10, now-5*time.Minute.Milliseconds())
+		mw.storeCacheExtents("key-4", []string{"tenant"}, []Extent{e4})
+
+		// No query time, extent ends inside of OOO window (30min). This will be used.
+		e5 := mkExtentWithStepAndQueryTime(extentEnd-100, extentEnd, 10, 0)
+		mw.storeCacheExtents("key-5", []string{"tenant"}, []Extent{e5})
+
+		actual := mw.fetchCacheExtents(ctx, time.UnixMilli(now), []string{"tenant"}, []string{"key-1", "key-2", "key-3", "key-4", "key-5"})
+		expected := [][]Extent{
+			nil,
+			{e2},
+			nil,
+			{e4},
+			{e5},
+		}
 		assert.Equal(t, expected, actual)
 	})
 }
@@ -1015,11 +1412,10 @@ func TestSplitAndCacheMiddleware_WrapMultipleTimes(t *testing.T) {
 		false,
 		true,
 		24*time.Hour,
-		false,
 		mockLimits{},
 		newTestPrometheusCodec(),
 		cache.NewMockCache(),
-		ConstSplitter(day),
+		DefaultCacheKeyGenerator{interval: day},
 		PrometheusResponseExtractor{},
 		resultsCacheAlwaysEnabled,
 		log.NewNopLogger(),
@@ -1035,7 +1431,7 @@ func TestSplitAndCacheMiddleware_WrapMultipleTimes(t *testing.T) {
 func TestSplitRequests_prepareDownstreamRequests(t *testing.T) {
 	tests := map[string]struct {
 		input    splitRequests
-		expected []Request
+		expected []MetricsQueryRequest
 	}{
 		"should return an empty slice on no downstream requests": {
 			input:    nil,
@@ -1043,14 +1439,14 @@ func TestSplitRequests_prepareDownstreamRequests(t *testing.T) {
 		},
 		"should inject ID and hints on downstream requests and return them": {
 			input: splitRequests{
-				{downstreamRequests: []Request{&PrometheusRangeQueryRequest{Start: 1}, &PrometheusRangeQueryRequest{Start: 2}}},
-				{downstreamRequests: []Request{}},
-				{downstreamRequests: []Request{&PrometheusRangeQueryRequest{Start: 3}}},
+				{downstreamRequests: []MetricsQueryRequest{&PrometheusRangeQueryRequest{start: 1}, &PrometheusRangeQueryRequest{start: 2}}},
+				{downstreamRequests: []MetricsQueryRequest{}},
+				{downstreamRequests: []MetricsQueryRequest{&PrometheusRangeQueryRequest{start: 3}}},
 			},
-			expected: []Request{
-				(&PrometheusRangeQueryRequest{Start: 1}).WithID(1).WithTotalQueriesHint(3),
-				(&PrometheusRangeQueryRequest{Start: 2}).WithID(2).WithTotalQueriesHint(3),
-				(&PrometheusRangeQueryRequest{Start: 3}).WithID(3).WithTotalQueriesHint(3),
+			expected: []MetricsQueryRequest{
+				mustSucceed(mustSucceed((&PrometheusRangeQueryRequest{start: 1}).WithID(1)).WithTotalQueriesHint(3)),
+				mustSucceed(mustSucceed((&PrometheusRangeQueryRequest{start: 2}).WithID(2)).WithTotalQueriesHint(3)),
+				mustSucceed(mustSucceed((&PrometheusRangeQueryRequest{start: 3}).WithID(3)).WithTotalQueriesHint(3)),
 			},
 		},
 	}
@@ -1062,7 +1458,7 @@ func TestSplitRequests_prepareDownstreamRequests(t *testing.T) {
 				require.Empty(t, req.downstreamResponses)
 			}
 
-			assert.Equal(t, testData.expected, testData.input.prepareDownstreamRequests())
+			assert.Equal(t, testData.expected, mustSucceed(testData.input.prepareDownstreamRequests()))
 
 			// Ensure responses slices have been initialized.
 			for _, req := range testData.input {
@@ -1081,100 +1477,100 @@ func TestSplitRequests_storeDownstreamResponses(t *testing.T) {
 	}{
 		"should do nothing on no downstream requests": {
 			requests: splitRequests{
-				{downstreamRequests: []Request{}},
-				{downstreamRequests: []Request{}},
+				{downstreamRequests: []MetricsQueryRequest{}},
+				{downstreamRequests: []MetricsQueryRequest{}},
 			},
 			responses: nil,
 			expected: splitRequests{
-				{downstreamRequests: []Request{}},
-				{downstreamRequests: []Request{}},
+				{downstreamRequests: []MetricsQueryRequest{}},
+				{downstreamRequests: []MetricsQueryRequest{}},
 			},
 		},
 		"should associate downstream responses to requests": {
 			requests: splitRequests{{
-				downstreamRequests:  []Request{&PrometheusRangeQueryRequest{Start: 1, Id: 1}, &PrometheusRangeQueryRequest{Start: 2, Id: 2}},
+				downstreamRequests:  []MetricsQueryRequest{&PrometheusRangeQueryRequest{start: 1, id: 1}, &PrometheusRangeQueryRequest{start: 2, id: 2}},
 				downstreamResponses: []Response{nil, nil},
 			}, {
-				downstreamRequests:  []Request{},
+				downstreamRequests:  []MetricsQueryRequest{},
 				downstreamResponses: []Response{},
 			}, {
-				downstreamRequests:  []Request{&PrometheusRangeQueryRequest{Start: 3, Id: 3}},
+				downstreamRequests:  []MetricsQueryRequest{&PrometheusRangeQueryRequest{start: 3, id: 3}},
 				downstreamResponses: []Response{nil},
 			}},
 			responses: []requestResponse{{
-				Request:  &PrometheusRangeQueryRequest{Start: 3, Id: 3},
+				Request:  &PrometheusRangeQueryRequest{start: 3, id: 3},
 				Response: &PrometheusResponse{Status: "response-3"},
 			}, {
-				Request:  &PrometheusRangeQueryRequest{Start: 1, Id: 1},
+				Request:  &PrometheusRangeQueryRequest{start: 1, id: 1},
 				Response: &PrometheusResponse{Status: "response-1"},
 			}, {
-				Request:  &PrometheusRangeQueryRequest{Start: 2, Id: 2},
+				Request:  &PrometheusRangeQueryRequest{start: 2, id: 2},
 				Response: &PrometheusResponse{Status: "response-2"},
 			}},
 			expected: splitRequests{{
-				downstreamRequests:  []Request{&PrometheusRangeQueryRequest{Start: 1, Id: 1}, &PrometheusRangeQueryRequest{Start: 2, Id: 2}},
+				downstreamRequests:  []MetricsQueryRequest{&PrometheusRangeQueryRequest{start: 1, id: 1}, &PrometheusRangeQueryRequest{start: 2, id: 2}},
 				downstreamResponses: []Response{&PrometheusResponse{Status: "response-1"}, &PrometheusResponse{Status: "response-2"}},
 			}, {
-				downstreamRequests:  []Request{},
+				downstreamRequests:  []MetricsQueryRequest{},
 				downstreamResponses: []Response{},
 			}, {
-				downstreamRequests:  []Request{&PrometheusRangeQueryRequest{Start: 3, Id: 3}},
+				downstreamRequests:  []MetricsQueryRequest{&PrometheusRangeQueryRequest{start: 3, id: 3}},
 				downstreamResponses: []Response{&PrometheusResponse{Status: "response-3"}},
 			}},
 		},
 		"should return error if a downstream response is missing": {
 			requests: splitRequests{{
-				downstreamRequests:  []Request{&PrometheusRangeQueryRequest{Start: 1, Id: 1}, &PrometheusRangeQueryRequest{Start: 2, Id: 2}},
+				downstreamRequests:  []MetricsQueryRequest{&PrometheusRangeQueryRequest{start: 1, id: 1}, &PrometheusRangeQueryRequest{start: 2, id: 2}},
 				downstreamResponses: []Response{nil, nil},
 			}, {
-				downstreamRequests:  []Request{&PrometheusRangeQueryRequest{Start: 3, Id: 3}},
+				downstreamRequests:  []MetricsQueryRequest{&PrometheusRangeQueryRequest{start: 3, id: 3}},
 				downstreamResponses: []Response{nil},
 			}},
 			responses: []requestResponse{{
-				Request:  &PrometheusRangeQueryRequest{Start: 3, Id: 3},
+				Request:  &PrometheusRangeQueryRequest{start: 3, id: 3},
 				Response: &PrometheusResponse{Status: "response-3"},
 			}, {
-				Request:  &PrometheusRangeQueryRequest{Start: 2, Id: 2},
+				Request:  &PrometheusRangeQueryRequest{start: 2, id: 2},
 				Response: &PrometheusResponse{Status: "response-2"},
 			}},
 			expectedErr: "consistency check failed: missing downstream response",
 		},
 		"should return error if multiple downstream responses have the same ID": {
 			requests: splitRequests{{
-				downstreamRequests:  []Request{&PrometheusRangeQueryRequest{Start: 1, Id: 1}, &PrometheusRangeQueryRequest{Start: 2, Id: 2}},
+				downstreamRequests:  []MetricsQueryRequest{&PrometheusRangeQueryRequest{start: 1, id: 1}, &PrometheusRangeQueryRequest{start: 2, id: 2}},
 				downstreamResponses: []Response{nil, nil},
 			}, {
-				downstreamRequests:  []Request{&PrometheusRangeQueryRequest{Start: 3, Id: 3}},
+				downstreamRequests:  []MetricsQueryRequest{&PrometheusRangeQueryRequest{start: 3, id: 3}},
 				downstreamResponses: []Response{nil},
 			}},
 			responses: []requestResponse{{
-				Request:  &PrometheusRangeQueryRequest{Start: 3, Id: 3},
+				Request:  &PrometheusRangeQueryRequest{start: 3, id: 3},
 				Response: &PrometheusResponse{Status: "response-3"},
 			}, {
-				Request:  &PrometheusRangeQueryRequest{Start: 2, Id: 3},
+				Request:  &PrometheusRangeQueryRequest{start: 2, id: 3},
 				Response: &PrometheusResponse{Status: "response-2"},
 			}},
 			expectedErr: "consistency check failed: conflicting downstream request ID",
 		},
 		"should return error if extra downstream responses are requested to be stored": {
 			requests: splitRequests{{
-				downstreamRequests:  []Request{&PrometheusRangeQueryRequest{Start: 1, Id: 1}, &PrometheusRangeQueryRequest{Start: 2, Id: 2}},
+				downstreamRequests:  []MetricsQueryRequest{&PrometheusRangeQueryRequest{start: 1, id: 1}, &PrometheusRangeQueryRequest{start: 2, id: 2}},
 				downstreamResponses: []Response{nil, nil},
 			}, {
-				downstreamRequests:  []Request{&PrometheusRangeQueryRequest{Start: 3, Id: 3}},
+				downstreamRequests:  []MetricsQueryRequest{&PrometheusRangeQueryRequest{start: 3, id: 3}},
 				downstreamResponses: []Response{nil},
 			}},
 			responses: []requestResponse{{
-				Request:  &PrometheusRangeQueryRequest{Start: 3, Id: 3},
+				Request:  &PrometheusRangeQueryRequest{start: 3, id: 3},
 				Response: &PrometheusResponse{Status: "response-3"},
 			}, {
-				Request:  &PrometheusRangeQueryRequest{Start: 2, Id: 2},
+				Request:  &PrometheusRangeQueryRequest{start: 2, id: 2},
 				Response: &PrometheusResponse{Status: "response-2"},
 			}, {
-				Request:  &PrometheusRangeQueryRequest{Start: 1, Id: 1},
+				Request:  &PrometheusRangeQueryRequest{start: 1, id: 1},
 				Response: &PrometheusResponse{Status: "response-1"},
 			}, {
-				Request:  &PrometheusRangeQueryRequest{Start: 4, Id: 4},
+				Request:  &PrometheusRangeQueryRequest{start: 4, id: 4},
 				Response: &PrometheusResponse{Status: "response-4"},
 			}},
 			expectedErr: "consistency check failed: received more responses than expected (expected: 3, got: 4)",
@@ -1220,15 +1616,37 @@ func mockQueryRangeURL(startTime, endTime time.Time, query string) string {
 	return generated.String()
 }
 
-func encodePrometheusResponse(t *testing.T, res *PrometheusResponse) string {
+func mockProtobufResponseWithSamplesAndHistograms(labels []mimirpb.LabelAdapter, samples []mimirpb.Sample, histograms []mimirpb.FloatHistogramPair) *mimirpb.QueryResponse {
+	return &mimirpb.QueryResponse{
+		Status: mimirpb.QueryResponse_SUCCESS,
+		Data: &mimirpb.QueryResponse_Matrix{
+			Matrix: &mimirpb.MatrixData{
+				Series: []mimirpb.MatrixSeries{
+					{
+						Metric:     stringArrayFromLabels(labels),
+						Samples:    samples,
+						Histograms: histograms,
+					},
+				},
+			},
+		},
+	}
+}
+
+func protobufEncodePrometheusResponse(t *testing.T, res *mimirpb.QueryResponse) []byte {
+	encoded, err := res.Marshal()
+	require.NoError(t, err)
+	return encoded
+}
+
+func jsonEncodePrometheusResponse(t *testing.T, res *PrometheusResponse) string {
 	encoded, err := json.Marshal(res)
 	require.NoError(t, err)
-
 	return string(encoded)
 }
 
-func newAssertHintsMiddleware(t *testing.T, expected *Hints) Middleware {
-	return MiddlewareFunc(func(next Handler) Handler {
+func newAssertHintsMiddleware(t *testing.T, expected *Hints) MetricsQueryMiddleware {
+	return MetricsQueryMiddlewareFunc(func(next MetricsQueryHandler) MetricsQueryHandler {
 		return &assertHintsMiddleware{
 			next:     next,
 			t:        t,
@@ -1238,26 +1656,26 @@ func newAssertHintsMiddleware(t *testing.T, expected *Hints) Middleware {
 }
 
 type assertHintsMiddleware struct {
-	next     Handler
+	next     MetricsQueryHandler
 	t        *testing.T
 	expected *Hints
 }
 
-func (m *assertHintsMiddleware) Do(ctx context.Context, req Request) (Response, error) {
+func (m *assertHintsMiddleware) Do(ctx context.Context, req MetricsQueryRequest) (Response, error) {
 	assert.Equal(m.t, m.expected, req.GetHints())
 	return m.next.Do(ctx, req)
 }
 
 type roundTripper struct {
-	handler Handler
+	handler MetricsQueryHandler
 	codec   Codec
 }
 
 // newRoundTripper merges a set of middlewares into an handler, then inject it into the `next` roundtripper
 // using the codec to translate requests and responses.
-func newRoundTripper(next http.RoundTripper, codec Codec, logger log.Logger, middlewares ...Middleware) http.RoundTripper {
+func newRoundTripper(next http.RoundTripper, codec Codec, logger log.Logger, middlewares ...MetricsQueryMiddleware) http.RoundTripper {
 	return roundTripper{
-		handler: MergeMiddlewares(middlewares...).Wrap(roundTripperHandler{
+		handler: MergeMetricsQueryMiddlewares(middlewares...).Wrap(roundTripperHandler{
 			logger: logger,
 			next:   next,
 			codec:  codec,
@@ -1267,13 +1685,13 @@ func newRoundTripper(next http.RoundTripper, codec Codec, logger log.Logger, mid
 }
 
 func (q roundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
-	request, err := q.codec.DecodeRequest(r.Context(), r)
+	request, err := q.codec.DecodeMetricsQueryRequest(r.Context(), r)
 	if err != nil {
 		return nil, err
 	}
 
 	if span := opentracing.SpanFromContext(r.Context()); span != nil {
-		request.LogToSpan(span)
+		request.AddSpanTags(span)
 	}
 
 	response, err := q.handler.Do(r.Context(), request)
@@ -1281,7 +1699,7 @@ func (q roundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
-	return q.codec.EncodeResponse(r.Context(), response)
+	return q.codec.EncodeMetricsQueryResponse(r.Context(), r, response)
 }
 
 const seconds = 1e3 // 1e3 milliseconds per second.
@@ -1325,158 +1743,178 @@ func TestNextIntervalBoundary(t *testing.T) {
 }
 
 func TestSplitQueryByInterval(t *testing.T) {
+	queryFoo := "foo"
+	queryFooExpr, _ := parser.ParseExpr(queryFoo)
+	queryFooAtStart := "foo @ start()"
+	queryFooAtStartExpr, _ := parser.ParseExpr(queryFooAtStart)
+	queryFooAtZero := "foo @ 0.000"
+	queryFooAtZeroExpr, _ := parser.ParseExpr(queryFooAtZero)
+	queryFooSubqueryAtStart := "sum_over_time(foo[1d:] @ start())"
+	queryFooSubqueryAtStartExpr, _ := parser.ParseExpr(queryFooSubqueryAtStart)
+	queryFooSubqueryAtZero := "sum_over_time(foo[1d:] @ 0.000)"
+	queryFooSubqueryAtZeroExpr, _ := parser.ParseExpr(queryFooSubqueryAtZero)
+	lookbackDelta := 5 * time.Minute
+
 	for i, tc := range []struct {
-		input    Request
-		expected []Request
+		input    MetricsQueryRequest
+		expected []MetricsQueryRequest
 		interval time.Duration
 	}{
 		{
-			input: &PrometheusRangeQueryRequest{Start: 0, End: 60 * 60 * seconds, Step: 15 * seconds, Query: "foo"},
-			expected: []Request{
-				&PrometheusRangeQueryRequest{Start: 0, End: 60 * 60 * seconds, Step: 15 * seconds, Query: "foo"},
+			input: &PrometheusRangeQueryRequest{start: 0, end: 60 * 60 * seconds, step: 15 * seconds, queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+			expected: []MetricsQueryRequest{
+				&PrometheusRangeQueryRequest{start: 0, end: 60 * 60 * seconds, minT: -lookbackDelta.Milliseconds() + 1, maxT: 60 * 60 * seconds, step: 15 * seconds, queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
 			},
 			interval: day,
 		},
 		{
-			input: &PrometheusRangeQueryRequest{Start: 0, End: 60 * 60 * seconds, Step: 15 * seconds, Query: "foo"},
-			expected: []Request{
-				&PrometheusRangeQueryRequest{Start: 0, End: 60 * 60 * seconds, Step: 15 * seconds, Query: "foo"},
+			input: &PrometheusRangeQueryRequest{start: 0, end: 60 * 60 * seconds, step: 15 * seconds, queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+			expected: []MetricsQueryRequest{
+				&PrometheusRangeQueryRequest{start: 0, end: 60 * 60 * seconds, minT: -lookbackDelta.Milliseconds() + 1, maxT: 60 * 60 * seconds, step: 15 * seconds, queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
 			},
 			interval: 3 * time.Hour,
 		},
 		{
-			input: &PrometheusRangeQueryRequest{Start: 0, End: 24 * 3600 * seconds, Step: 15 * seconds, Query: "foo"},
-			expected: []Request{
-				&PrometheusRangeQueryRequest{Start: 0, End: 24 * 3600 * seconds, Step: 15 * seconds, Query: "foo"},
+			input: &PrometheusRangeQueryRequest{start: 0, end: 24 * 3600 * seconds, step: 15 * seconds, queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+			expected: []MetricsQueryRequest{
+				&PrometheusRangeQueryRequest{start: 0, end: 24 * 3600 * seconds, minT: -lookbackDelta.Milliseconds() + 1, maxT: 24 * 3600 * seconds, step: 15 * seconds, queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
 			},
 			interval: day,
 		},
 		{
-			input: &PrometheusRangeQueryRequest{Start: 0, End: 3 * 3600 * seconds, Step: 15 * seconds, Query: "foo"},
-			expected: []Request{
-				&PrometheusRangeQueryRequest{Start: 0, End: 3 * 3600 * seconds, Step: 15 * seconds, Query: "foo"},
+			input: &PrometheusRangeQueryRequest{start: 0, end: 3 * 3600 * seconds, step: 15 * seconds, queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+			expected: []MetricsQueryRequest{
+				&PrometheusRangeQueryRequest{start: 0, end: 3 * 3600 * seconds, minT: -lookbackDelta.Milliseconds() + 1, maxT: 3 * 3600 * seconds, step: 15 * seconds, queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
 			},
 			interval: 3 * time.Hour,
 		},
 		{
-			input: &PrometheusRangeQueryRequest{Start: 0, End: 2 * 24 * 3600 * seconds, Step: 15 * seconds, Query: "foo @ start()"},
-			expected: []Request{
-				&PrometheusRangeQueryRequest{Start: 0, End: (24 * 3600 * seconds) - (15 * seconds), Step: 15 * seconds, Query: "foo @ 0.000"},
-				&PrometheusRangeQueryRequest{Start: 24 * 3600 * seconds, End: 2 * 24 * 3600 * seconds, Step: 15 * seconds, Query: "foo @ 0.000"},
+			input: &PrometheusRangeQueryRequest{start: 0, end: 2 * 24 * 3600 * seconds, step: 15 * seconds, queryExpr: queryFooAtStartExpr, lookbackDelta: lookbackDelta},
+			expected: []MetricsQueryRequest{
+				&PrometheusRangeQueryRequest{start: 0, end: (24 * 3600 * seconds) - (15 * seconds), minT: -lookbackDelta.Milliseconds() + 1, step: 15 * seconds, queryExpr: queryFooAtZeroExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: 24 * 3600 * seconds, end: 2 * 24 * 3600 * seconds, minT: -lookbackDelta.Milliseconds() + 1, step: 15 * seconds, queryExpr: queryFooAtZeroExpr, lookbackDelta: lookbackDelta},
 			},
 			interval: day,
 		},
 		{
-			input: &PrometheusRangeQueryRequest{Start: 0, End: 2 * 3 * 3600 * seconds, Step: 15 * seconds, Query: "foo"},
-			expected: []Request{
-				&PrometheusRangeQueryRequest{Start: 0, End: (3 * 3600 * seconds) - (15 * seconds), Step: 15 * seconds, Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: 3 * 3600 * seconds, End: 2 * 3 * 3600 * seconds, Step: 15 * seconds, Query: "foo"},
+			input: &PrometheusRangeQueryRequest{minT: -(24 * 3600 * seconds), start: 0, end: 2 * 24 * 3600 * seconds, step: 15 * seconds, queryExpr: queryFooSubqueryAtStartExpr, lookbackDelta: lookbackDelta},
+			expected: []MetricsQueryRequest{
+				&PrometheusRangeQueryRequest{minT: -(24 * 3600 * seconds) - lookbackDelta.Milliseconds() + 1, start: 0, end: (24 * 3600 * seconds) - (15 * seconds), step: 15 * seconds, queryExpr: queryFooSubqueryAtZeroExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{minT: -(24 * 3600 * seconds) - lookbackDelta.Milliseconds() + 1, start: 24 * 3600 * seconds, end: 2 * 24 * 3600 * seconds, step: 15 * seconds, queryExpr: queryFooSubqueryAtZeroExpr, lookbackDelta: lookbackDelta},
+			},
+			interval: day,
+		},
+		{
+			input: &PrometheusRangeQueryRequest{start: 0, end: 2 * 3 * 3600 * seconds, step: 15 * seconds, queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+			expected: []MetricsQueryRequest{
+				&PrometheusRangeQueryRequest{start: 0, end: (3 * 3600 * seconds) - (15 * seconds), minT: -lookbackDelta.Milliseconds() + 1, maxT: (3 * 3600 * seconds) - (15 * seconds), step: 15 * seconds, queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: 3 * 3600 * seconds, end: 2 * 3 * 3600 * seconds, minT: 3*3600*seconds - lookbackDelta.Milliseconds() + 1, maxT: 2 * 3 * 3600 * seconds, step: 15 * seconds, queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
 			},
 			interval: 3 * time.Hour,
 		},
 		{
-			input: &PrometheusRangeQueryRequest{Start: 3 * 3600 * seconds, End: 3 * 24 * 3600 * seconds, Step: 15 * seconds, Query: "foo"},
-			expected: []Request{
-				&PrometheusRangeQueryRequest{Start: 3 * 3600 * seconds, End: (24 * 3600 * seconds) - (15 * seconds), Step: 15 * seconds, Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: 24 * 3600 * seconds, End: (2 * 24 * 3600 * seconds) - (15 * seconds), Step: 15 * seconds, Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: 2 * 24 * 3600 * seconds, End: 3 * 24 * 3600 * seconds, Step: 15 * seconds, Query: "foo"},
+			input: &PrometheusRangeQueryRequest{start: 3 * 3600 * seconds, end: 3 * 24 * 3600 * seconds, step: 15 * seconds, queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+			expected: []MetricsQueryRequest{
+				&PrometheusRangeQueryRequest{start: 3 * 3600 * seconds, minT: 3*3600*seconds - lookbackDelta.Milliseconds() + 1, end: (24 * 3600 * seconds) - (15 * seconds), maxT: (24 * 3600 * seconds) - (15 * seconds), step: 15 * seconds, queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: 24 * 3600 * seconds, minT: 24*3600*seconds - lookbackDelta.Milliseconds() + 1, end: (2 * 24 * 3600 * seconds) - (15 * seconds), maxT: (2 * 24 * 3600 * seconds) - (15 * seconds), step: 15 * seconds, queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: 2 * 24 * 3600 * seconds, minT: 2*24*3600*seconds - lookbackDelta.Milliseconds() + 1, end: 3 * 24 * 3600 * seconds, maxT: 3 * 24 * 3600 * seconds, step: 15 * seconds, queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
 			},
 			interval: day,
 		},
 		{
-			input: &PrometheusRangeQueryRequest{Start: 2 * 3600 * seconds, End: 3 * 3 * 3600 * seconds, Step: 15 * seconds, Query: "foo"},
-			expected: []Request{
-				&PrometheusRangeQueryRequest{Start: 2 * 3600 * seconds, End: (3 * 3600 * seconds) - (15 * seconds), Step: 15 * seconds, Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: 3 * 3600 * seconds, End: (2 * 3 * 3600 * seconds) - (15 * seconds), Step: 15 * seconds, Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: 2 * 3 * 3600 * seconds, End: 3 * 3 * 3600 * seconds, Step: 15 * seconds, Query: "foo"},
+			input: &PrometheusRangeQueryRequest{start: 2 * 3600 * seconds, end: 3 * 3 * 3600 * seconds, step: 15 * seconds, queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+			expected: []MetricsQueryRequest{
+				&PrometheusRangeQueryRequest{start: 2 * 3600 * seconds, end: (3 * 3600 * seconds) - (15 * seconds), minT: 2*3600*seconds - lookbackDelta.Milliseconds() + 1, maxT: (3 * 3600 * seconds) - (15 * seconds), step: 15 * seconds, queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: 3 * 3600 * seconds, end: (2 * 3 * 3600 * seconds) - (15 * seconds), minT: 3*3600*seconds - lookbackDelta.Milliseconds() + 1, maxT: (2 * 3 * 3600 * seconds) - (15 * seconds), step: 15 * seconds, queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: 2 * 3 * 3600 * seconds, end: 3 * 3 * 3600 * seconds, minT: 2*3*3600*seconds - lookbackDelta.Milliseconds() + 1, maxT: 3 * 3 * 3600 * seconds, step: 15 * seconds, queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
 			},
 			interval: 3 * time.Hour,
 		},
 		{
-			input: &PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-14T23:48:00Z"), End: timeToMillis(t, "2021-10-15T00:03:00Z"), Step: 5 * time.Minute.Milliseconds(), Query: "foo"},
-			expected: []Request{
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-14T23:48:00Z"), End: timeToMillis(t, "2021-10-15T00:03:00Z"), Step: 5 * time.Minute.Milliseconds(), Query: "foo"},
+			input: &PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-14T23:48:00Z"), end: timeToMillis(t, "2021-10-15T00:03:00Z"), step: 5 * time.Minute.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+			expected: []MetricsQueryRequest{
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-14T23:48:00Z"), end: timeToMillis(t, "2021-10-15T00:03:00Z"), minT: timeToMillis(t, "2021-10-14T23:48:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-15T00:03:00Z"), step: 5 * time.Minute.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
 			},
 			interval: day,
 		},
 		{
-			input: &PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-14T23:48:00Z"), End: timeToMillis(t, "2021-10-15T00:00:00Z"), Step: 6 * time.Minute.Milliseconds(), Query: "foo"},
-			expected: []Request{
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-14T23:48:00Z"), End: timeToMillis(t, "2021-10-14T23:54:00Z"), Step: 6 * time.Minute.Milliseconds(), Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-15T00:00:00Z"), End: timeToMillis(t, "2021-10-15T00:00:00Z"), Step: 6 * time.Minute.Milliseconds(), Query: "foo"},
+			input: &PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-14T23:48:00Z"), end: timeToMillis(t, "2021-10-15T00:00:00Z"), step: 6 * time.Minute.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+			expected: []MetricsQueryRequest{
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-14T23:48:00Z"), end: timeToMillis(t, "2021-10-14T23:54:00Z"), minT: timeToMillis(t, "2021-10-14T23:48:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-14T23:54:00Z"), step: 6 * time.Minute.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-15T00:00:00Z"), end: timeToMillis(t, "2021-10-15T00:00:00Z"), minT: timeToMillis(t, "2021-10-15T00:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-15T00:00:00Z"), step: 6 * time.Minute.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
 			},
 			interval: day,
 		},
 		{
-			input: &PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-14T22:00:00Z"), End: timeToMillis(t, "2021-10-17T22:00:00Z"), Step: 24 * time.Hour.Milliseconds(), Query: "foo"},
-			expected: []Request{
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-14T22:00:00Z"), End: timeToMillis(t, "2021-10-14T22:00:00Z"), Step: 24 * time.Hour.Milliseconds(), Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-15T22:00:00Z"), End: timeToMillis(t, "2021-10-15T22:00:00Z"), Step: 24 * time.Hour.Milliseconds(), Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-16T22:00:00Z"), End: timeToMillis(t, "2021-10-16T22:00:00Z"), Step: 24 * time.Hour.Milliseconds(), Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-17T22:00:00Z"), End: timeToMillis(t, "2021-10-17T22:00:00Z"), Step: 24 * time.Hour.Milliseconds(), Query: "foo"},
+			input: &PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-14T22:00:00Z"), end: timeToMillis(t, "2021-10-17T22:00:00Z"), step: 24 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+			expected: []MetricsQueryRequest{
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-14T22:00:00Z"), end: timeToMillis(t, "2021-10-14T22:00:00Z"), minT: timeToMillis(t, "2021-10-14T22:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-14T22:00:00Z"), step: 24 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-15T22:00:00Z"), end: timeToMillis(t, "2021-10-15T22:00:00Z"), minT: timeToMillis(t, "2021-10-15T22:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-15T22:00:00Z"), step: 24 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-16T22:00:00Z"), end: timeToMillis(t, "2021-10-16T22:00:00Z"), minT: timeToMillis(t, "2021-10-16T22:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-16T22:00:00Z"), step: 24 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-17T22:00:00Z"), end: timeToMillis(t, "2021-10-17T22:00:00Z"), minT: timeToMillis(t, "2021-10-17T22:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-17T22:00:00Z"), step: 24 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
 			},
 			interval: day,
 		},
 		{
-			input: &PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-15T00:00:00Z"), End: timeToMillis(t, "2021-10-18T00:00:00Z"), Step: 24 * time.Hour.Milliseconds(), Query: "foo"},
-			expected: []Request{
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-15T00:00:00Z"), End: timeToMillis(t, "2021-10-15T00:00:00Z"), Step: 24 * time.Hour.Milliseconds(), Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-16T00:00:00Z"), End: timeToMillis(t, "2021-10-16T00:00:00Z"), Step: 24 * time.Hour.Milliseconds(), Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-17T00:00:00Z"), End: timeToMillis(t, "2021-10-17T00:00:00Z"), Step: 24 * time.Hour.Milliseconds(), Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-18T00:00:00Z"), End: timeToMillis(t, "2021-10-18T00:00:00Z"), Step: 24 * time.Hour.Milliseconds(), Query: "foo"},
+			input: &PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-15T00:00:00Z"), end: timeToMillis(t, "2021-10-18T00:00:00Z"), step: 24 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+			expected: []MetricsQueryRequest{
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-15T00:00:00Z"), end: timeToMillis(t, "2021-10-15T00:00:00Z"), minT: timeToMillis(t, "2021-10-15T00:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-15T00:00:00Z"), step: 24 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-16T00:00:00Z"), end: timeToMillis(t, "2021-10-16T00:00:00Z"), minT: timeToMillis(t, "2021-10-16T00:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-16T00:00:00Z"), step: 24 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-17T00:00:00Z"), end: timeToMillis(t, "2021-10-17T00:00:00Z"), minT: timeToMillis(t, "2021-10-17T00:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-17T00:00:00Z"), step: 24 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-18T00:00:00Z"), end: timeToMillis(t, "2021-10-18T00:00:00Z"), minT: timeToMillis(t, "2021-10-18T00:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-18T00:00:00Z"), step: 24 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
 			},
 			interval: day,
 		},
 		{
-			input: &PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-15T22:00:00Z"), End: timeToMillis(t, "2021-10-22T04:00:00Z"), Step: 30 * time.Hour.Milliseconds(), Query: "foo"},
-			expected: []Request{
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-15T22:00:00Z"), End: timeToMillis(t, "2021-10-15T22:00:00Z"), Step: 30 * time.Hour.Milliseconds(), Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-17T04:00:00Z"), End: timeToMillis(t, "2021-10-17T04:00:00Z"), Step: 30 * time.Hour.Milliseconds(), Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-18T10:00:00Z"), End: timeToMillis(t, "2021-10-18T10:00:00Z"), Step: 30 * time.Hour.Milliseconds(), Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-19T16:00:00Z"), End: timeToMillis(t, "2021-10-19T16:00:00Z"), Step: 30 * time.Hour.Milliseconds(), Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-20T22:00:00Z"), End: timeToMillis(t, "2021-10-20T22:00:00Z"), Step: 30 * time.Hour.Milliseconds(), Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-22T04:00:00Z"), End: timeToMillis(t, "2021-10-22T04:00:00Z"), Step: 30 * time.Hour.Milliseconds(), Query: "foo"},
+			input: &PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-15T22:00:00Z"), end: timeToMillis(t, "2021-10-22T04:00:00Z"), step: 30 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+			expected: []MetricsQueryRequest{
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-15T22:00:00Z"), end: timeToMillis(t, "2021-10-15T22:00:00Z"), minT: timeToMillis(t, "2021-10-15T22:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-15T22:00:00Z"), step: 30 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-17T04:00:00Z"), end: timeToMillis(t, "2021-10-17T04:00:00Z"), minT: timeToMillis(t, "2021-10-17T04:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-17T04:00:00Z"), step: 30 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-18T10:00:00Z"), end: timeToMillis(t, "2021-10-18T10:00:00Z"), minT: timeToMillis(t, "2021-10-18T10:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-18T10:00:00Z"), step: 30 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-19T16:00:00Z"), end: timeToMillis(t, "2021-10-19T16:00:00Z"), minT: timeToMillis(t, "2021-10-19T16:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-19T16:00:00Z"), step: 30 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-20T22:00:00Z"), end: timeToMillis(t, "2021-10-20T22:00:00Z"), minT: timeToMillis(t, "2021-10-20T22:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-20T22:00:00Z"), step: 30 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-22T04:00:00Z"), end: timeToMillis(t, "2021-10-22T04:00:00Z"), minT: timeToMillis(t, "2021-10-22T04:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-22T04:00:00Z"), step: 30 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
 			},
 			interval: day,
 		},
 		{
-			input: &PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-15T06:00:00Z"), End: timeToMillis(t, "2021-10-17T14:00:00Z"), Step: 12 * time.Hour.Milliseconds(), Query: "foo"},
-			expected: []Request{
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-15T06:00:00Z"), End: timeToMillis(t, "2021-10-15T18:00:00Z"), Step: 12 * time.Hour.Milliseconds(), Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-16T06:00:00Z"), End: timeToMillis(t, "2021-10-16T18:00:00Z"), Step: 12 * time.Hour.Milliseconds(), Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-17T06:00:00Z"), End: timeToMillis(t, "2021-10-17T14:00:00Z"), Step: 12 * time.Hour.Milliseconds(), Query: "foo"},
+			input: &PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-15T06:00:00Z"), end: timeToMillis(t, "2021-10-17T14:00:00Z"), step: 12 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+			expected: []MetricsQueryRequest{
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-15T06:00:00Z"), end: timeToMillis(t, "2021-10-15T18:00:00Z"), minT: timeToMillis(t, "2021-10-15T06:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-15T18:00:00Z"), step: 12 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-16T06:00:00Z"), end: timeToMillis(t, "2021-10-16T18:00:00Z"), minT: timeToMillis(t, "2021-10-16T06:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-16T18:00:00Z"), step: 12 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-17T06:00:00Z"), end: timeToMillis(t, "2021-10-17T14:00:00Z"), minT: timeToMillis(t, "2021-10-17T06:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-17T14:00:00Z"), step: 12 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
 			},
 			interval: day,
 		},
 		{
-			input: &PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-15T06:00:00Z"), End: timeToMillis(t, "2021-10-17T18:00:00Z"), Step: 12 * time.Hour.Milliseconds(), Query: "foo"},
-			expected: []Request{
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-15T06:00:00Z"), End: timeToMillis(t, "2021-10-15T18:00:00Z"), Step: 12 * time.Hour.Milliseconds(), Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-16T06:00:00Z"), End: timeToMillis(t, "2021-10-16T18:00:00Z"), Step: 12 * time.Hour.Milliseconds(), Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-17T06:00:00Z"), End: timeToMillis(t, "2021-10-17T18:00:00Z"), Step: 12 * time.Hour.Milliseconds(), Query: "foo"},
+			input: &PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-15T06:00:00Z"), end: timeToMillis(t, "2021-10-17T18:00:00Z"), step: 12 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+			expected: []MetricsQueryRequest{
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-15T06:00:00Z"), end: timeToMillis(t, "2021-10-15T18:00:00Z"), minT: timeToMillis(t, "2021-10-15T06:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-15T18:00:00Z"), step: 12 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-16T06:00:00Z"), end: timeToMillis(t, "2021-10-16T18:00:00Z"), minT: timeToMillis(t, "2021-10-16T06:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-16T18:00:00Z"), step: 12 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-17T06:00:00Z"), end: timeToMillis(t, "2021-10-17T18:00:00Z"), minT: timeToMillis(t, "2021-10-17T06:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-17T18:00:00Z"), step: 12 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
 			},
 			interval: day,
 		},
 		{
-			input: &PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-15T06:00:00Z"), End: timeToMillis(t, "2021-10-17T18:00:00Z"), Step: 10 * time.Hour.Milliseconds(), Query: "foo"},
-			expected: []Request{
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-15T06:00:00Z"), End: timeToMillis(t, "2021-10-15T16:00:00Z"), Step: 10 * time.Hour.Milliseconds(), Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-16T02:00:00Z"), End: timeToMillis(t, "2021-10-16T22:00:00Z"), Step: 10 * time.Hour.Milliseconds(), Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-17T08:00:00Z"), End: timeToMillis(t, "2021-10-17T18:00:00Z"), Step: 10 * time.Hour.Milliseconds(), Query: "foo"},
+			input: &PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-15T06:00:00Z"), end: timeToMillis(t, "2021-10-17T18:00:00Z"), step: 10 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+			expected: []MetricsQueryRequest{
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-15T06:00:00Z"), end: timeToMillis(t, "2021-10-15T16:00:00Z"), minT: timeToMillis(t, "2021-10-15T06:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-15T16:00:00Z"), step: 10 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-16T02:00:00Z"), end: timeToMillis(t, "2021-10-16T22:00:00Z"), minT: timeToMillis(t, "2021-10-16T02:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-16T22:00:00Z"), step: 10 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-17T08:00:00Z"), end: timeToMillis(t, "2021-10-17T18:00:00Z"), minT: timeToMillis(t, "2021-10-17T08:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-17T18:00:00Z"), step: 10 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
 			},
 			interval: day,
 		},
 		{
-			input: &PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-15T06:00:00Z"), End: timeToMillis(t, "2021-10-17T08:00:00Z"), Step: 10 * time.Hour.Milliseconds(), Query: "foo"},
-			expected: []Request{
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-15T06:00:00Z"), End: timeToMillis(t, "2021-10-15T16:00:00Z"), Step: 10 * time.Hour.Milliseconds(), Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-16T02:00:00Z"), End: timeToMillis(t, "2021-10-16T22:00:00Z"), Step: 10 * time.Hour.Milliseconds(), Query: "foo"},
-				&PrometheusRangeQueryRequest{Start: timeToMillis(t, "2021-10-17T08:00:00Z"), End: timeToMillis(t, "2021-10-17T08:00:00Z"), Step: 10 * time.Hour.Milliseconds(), Query: "foo"},
+			input: &PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-15T06:00:00Z"), end: timeToMillis(t, "2021-10-17T08:00:00Z"), step: 10 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+			expected: []MetricsQueryRequest{
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-15T06:00:00Z"), end: timeToMillis(t, "2021-10-15T16:00:00Z"), minT: timeToMillis(t, "2021-10-15T06:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-15T16:00:00Z"), step: 10 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-16T02:00:00Z"), end: timeToMillis(t, "2021-10-16T22:00:00Z"), minT: timeToMillis(t, "2021-10-16T02:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-16T22:00:00Z"), step: 10 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
+				&PrometheusRangeQueryRequest{start: timeToMillis(t, "2021-10-17T08:00:00Z"), end: timeToMillis(t, "2021-10-17T08:00:00Z"), minT: timeToMillis(t, "2021-10-17T08:00:00Z") - lookbackDelta.Milliseconds() + 1, maxT: timeToMillis(t, "2021-10-17T08:00:00Z"), step: 10 * time.Hour.Milliseconds(), queryExpr: queryFooExpr, lookbackDelta: lookbackDelta},
 			},
 			interval: day,
 		},
 	} {
-		t.Run(fmt.Sprintf("%d: start: %v, end: %v, step: %v", i, tc.input.GetStart(), tc.input.GetEnd(), tc.input.GetStep()), func(t *testing.T) {
+		t.Run(fmt.Sprintf("%d: start: %v, end: %v, step: %v: %v", i, tc.input.GetStart(), tc.input.GetEnd(), tc.input.GetStep(), tc.input.GetQuery()), func(t *testing.T) {
 			days, err := splitQueryByInterval(tc.input, tc.interval)
 			require.NoError(t, err)
 			require.Equal(t, tc.expected, days)
@@ -1501,6 +1939,8 @@ func Test_evaluateAtModifier(t *testing.T) {
 		{"topk(5, rate(http_requests_total[1h] @ start()))", "topk(5, rate(http_requests_total[1h] @ 1546300.800))", nil},
 		{"topk(5, rate(http_requests_total[1h] @ 0))", "topk(5, rate(http_requests_total[1h] @ 0.000))", nil},
 		{"http_requests_total[1h] @ 10.001", "http_requests_total[1h] @ 10.001", nil},
+		{"sum_over_time(http_requests_total[1h:] @ start())", "sum_over_time(http_requests_total[1h:] @ 1546300.800)", nil},
+		{"sum_over_time((http_requests_total @ end())[1h:] @ start())", "sum_over_time((http_requests_total @ 1646300.800)[1h:] @ 1546300.800)", nil},
 		{
 			`min_over_time(
 				sum by(cluster) (
@@ -1529,9 +1969,8 @@ func Test_evaluateAtModifier(t *testing.T) {
 				[2m:])
 			[10m:])`, nil,
 		},
-		{"sum by (foo) (bar[buzz])", "foo{}", apierror.New(apierror.TypeBadData, `1:19: parse error: bad duration syntax: ""`)},
+		{"sum by (foo) (bar[buzz])", "foo{}", apierror.New(apierror.TypeBadData, `invalid parameter "query": 1:19: parse error: bad number or duration syntax: ""`)},
 	} {
-		tt := tt
 		t.Run(tt.in, func(t *testing.T) {
 			t.Parallel()
 			expectedExpr, err := parser.ParseExpr(tt.expected)
@@ -1551,7 +1990,9 @@ func TestSplitAndCacheMiddlewareLowerTTL(t *testing.T) {
 	mcache := cache.NewMockCache()
 	m := splitAndCacheMiddleware{
 		limits: mockLimits{
-			outOfOrderTimeWindow: model.Duration(time.Hour),
+			outOfOrderTimeWindow:            time.Hour,
+			resultsCacheTTL:                 resultsCacheTTL,
+			resultsCacheOutOfOrderWindowTTL: resultsCacheLowerTTL,
 		},
 		cache: mcache,
 	}
@@ -1586,11 +2027,10 @@ func TestSplitAndCacheMiddlewareLowerTTL(t *testing.T) {
 		},
 	}
 
-	ctx := context.Background()
 	for i, c := range cases {
 		// Store.
 		key := fmt.Sprintf("k%d", i)
-		m.storeCacheExtents(ctx, key, []string{"ten1"}, []Extent{
+		m.storeCacheExtents(key, []string{"ten1"}, []Extent{
 			{Start: 0, End: c.endTime.UnixMilli()},
 		})
 

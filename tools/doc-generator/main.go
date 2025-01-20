@@ -13,14 +13,12 @@ import (
 	"strings"
 	"text/template"
 
+	"github.com/grafana/dskit/flagext"
+
 	"github.com/grafana/mimir/pkg/mimir"
 	util_log "github.com/grafana/mimir/pkg/util/log"
 	"github.com/grafana/mimir/tools/doc-generator/parse"
-)
-
-const (
-	maxLineWidth = 80
-	tabWidth     = 2
+	"github.com/grafana/mimir/tools/doc-generator/write"
 )
 
 func removeFlagPrefix(block *parse.ConfigBlock, prefix string) {
@@ -91,9 +89,9 @@ func annotateFlagPrefix(blocks []*parse.ConfigBlock) {
 }
 
 func generateBlocksMarkdown(blocks []*parse.ConfigBlock) string {
-	md := &markdownWriter{}
-	md.writeConfigDoc(blocks)
-	return md.string()
+	md := &write.MarkdownWriter{}
+	md.WriteConfigDoc(blocks, parse.RootBlocks)
+	return md.String()
 }
 
 func generateBlockMarkdown(blocks []*parse.ConfigBlock, blockName, fieldName string) string {
@@ -103,11 +101,11 @@ func generateBlockMarkdown(blocks []*parse.ConfigBlock, blockName, fieldName str
 			continue
 		}
 
-		md := &markdownWriter{}
+		md := &write.MarkdownWriter{}
 
 		// Wrap the root block with another block, so that we can show the name of the
 		// root field containing the block specs.
-		md.writeConfigBlock(&parse.ConfigBlock{
+		md.WriteConfigBlock(&parse.ConfigBlock{
 			Name: blockName,
 			Desc: block.Desc,
 			Entries: []*parse.ConfigEntry{
@@ -122,7 +120,7 @@ func generateBlockMarkdown(blocks []*parse.ConfigBlock, blockName, fieldName str
 			},
 		})
 
-		return md.string()
+		return md.String()
 	}
 
 	// If the block has not been found, we return an empty string.
@@ -130,14 +128,22 @@ func generateBlockMarkdown(blocks []*parse.ConfigBlock, blockName, fieldName str
 }
 
 func main() {
-	// Parse the generator flags.
-	flag.Parse()
-	if flag.NArg() != 1 {
+	// Clean up all flags registered via init() methods of 3rd-party libraries.
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+
+	// Parse CLI arguments.
+	args, err := flagext.ParseFlagsAndArguments(flag.CommandLine)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+
+	if len(args) != 1 {
 		fmt.Fprintf(os.Stderr, "Usage: doc-generator template-file")
 		os.Exit(1)
 	}
 
-	templatePath := flag.Arg(0)
+	templatePath := args[0]
 
 	// In order to match YAML config fields with CLI flags, we map
 	// the memory address of the CLI flag variables and match them with

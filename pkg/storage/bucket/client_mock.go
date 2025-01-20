@@ -24,6 +24,10 @@ type ClientMock struct {
 	mock.Mock
 }
 
+func (m *ClientMock) Provider() objstore.ObjProvider {
+	return objstore.MEMORY
+}
+
 // Upload mocks objstore.Bucket.Upload()
 func (m *ClientMock) Upload(ctx context.Context, name string, r io.Reader) error {
 	args := m.Called(ctx, name, r)
@@ -49,6 +53,17 @@ func (m *ClientMock) Name() string {
 func (m *ClientMock) Iter(ctx context.Context, dir string, f func(string) error, options ...objstore.IterOption) error {
 	args := m.Called(ctx, dir, f, options)
 	return args.Error(0)
+}
+
+// IterWithAttributes mocks objstore.Bucket.IterWithAttributes().
+func (m *ClientMock) IterWithAttributes(ctx context.Context, dir string, f func(attrs objstore.IterObjectAttributes) error, options ...objstore.IterOption) error {
+	return m.Called(ctx, dir, f, options).Error(0)
+}
+
+// SupportedIterOptions mocks objstore.Bucket.SupportedIterOptions().
+func (m *ClientMock) SupportedIterOptions() []objstore.IterOptionType {
+	m.Called()
+	return nil
 }
 
 // MockIter is a convenient method to mock Iter()
@@ -92,11 +107,15 @@ func (m *ClientMock) Get(ctx context.Context, name string) (io.ReadCloser, error
 
 // MockGet is a convenient method to mock Get() and Exists()
 func (m *ClientMock) MockGet(name, content string, err error) {
+	m.MockGetAndLastModified(name, content, time.Now(), err)
+}
+
+func (m *ClientMock) MockGetAndLastModified(name, content string, lastModified time.Time, err error) {
 	if content != "" {
 		m.On("Exists", mock.Anything, name).Return(true, err)
 		m.On("Attributes", mock.Anything, name).Return(objstore.ObjectAttributes{
 			Size:         int64(len(content)),
-			LastModified: time.Now(),
+			LastModified: lastModified,
 		}, nil)
 
 		// Since we return an ReadCloser and it can be consumed only once,
@@ -110,6 +129,10 @@ func (m *ClientMock) MockGet(name, content string, err error) {
 		m.On("Get", mock.Anything, name).Return(nil, ErrObjectDoesNotExist)
 		m.On("Attributes", mock.Anything, name).Return(nil, ErrObjectDoesNotExist)
 	}
+}
+
+func (m *ClientMock) MockAttributes(name string, attrs objstore.ObjectAttributes, err error) {
+	m.On("Attributes", mock.Anything, name).Return(attrs, err)
 }
 
 func (m *ClientMock) MockDelete(name string, err error) {
@@ -135,6 +158,10 @@ func (m *ClientMock) Exists(ctx context.Context, name string) (bool, error) {
 // IsObjNotFoundErr mocks objstore.Bucket.IsObjNotFoundErr()
 func (m *ClientMock) IsObjNotFoundErr(err error) bool {
 	return errors.Is(err, ErrObjectDoesNotExist)
+}
+
+func (m *ClientMock) IsAccessDeniedErr(_ error) bool {
+	return false
 }
 
 // ObjectSize mocks objstore.Bucket.Attributes()

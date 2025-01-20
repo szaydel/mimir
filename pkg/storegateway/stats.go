@@ -8,11 +8,14 @@ package storegateway
 import (
 	"sync"
 	"time"
+
+	"github.com/grafana/mimir/pkg/storage/tsdb/block"
 )
 
 // queryStats holds query statistics. This data structure is NOT concurrency safe.
 type queryStats struct {
-	blocksQueried int
+	blocksQueried            int
+	blocksQueriedByBlockMeta map[blockQueriedMeta]int
 
 	postingsTouched          int
 	postingsTouchedSizeSum   int
@@ -31,12 +34,13 @@ type queryStats struct {
 	cachedPostingsDecompressionErrors  int
 	cachedPostingsDecompressionTimeSum time.Duration
 
-	seriesTouched          int
-	seriesTouchedSizeSum   int
+	seriesProcessed        int
+	seriesProcessedSizeSum int
+	seriesOmitted          int
 	seriesFetched          int
 	seriesFetchedSizeSum   int
-	seriesFetchCount       int
 	seriesFetchDurationSum time.Duration
+	seriesRefetches        int
 
 	seriesHashCacheRequests int
 	seriesHashCacheHits     int
@@ -47,14 +51,13 @@ type queryStats struct {
 	chunksFetchedSizeSum   int
 	chunksRefetched        int
 	chunksRefetchedSizeSum int
+	chunksProcessed        int
+	chunksProcessedSizeSum int
 	chunksReturned         int
 	chunksReturnedSizeSum  int
 
 	mergedSeriesCount int
 	mergedChunksCount int
-
-	// The total time spent fetching series and chunk refs.
-	streamingSeriesFetchRefsDuration time.Duration
 
 	// The number of batches the Series() request has been split into.
 	streamingSeriesBatchCount int
@@ -66,20 +69,44 @@ type queryStats struct {
 	// ready to send it to the client.
 	streamingSeriesWaitBatchLoadedDuration time.Duration
 
-	// The Series() request timing breakdown when streaming store-gateway is enabled.
+	// The Series() request timing breakdown.
 	streamingSeriesExpandPostingsDuration       time.Duration
-	streamingSeriesFetchSeriesAndChunksDuration time.Duration
 	streamingSeriesEncodeResponseDuration       time.Duration
 	streamingSeriesSendResponseDuration         time.Duration
-	streamingSeriesOtherDuration                time.Duration
+	streamingSeriesIndexHeaderLoadDuration      time.Duration
+	streamingSeriesConcurrencyLimitWaitDuration time.Duration
 
-	// The Series() request timing breakdown when streaming store-gateway is disabled.
-	synchronousSeriesGetAllDuration time.Duration
-	synchronousSeriesMergeDuration  time.Duration
+	// streamingSeriesAmbientTime is the total wall clock time spent serving the request. It includes all other durations.
+	streamingSeriesAmbientTime time.Duration
+}
+
+func newQueryStats() *queryStats {
+	return &queryStats{
+		blocksQueriedByBlockMeta: make(map[blockQueriedMeta]int),
+	}
+}
+
+// blockQueriedMeta encapsulate a block's thanos source, compaction level, and if it
+// was created from out-or-order samples
+type blockQueriedMeta struct {
+	source     block.SourceType
+	level      int
+	outOfOrder bool
+}
+
+func newBlockQueriedMeta(meta *block.Meta) blockQueriedMeta {
+	return blockQueriedMeta{
+		source:     meta.Thanos.Source,
+		level:      meta.Compaction.Level,
+		outOfOrder: meta.Compaction.FromOutOfOrder(),
+	}
 }
 
 func (s queryStats) merge(o *queryStats) *queryStats {
 	s.blocksQueried += o.blocksQueried
+	for m, count := range o.blocksQueriedByBlockMeta {
+		s.blocksQueriedByBlockMeta[m] += count
+	}
 
 	s.postingsTouched += o.postingsTouched
 	s.postingsTouchedSizeSum += o.postingsTouchedSizeSum
@@ -98,12 +125,13 @@ func (s queryStats) merge(o *queryStats) *queryStats {
 	s.cachedPostingsDecompressionErrors += o.cachedPostingsDecompressionErrors
 	s.cachedPostingsDecompressionTimeSum += o.cachedPostingsDecompressionTimeSum
 
-	s.seriesTouched += o.seriesTouched
-	s.seriesTouchedSizeSum += o.seriesTouchedSizeSum
+	s.seriesProcessed += o.seriesProcessed
+	s.seriesProcessedSizeSum += o.seriesProcessedSizeSum
+	s.seriesOmitted += o.seriesOmitted
 	s.seriesFetched += o.seriesFetched
 	s.seriesFetchedSizeSum += o.seriesFetchedSizeSum
-	s.seriesFetchCount += o.seriesFetchCount
 	s.seriesFetchDurationSum += o.seriesFetchDurationSum
+	s.seriesRefetches += o.seriesRefetches
 
 	s.seriesHashCacheRequests += o.seriesHashCacheRequests
 	s.seriesHashCacheHits += o.seriesHashCacheHits
@@ -114,24 +142,24 @@ func (s queryStats) merge(o *queryStats) *queryStats {
 	s.chunksFetchedSizeSum += o.chunksFetchedSizeSum
 	s.chunksRefetched += o.chunksRefetched
 	s.chunksRefetchedSizeSum += o.chunksRefetchedSizeSum
+	s.chunksProcessed += o.chunksProcessed
+	s.chunksProcessedSizeSum += o.chunksProcessedSizeSum
 	s.chunksReturned += o.chunksReturned
 	s.chunksReturnedSizeSum += o.chunksReturnedSizeSum
 
 	s.mergedSeriesCount += o.mergedSeriesCount
 	s.mergedChunksCount += o.mergedChunksCount
 
-	s.streamingSeriesFetchRefsDuration += o.streamingSeriesFetchRefsDuration
 	s.streamingSeriesBatchCount += o.streamingSeriesBatchCount
 	s.streamingSeriesBatchLoadDuration += o.streamingSeriesBatchLoadDuration
 	s.streamingSeriesWaitBatchLoadedDuration += o.streamingSeriesWaitBatchLoadedDuration
 	s.streamingSeriesExpandPostingsDuration += o.streamingSeriesExpandPostingsDuration
-	s.streamingSeriesFetchSeriesAndChunksDuration += o.streamingSeriesFetchSeriesAndChunksDuration
 	s.streamingSeriesEncodeResponseDuration += o.streamingSeriesEncodeResponseDuration
 	s.streamingSeriesSendResponseDuration += o.streamingSeriesSendResponseDuration
-	s.streamingSeriesOtherDuration += o.streamingSeriesOtherDuration
+	s.streamingSeriesAmbientTime += o.streamingSeriesAmbientTime
 
-	s.synchronousSeriesGetAllDuration += o.synchronousSeriesGetAllDuration
-	s.synchronousSeriesMergeDuration += o.synchronousSeriesMergeDuration
+	s.streamingSeriesIndexHeaderLoadDuration += o.streamingSeriesIndexHeaderLoadDuration
+	s.streamingSeriesConcurrencyLimitWaitDuration += o.streamingSeriesConcurrencyLimitWaitDuration
 
 	return &s
 }
@@ -144,7 +172,7 @@ type safeQueryStats struct {
 
 func newSafeQueryStats() *safeQueryStats {
 	return &safeQueryStats{
-		unsafeStats: &queryStats{},
+		unsafeStats: newQueryStats(),
 	}
 }
 
@@ -169,6 +197,14 @@ func (s *safeQueryStats) export() *queryStats {
 	s.unsafeStatsMx.Lock()
 	defer s.unsafeStatsMx.Unlock()
 
-	copy := *s.unsafeStats
-	return &copy
+	copied := *s.unsafeStats
+	return &copied
+}
+
+// seriesAndChunksCount return the value of mergedSeriesCount and mergedChunksCount fields.
+func (s *safeQueryStats) seriesAndChunksCount() (seriesCount, chunksCount int) {
+	s.unsafeStatsMx.Lock()
+	defer s.unsafeStatsMx.Unlock()
+
+	return s.unsafeStats.mergedSeriesCount, s.unsafeStats.mergedChunksCount
 }

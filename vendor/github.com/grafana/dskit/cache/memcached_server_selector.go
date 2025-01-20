@@ -1,10 +1,13 @@
+// Provenance-includes-license: Apache-2.0
+// Provenance-includes-copyright: The Thanos Authors.
+
 package cache
 
 import (
 	"net"
 	"sync"
 
-	"github.com/cespare/xxhash"
+	"github.com/cespare/xxhash/v2"
 	"github.com/facette/natsort"
 	"github.com/grafana/gomemcache/memcache"
 )

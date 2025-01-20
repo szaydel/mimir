@@ -10,7 +10,7 @@ import (
 	"github.com/grafana/dskit/kv/consul"
 	"github.com/grafana/dskit/kv/etcd"
 	"github.com/grafana/dskit/kv/memberlist"
-	"github.com/weaveworks/common/server"
+	"github.com/grafana/dskit/server"
 
 	"github.com/grafana/mimir/pkg/alertmanager"
 	"github.com/grafana/mimir/pkg/alertmanager/alertstore"
@@ -31,6 +31,7 @@ import (
 	"github.com/grafana/mimir/pkg/storage/bucket/gcs"
 	"github.com/grafana/mimir/pkg/storage/bucket/s3"
 	"github.com/grafana/mimir/pkg/storage/bucket/swift"
+	"github.com/grafana/mimir/pkg/storage/ingest"
 	"github.com/grafana/mimir/pkg/storage/tsdb"
 	"github.com/grafana/mimir/pkg/storegateway"
 	"github.com/grafana/mimir/pkg/util/validation"
@@ -136,6 +137,11 @@ var (
 			Desc:       "The limits block configures default and per-tenant limits imposed by components.",
 		},
 		{
+			Name:       "ingest_storage",
+			StructType: reflect.TypeOf(ingest.Config{}),
+			Desc:       "The ingest_storage block configures the experimental Kafka-based ingest storage.",
+		},
+		{
 			Name:       "blocks_storage",
 			StructType: reflect.TypeOf(tsdb.BlocksStorageConfig{}),
 			Desc:       "The blocks_storage block configures the blocks storage.",
@@ -152,8 +158,13 @@ var (
 		},
 		{
 			Name:       "memcached",
-			StructType: reflect.TypeOf(cache.MemcachedConfig{}),
+			StructType: reflect.TypeOf(cache.MemcachedClientConfig{}),
 			Desc:       "The memcached block configures the Memcached-based caching backend.",
+		},
+		{
+			Name:       "redis",
+			StructType: reflect.TypeOf(cache.RedisClientConfig{}),
+			Desc:       "The redis block configures the Redis-based caching backend.",
 		},
 		{
 			Name:       "s3_storage_backend",

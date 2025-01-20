@@ -8,6 +8,7 @@ package distributor
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -15,11 +16,13 @@ import (
 	"github.com/go-kit/log"
 	"github.com/grafana/dskit/flagext"
 	"github.com/grafana/dskit/kv"
+	"github.com/grafana/dskit/kv/codec"
 	"github.com/grafana/dskit/kv/consul"
+	"github.com/grafana/dskit/kv/memberlist"
 	"github.com/grafana/dskit/ring"
 	"github.com/grafana/dskit/services"
 	"github.com/grafana/dskit/test"
-	"github.com/pkg/errors"
+	"github.com/grafana/dskit/user"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
@@ -27,18 +30,32 @@ import (
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/weaveworks/common/user"
 
 	"github.com/grafana/mimir/pkg/mimirpb"
-	util_log "github.com/grafana/mimir/pkg/util/log"
+	utiltest "github.com/grafana/mimir/pkg/util/test"
 )
 
-func checkReplicaTimestamp(t *testing.T, duration time.Duration, c *haTracker, user, cluster, replica string, expected time.Time) {
+type dnsProviderMock struct {
+	resolved []string
+}
+
+func (p *dnsProviderMock) Resolve(_ context.Context, addrs []string) error {
+	p.resolved = addrs
+	return nil
+}
+
+func (p dnsProviderMock) Addresses() []string {
+	return p.resolved
+}
+
+func checkReplicaTimestamp(t *testing.T, duration time.Duration, c *defaultHaTracker, user, cluster, replica string, expected time.Time, elected time.Time) {
 	t.Helper()
 
 	// Round the expected timestamp with milliseconds precision
 	// to match "received at" precision
 	expected = expected.Truncate(time.Millisecond)
+	// change elected time to UTC
+	elected = elected.UTC().Truncate(time.Millisecond)
 
 	test.Poll(t, duration, nil, func() interface{} {
 		var r ReplicaDesc
@@ -51,7 +68,6 @@ func checkReplicaTimestamp(t *testing.T, duration time.Duration, c *haTracker, u
 		if info == nil {
 			return fmt.Errorf("no data for user %s cluster %s", user, cluster)
 		}
-
 		if r.GetReplica() != replica {
 			return fmt.Errorf("replicas did not match: %s != %s", r.GetReplica(), replica)
 		}
@@ -61,9 +77,308 @@ func checkReplicaTimestamp(t *testing.T, duration time.Duration, c *haTracker, u
 		if !timestamp.Time(r.GetReceivedAt()).Equal(expected) {
 			return fmt.Errorf("timestamps did not match: %+v != %+v", timestamp.Time(r.GetReceivedAt()), expected)
 		}
+		if timestamp.Time(r.GetElectedAt()).Sub(elected) > time.Second {
+			return fmt.Errorf("elected timestamps did not match: %+v != %+v", timestamp.Time(r.GetElectedAt()), elected)
+		}
 
 		return nil
 	})
+}
+
+func merge(r1, r2 *ReplicaDesc) (*ReplicaDesc, *ReplicaDesc) {
+	change, err := r1.Merge(r2, false)
+	if err != nil {
+		panic(err)
+	}
+
+	if change == nil {
+		return r1, nil
+	}
+
+	changeRDesc := change.(*ReplicaDesc)
+	return r1, changeRDesc
+}
+func TestReplicaDescMerge(t *testing.T) {
+	now := time.Now().Unix()
+
+	const (
+		replica1 = "r1"
+		replica2 = "r2"
+		replica3 = "r3"
+	)
+
+	firstReplica := func() *ReplicaDesc {
+		return &ReplicaDesc{
+			Replica:        replica1,
+			ReceivedAt:     now,
+			DeletedAt:      0,
+			ElectedAt:      now,
+			ElectedChanges: 1,
+		}
+	}
+
+	firstReplicaWithHigherReceivedAt := func() *ReplicaDesc {
+		return &ReplicaDesc{
+			Replica:        replica1,
+			ReceivedAt:     now + 5,
+			DeletedAt:      0,
+			ElectedAt:      now,
+			ElectedChanges: 1,
+		}
+	}
+
+	secondReplica := func() *ReplicaDesc {
+		return &ReplicaDesc{
+			Replica:        replica2,
+			ReceivedAt:     now,
+			DeletedAt:      0,
+			ElectedAt:      now + 5,
+			ElectedChanges: 2,
+		}
+	}
+
+	thirdReplica := func() *ReplicaDesc {
+		return &ReplicaDesc{
+			Replica:        replica3,
+			ReceivedAt:     now,
+			DeletedAt:      0,
+			ElectedAt:      now + 10,
+			ElectedChanges: 3,
+		}
+	}
+
+	expectedFirstAndFirstHigherReceivedAtMerge := func() *ReplicaDesc {
+		return &ReplicaDesc{
+			Replica:        replica1,
+			ReceivedAt:     now + 5,
+			DeletedAt:      0,
+			ElectedAt:      now,
+			ElectedChanges: 1,
+		}
+	}
+
+	expectedFirstAndSecondMerge := func() *ReplicaDesc {
+		return &ReplicaDesc{
+			Replica:        replica2,
+			ReceivedAt:     now,
+			DeletedAt:      0,
+			ElectedAt:      now + 5,
+			ElectedChanges: 2,
+		}
+	}
+
+	testsMerge := []struct {
+		name           string
+		rDesc1         *ReplicaDesc
+		rDesc2         *ReplicaDesc
+		expectedRDesc  *ReplicaDesc
+		expectedChange *ReplicaDesc
+	}{
+		{
+			name:           "Merge ReplicaDesc: Same replica name, different receivedAt should return ReplicaDesc with most recent receivedAt timestamp",
+			rDesc1:         firstReplica(),
+			rDesc2:         firstReplicaWithHigherReceivedAt(),
+			expectedRDesc:  expectedFirstAndFirstHigherReceivedAtMerge(),
+			expectedChange: expectedFirstAndFirstHigherReceivedAtMerge(),
+		},
+		{
+			name:           "Merge ReplicaDesc: Different replica name, different electedAt should return ReplicaDesc with most recent electedAt timestamp",
+			rDesc1:         firstReplica(),
+			rDesc2:         secondReplica(),
+			expectedRDesc:  expectedFirstAndSecondMerge(),
+			expectedChange: expectedFirstAndSecondMerge(),
+		},
+		{
+			name: "idempotency: no change after applying same ReplicaDesc again.",
+			rDesc1: func() *ReplicaDesc {
+				out, _ := merge(firstReplica(), secondReplica())
+				return out
+			}(),
+			rDesc2:         firstReplica(),
+			expectedRDesc:  expectedFirstAndSecondMerge(),
+			expectedChange: nil,
+		},
+		{
+			name:   "commutativity: Merge(first, second) == Merge(second, first)",
+			rDesc1: firstReplica(),
+			rDesc2: secondReplica(),
+			expectedRDesc: func() *ReplicaDesc {
+				expected, _ := merge(secondReplica(), firstReplica())
+				return expected
+			}(),
+			expectedChange: expectedFirstAndSecondMerge(),
+		},
+		{
+			name: "associativity: Merge(Merge(first, second), third) == Merge(first, Merge(second, third))",
+			rDesc1: func() *ReplicaDesc {
+				ours1, _ := merge(firstReplica(), secondReplica())
+				ours1, _ = merge(ours1, thirdReplica())
+				return ours1
+			}(),
+			rDesc2: nil,
+			expectedRDesc: func() *ReplicaDesc {
+				ours2, _ := merge(secondReplica(), thirdReplica())
+				ours2, _ = merge(firstReplica(), ours2)
+				return ours2
+			}(),
+			expectedChange: nil,
+		},
+		{
+			name:           "Merge should return no change when replica is the same",
+			rDesc1:         firstReplica(),
+			rDesc2:         firstReplica(),
+			expectedRDesc:  firstReplica(),
+			expectedChange: nil,
+		},
+	}
+
+	for _, tt := range testsMerge {
+		t.Run(tt.name, func(t *testing.T) {
+			rDesc, ch := merge(tt.rDesc1, tt.rDesc2)
+			assert.Equal(t, tt.expectedRDesc, rDesc)
+			assert.Equal(t, tt.expectedChange, ch)
+		})
+	}
+}
+
+func TestHaTrackerWithMemberList(t *testing.T) {
+	var config memberlist.KVConfig
+
+	const (
+		cluster                  = "cluster"
+		replica1                 = "r1"
+		replica2                 = "r2"
+		updateTimeout            = time.Millisecond * 100
+		failoverTimeout          = 2 * time.Millisecond
+		failoverTimeoutPlus100ms = failoverTimeout + 100*time.Millisecond
+	)
+
+	flagext.DefaultValues(&config)
+	ctx := context.Background()
+
+	config.Codecs = []codec.Codec{
+		GetReplicaDescCodec(),
+	}
+
+	memberListSvc := memberlist.NewKVInitService(
+		&config,
+		log.NewNopLogger(),
+		&dnsProviderMock{},
+		prometheus.NewPedanticRegistry(),
+	)
+	require.NoError(t, services.StartAndAwaitRunning(ctx, memberListSvc))
+	t.Cleanup(func() {
+		assert.NoError(t, services.StopAndAwaitTerminated(ctx, memberListSvc))
+	})
+
+	tracker, err := newHaTracker(HATrackerConfig{
+		EnableHATracker: true,
+		KVStore: kv.Config{Store: "memberlist", StoreConfig: kv.StoreConfig{
+			MemberlistKV: memberListSvc.GetMemberlistKV,
+		}},
+		UpdateTimeout:          updateTimeout,
+		UpdateTimeoutJitterMax: 0,
+		FailoverTimeout:        failoverTimeout,
+	}, trackerLimits{maxClusters: 100}, nil, log.NewNopLogger())
+	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(ctx, tracker))
+
+	t.Cleanup(func() {
+		assert.NoError(t, services.StopAndAwaitTerminated(ctx, tracker))
+	})
+
+	now := time.Now()
+
+	// Write the first time.
+	err = tracker.checkReplica(context.Background(), "user", cluster, replica1, now)
+	assert.NoError(t, err)
+
+	// Throw away a sample from replica2.
+	err = tracker.checkReplica(context.Background(), "user", cluster, replica2, now)
+	assert.Error(t, err)
+
+	// Wait more than the overwrite timeout.
+	now = now.Add(failoverTimeoutPlus100ms)
+
+	// Another sample from replica2 to update its timestamp.
+	err = tracker.checkReplica(context.Background(), "user", cluster, replica2, now)
+	assert.Error(t, err)
+
+	// Update KVStore - this should elect replica 2.
+	tracker.updateKVStoreAll(context.Background(), now)
+
+	// Evaluate up to 10 seconds to verify whether the tracker’s cache replica has been updated to r2.
+	checkReplicaTimestamp(t, 10*time.Second, tracker, "user", cluster, replica2, now, now)
+
+	// Now we should accept from replica 2.
+	err = tracker.checkReplica(context.Background(), "user", cluster, replica2, now)
+	assert.NoError(t, err)
+
+	// We timed out accepting samples from replica 1 and should now reject them.
+	err = tracker.checkReplica(context.Background(), "user", cluster, replica1, now)
+	assert.Error(t, err)
+}
+
+func TestHATrackerCacheSyncOnStart(t *testing.T) {
+	const cluster = "c1"
+	const replicaOne = "r1"
+	const replicaTwo = "r2"
+
+	var c *defaultHaTracker
+	var err error
+	var now time.Time
+
+	codec := GetReplicaDescCodec()
+	kvStore, closer := consul.NewInMemoryClient(codec, log.NewNopLogger(), nil)
+	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
+
+	mockCountingClient := kv.NewMockCountingClient(kvStore)
+	c, err = newHaTracker(HATrackerConfig{
+		EnableHATracker:        true,
+		KVStore:                kv.Config{Mock: mockCountingClient},
+		UpdateTimeout:          time.Millisecond * 100,
+		UpdateTimeoutJitterMax: 0,
+		FailoverTimeout:        time.Millisecond * 2,
+	}, trackerLimits{maxClusters: 100}, nil, log.NewNopLogger())
+	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), c))
+
+	// KV Store empty: The sync should try fetching the Keys only
+	// client.List: 1
+	// client.Get: 0
+	assert.Equal(t, 1, int(mockCountingClient.ListCalls.Load()))
+	assert.Equal(t, 0, int(mockCountingClient.GetCalls.Load()))
+
+	now = time.Now()
+	err = c.checkReplica(context.Background(), "user", cluster, replicaOne, now)
+	assert.NoError(t, err)
+
+	err = services.StopAndAwaitTerminated(context.Background(), c)
+	assert.NoError(t, err)
+
+	// Initializing a New Client to set calls to zero
+	mockCountingClient = kv.NewMockCountingClient(kvStore)
+	c, err = newHaTracker(HATrackerConfig{
+		EnableHATracker:        true,
+		KVStore:                kv.Config{Mock: mockCountingClient},
+		UpdateTimeout:          time.Millisecond * 100,
+		UpdateTimeoutJitterMax: 0,
+		FailoverTimeout:        time.Millisecond * 2,
+	}, trackerLimits{maxClusters: 100}, nil, log.NewNopLogger())
+	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), c))
+	t.Cleanup(func() { assert.NoError(t, services.StopAndAwaitTerminated(context.Background(), c)) })
+
+	// KV Store has one entry: The sync should try fetching the Keys and updating the cache
+	// client.List: 1
+	// client.Get: 1
+	assert.Equal(t, 1, int(mockCountingClient.ListCalls.Load()))
+	assert.Equal(t, 1, int(mockCountingClient.GetCalls.Load()))
+
+	now = time.Now()
+	err = c.checkReplica(context.Background(), "user", cluster, replicaTwo, now)
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, replicasDidNotMatchError{replica: "r2", elected: "r1"})
 }
 
 func TestHATrackerConfig_Validate(t *testing.T) {
@@ -116,7 +431,7 @@ func TestHATrackerConfig_Validate(t *testing.T) {
 			}(),
 			expectedErr: nil,
 		},
-		"should fail if KV backend is set to memberlist": {
+		"should pass if KV backend is set to memberlist": {
 			cfg: func() HATrackerConfig {
 				cfg := HATrackerConfig{}
 				flagext.DefaultValues(&cfg)
@@ -124,7 +439,7 @@ func TestHATrackerConfig_Validate(t *testing.T) {
 
 				return cfg
 			}(),
-			expectedErr: errMemberlistUnsupported,
+			expectedErr: nil,
 		},
 	}
 
@@ -136,7 +451,7 @@ func TestHATrackerConfig_Validate(t *testing.T) {
 }
 
 // Test that values are set in the HATracker after WatchPrefix has found it in the KVStore.
-func TestWatchPrefixAssignment(t *testing.T) {
+func TestHATrackerWatchPrefixAssignment(t *testing.T) {
 	cluster := "c1"
 	replica := "r1"
 
@@ -145,7 +460,7 @@ func TestWatchPrefixAssignment(t *testing.T) {
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
 	mock := kv.PrefixClient(kvStore, "prefix")
-	c, err := newHATracker(HATrackerConfig{
+	c, err := newHaTracker(HATrackerConfig{
 		EnableHATracker:        true,
 		KVStore:                kv.Config{Mock: mock},
 		UpdateTimeout:          time.Millisecond,
@@ -163,14 +478,14 @@ func TestWatchPrefixAssignment(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Check to see if the value in the trackers cache is correct.
-	checkReplicaTimestamp(t, time.Second, c, "user", cluster, replica, now)
+	checkReplicaTimestamp(t, 2*time.Second, c, "user", cluster, replica, now, now)
 }
 
-func TestCheckReplicaOverwriteTimeout(t *testing.T) {
+func TestHATrackerCheckReplicaOverwriteTimeout(t *testing.T) {
 	replica1 := "replica1"
 	replica2 := "replica2"
 
-	c, err := newHATracker(HATrackerConfig{
+	c, err := newHaTracker(HATrackerConfig{
 		EnableHATracker:        true,
 		KVStore:                kv.Config{Store: "inmemory"},
 		UpdateTimeout:          100 * time.Millisecond,
@@ -201,7 +516,7 @@ func TestCheckReplicaOverwriteTimeout(t *testing.T) {
 	// Update KVStore - this should elect replica 2.
 	c.updateKVStoreAll(context.Background(), now)
 
-	checkReplicaTimestamp(t, time.Second, c, "user", "test", replica2, now)
+	checkReplicaTimestamp(t, 2*time.Second, c, "user", "test", replica2, now, now)
 
 	// Now we should accept from replica 2.
 	err = c.checkReplica(context.Background(), "user", "test", replica2, now)
@@ -212,12 +527,12 @@ func TestCheckReplicaOverwriteTimeout(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestCheckReplicaMultiCluster(t *testing.T) {
+func TestHATrackerCheckReplicaMultiCluster(t *testing.T) {
 	replica1 := "replica1"
 	replica2 := "replica2"
 
 	reg := prometheus.NewPedanticRegistry()
-	c, err := newHATracker(HATrackerConfig{
+	c, err := newHaTracker(HATrackerConfig{
 		EnableHATracker:        true,
 		KVStore:                kv.Config{Store: "inmemory"},
 		UpdateTimeout:          100 * time.Millisecond,
@@ -262,12 +577,12 @@ func TestCheckReplicaMultiCluster(t *testing.T) {
 	}), uint64(0))
 }
 
-func TestCheckReplicaMultiClusterTimeout(t *testing.T) {
+func TestHATrackerCheckReplicaMultiClusterTimeout(t *testing.T) {
 	replica1 := "replica1"
 	replica2 := "replica2"
 
 	reg := prometheus.NewPedanticRegistry()
-	c, err := newHATracker(HATrackerConfig{
+	c, err := newHaTracker(HATrackerConfig{
 		EnableHATracker:        true,
 		KVStore:                kv.Config{Store: "inmemory"},
 		UpdateTimeout:          100 * time.Millisecond,
@@ -310,7 +625,7 @@ func TestCheckReplicaMultiClusterTimeout(t *testing.T) {
 	err = c.checkReplica(context.Background(), "user", "c1", replica2, now)
 	assert.Error(t, err)
 	c.updateKVStoreAll(context.Background(), now)
-	checkReplicaTimestamp(t, time.Second, c, "user", "c1", replica2, now)
+	checkReplicaTimestamp(t, 2*time.Second, c, "user", "c1", replica2, now, now)
 
 	// Accept a sample from c1/replica2.
 	err = c.checkReplica(context.Background(), "user", "c1", replica2, now)
@@ -337,7 +652,7 @@ func TestCheckReplicaMultiClusterTimeout(t *testing.T) {
 }
 
 // Test that writes only happen every update timeout.
-func TestCheckReplicaUpdateTimeout(t *testing.T) {
+func TestHATrackerCheckReplicaUpdateTimeout(t *testing.T) {
 	replica := "r1"
 	cluster := "c1"
 	user := "user"
@@ -347,7 +662,7 @@ func TestCheckReplicaUpdateTimeout(t *testing.T) {
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
 	mock := kv.PrefixClient(kvStore, "prefix")
-	c, err := newHATracker(HATrackerConfig{
+	c, err := newHaTracker(HATrackerConfig{
 		EnableHATracker:        true,
 		KVStore:                kv.Config{Mock: mock},
 		UpdateTimeout:          time.Second,
@@ -363,13 +678,13 @@ func TestCheckReplicaUpdateTimeout(t *testing.T) {
 	err = c.checkReplica(context.Background(), user, cluster, replica, startTime)
 	assert.NoError(t, err)
 
-	checkReplicaTimestamp(t, time.Second, c, user, cluster, replica, startTime)
+	checkReplicaTimestamp(t, 2*time.Second, c, user, cluster, replica, startTime, startTime)
 
 	// Timestamp should not update here, since time has not advanced.
 	err = c.checkReplica(context.Background(), user, cluster, replica, startTime)
 	assert.NoError(t, err)
 
-	checkReplicaTimestamp(t, time.Second, c, user, cluster, replica, startTime)
+	checkReplicaTimestamp(t, 2*time.Second, c, user, cluster, replica, startTime, startTime)
 
 	// Wait 500ms and the timestamp should still not update.
 	updateTime := time.Unix(0, startTime.UnixNano()).Add(500 * time.Millisecond)
@@ -377,19 +692,23 @@ func TestCheckReplicaUpdateTimeout(t *testing.T) {
 
 	err = c.checkReplica(context.Background(), user, cluster, replica, updateTime)
 	assert.NoError(t, err)
-	checkReplicaTimestamp(t, time.Second, c, user, cluster, replica, startTime)
+	checkReplicaTimestamp(t, 2*time.Second, c, user, cluster, replica, startTime, startTime)
+
+	receivedAt := updateTime
 
 	// Now we've waited > 1s, so the timestamp should update.
 	updateTime = time.Unix(0, startTime.UnixNano()).Add(1100 * time.Millisecond)
 	c.updateKVStoreAll(context.Background(), updateTime)
 
+	// Timestamp stored in KV should be time when we have received a request (called "checkReplica"), not current time (updateTime).
+	checkReplicaTimestamp(t, 2*time.Second, c, user, cluster, replica, receivedAt, receivedAt)
+
 	err = c.checkReplica(context.Background(), user, cluster, replica, updateTime)
 	assert.NoError(t, err)
-	checkReplicaTimestamp(t, time.Second, c, user, cluster, replica, updateTime)
 }
 
 // Test that writes only happen every write timeout.
-func TestCheckReplicaMultiUser(t *testing.T) {
+func TestHATrackerCheckReplicaMultiUser(t *testing.T) {
 	replica := "r1"
 	cluster := "c1"
 
@@ -398,7 +717,7 @@ func TestCheckReplicaMultiUser(t *testing.T) {
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
 	mock := kv.PrefixClient(kvStore, "prefix")
-	c, err := newHATracker(HATrackerConfig{
+	c, err := newHaTracker(HATrackerConfig{
 		EnableHATracker:        true,
 		KVStore:                kv.Config{Mock: mock},
 		UpdateTimeout:          100 * time.Millisecond,
@@ -414,12 +733,12 @@ func TestCheckReplicaMultiUser(t *testing.T) {
 	// Write the first time for user 1.
 	err = c.checkReplica(context.Background(), "user1", cluster, replica, now)
 	assert.NoError(t, err)
-	checkReplicaTimestamp(t, time.Second, c, "user1", cluster, replica, now)
+	checkReplicaTimestamp(t, 2*time.Second, c, "user1", cluster, replica, now, now)
 
 	// Write the first time for user 2.
 	err = c.checkReplica(context.Background(), "user2", cluster, replica, now)
 	assert.NoError(t, err)
-	checkReplicaTimestamp(t, time.Second, c, "user2", cluster, replica, now)
+	checkReplicaTimestamp(t, 2*time.Second, c, "user2", cluster, replica, now, now)
 
 	// Now we've waited > 1s, so the timestamp should update.
 	updated := now.Add(1100 * time.Millisecond)
@@ -427,12 +746,12 @@ func TestCheckReplicaMultiUser(t *testing.T) {
 	assert.NoError(t, err)
 	c.updateKVStoreAll(context.Background(), updated)
 
-	checkReplicaTimestamp(t, time.Second, c, "user1", cluster, replica, updated)
+	checkReplicaTimestamp(t, 2*time.Second, c, "user1", cluster, replica, updated, updated)
 	// No update for user2.
-	checkReplicaTimestamp(t, time.Second, c, "user2", cluster, replica, now)
+	checkReplicaTimestamp(t, 2*time.Second, c, "user2", cluster, replica, now, now)
 }
 
-func TestCheckReplicaUpdateTimeoutJitter(t *testing.T) {
+func TestHATrackerCheckReplicaUpdateTimeoutJitter(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]struct {
@@ -480,7 +799,7 @@ func TestCheckReplicaUpdateTimeoutJitter(t *testing.T) {
 			t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
 			mock := kv.PrefixClient(kvStore, "prefix")
-			c, err := newHATracker(HATrackerConfig{
+			c, err := newHaTracker(HATrackerConfig{
 				EnableHATracker:        true,
 				KVStore:                kv.Config{Mock: mock},
 				UpdateTimeout:          testData.updateTimeout,
@@ -502,20 +821,20 @@ func TestCheckReplicaUpdateTimeoutJitter(t *testing.T) {
 			// Init the replica in the KV Store
 			err = c.checkReplica(ctx, "user1", "cluster", "replica-1", testData.startTime)
 			require.NoError(t, err)
-			checkReplicaTimestamp(t, time.Second, c, "user1", "cluster", "replica-1", testData.startTime)
+			checkReplicaTimestamp(t, 2*time.Second, c, "user1", "cluster", "replica-1", testData.startTime, testData.startTime)
 
 			// Refresh the replica in the KV Store
 			err = c.checkReplica(ctx, "user1", "cluster", "replica-1", testData.updateTime)
 			require.NoError(t, err)
 			c.updateKVStoreAll(context.Background(), testData.updateTime)
 
-			// Assert on the the received timestamp
-			checkReplicaTimestamp(t, time.Second, c, "user1", "cluster", "replica-1", testData.expectedTimestamp)
+			// Assert on the received timestamp
+			checkReplicaTimestamp(t, 2*time.Second, c, "user1", "cluster", "replica-1", testData.expectedTimestamp, testData.expectedTimestamp)
 		})
 	}
 }
 
-func TestFindHALabels(t *testing.T) {
+func TestHATrackerFindHALabels(t *testing.T) {
 	replicaLabel, clusterLabel := "replica", "cluster"
 	type expectedOutput struct {
 		cluster string
@@ -572,7 +891,7 @@ func TestHATrackerConfig_ShouldCustomizePrefixDefaultValue(t *testing.T) {
 	assert.NotEqual(t, haConfig.KVStore.Prefix, ringConfig.KVStore.Prefix)
 }
 
-func TestHAClustersLimit(t *testing.T) {
+func TestHATrackerClustersLimit(t *testing.T) {
 	const userID = "user"
 
 	codec := GetReplicaDescCodec()
@@ -582,7 +901,7 @@ func TestHAClustersLimit(t *testing.T) {
 	mock := kv.PrefixClient(kvStore, "prefix")
 	limits := trackerLimits{maxClusters: 2}
 
-	t1, err := newHATracker(HATrackerConfig{
+	t1, err := newHaTracker(HATrackerConfig{
 		EnableHATracker:        true,
 		KVStore:                kv.Config{Mock: mock},
 		UpdateTimeout:          time.Second,
@@ -602,7 +921,8 @@ func TestHAClustersLimit(t *testing.T) {
 	assert.NoError(t, t1.checkReplica(context.Background(), userID, "b", "b1", now))
 	waitForClustersUpdate(t, 2, t1, userID)
 
-	assert.EqualError(t, t1.checkReplica(context.Background(), userID, "c", "c1", now), tooManyClustersError{limit: 2}.Error())
+	expectedErr := newTooManyClustersError(2)
+	assert.EqualError(t, t1.checkReplica(context.Background(), userID, "c", "c1", now), expectedErr.Error())
 
 	// Move time forward, and make sure that checkReplica for existing cluster works fine.
 	now = now.Add(5 * time.Second) // higher than "update timeout"
@@ -612,7 +932,7 @@ func TestHAClustersLimit(t *testing.T) {
 	assert.Error(t, err)
 	// Update KVStore.
 	t1.updateKVStoreAll(context.Background(), now)
-	checkReplicaTimestamp(t, time.Second, t1, userID, "b", "b2", now)
+	checkReplicaTimestamp(t, 2*time.Second, t1, userID, "b", "b2", now, now)
 
 	assert.NoError(t, t1.checkReplica(context.Background(), userID, "b", "b2", now))
 	waitForClustersUpdate(t, 2, t1, userID)
@@ -627,7 +947,8 @@ func TestHAClustersLimit(t *testing.T) {
 	waitForClustersUpdate(t, 2, t1, userID)
 
 	// But yet another cluster doesn't.
-	assert.EqualError(t, t1.checkReplica(context.Background(), userID, "a", "a2", now), tooManyClustersError{limit: 2}.Error())
+	expectedErr = newTooManyClustersError(2)
+	assert.EqualError(t, t1.checkReplica(context.Background(), userID, "a", "a2", now), expectedErr.Error())
 
 	now = now.Add(5 * time.Second)
 
@@ -640,7 +961,7 @@ func TestHAClustersLimit(t *testing.T) {
 	waitForClustersUpdate(t, 1, t1, userID)
 }
 
-func waitForClustersUpdate(t *testing.T, expected int, tr *haTracker, userID string) {
+func waitForClustersUpdate(t *testing.T, expected int, tr *defaultHaTracker, userID string) {
 	t.Helper()
 	test.Poll(t, 2*time.Second, expected, func() interface{} {
 		tr.electedLock.RLock()
@@ -648,34 +969,6 @@ func waitForClustersUpdate(t *testing.T, expected int, tr *haTracker, userID str
 
 		return len(tr.clusters[userID])
 	})
-}
-
-func TestTooManyClustersError(t *testing.T) {
-	var err error = tooManyClustersError{limit: 10}
-	assert.True(t, errors.Is(err, tooManyClustersError{}))
-	assert.True(t, errors.Is(err, &tooManyClustersError{}))
-
-	err = &tooManyClustersError{limit: 20}
-	assert.True(t, errors.Is(err, tooManyClustersError{}))
-	assert.True(t, errors.Is(err, &tooManyClustersError{}))
-
-	err = replicasNotMatchError{replica: "a", elected: "b"}
-	assert.False(t, errors.Is(err, tooManyClustersError{}))
-	assert.False(t, errors.Is(err, &tooManyClustersError{}))
-}
-
-func TestReplicasNotMatchError(t *testing.T) {
-	var err error = replicasNotMatchError{replica: "a", elected: "b"}
-	assert.True(t, errors.Is(err, replicasNotMatchError{}))
-	assert.True(t, errors.Is(err, &replicasNotMatchError{}))
-
-	err = &replicasNotMatchError{replica: "a", elected: "b"}
-	assert.True(t, errors.Is(err, replicasNotMatchError{}))
-	assert.True(t, errors.Is(err, &replicasNotMatchError{}))
-
-	err = tooManyClustersError{limit: 10}
-	assert.False(t, errors.Is(err, replicasNotMatchError{}))
-	assert.False(t, errors.Is(err, &replicasNotMatchError{}))
 }
 
 type trackerLimits struct {
@@ -688,8 +981,21 @@ func (l trackerLimits) MaxHAClusters(_ string) int {
 
 func TestHATracker_MetricsCleanup(t *testing.T) {
 	reg := prometheus.NewPedanticRegistry()
-	tr, err := newHATracker(HATrackerConfig{EnableHATracker: false}, nil, reg, log.NewNopLogger())
+	logger := utiltest.NewTestingLogger(t)
+
+	kvStore, closer := consul.NewInMemoryClient(GetReplicaDescCodec(), log.NewNopLogger(), nil)
+	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
+
+	mock := kv.PrefixClient(kvStore, "prefix")
+	tr, err := newHaTracker(HATrackerConfig{
+		EnableHATracker:        true,
+		KVStore:                kv.Config{Mock: mock},
+		UpdateTimeout:          1 * time.Second,
+		UpdateTimeoutJitterMax: 0,
+		FailoverTimeout:        time.Second,
+	}, trackerLimits{maxClusters: 100}, reg, logger)
 	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), tr))
 
 	metrics := []string{
 		"cortex_ha_tracker_elected_replica_changes_total",
@@ -744,25 +1050,26 @@ func TestHATracker_MetricsCleanup(t *testing.T) {
 	`), metrics...))
 }
 
-func TestCheckReplicaCleanup(t *testing.T) {
+func TestHATrackerCheckReplicaCleanup(t *testing.T) {
 	replica := "r1"
 	cluster := "c1"
 	userID := "user"
 	ctx := user.InjectOrgID(context.Background(), userID)
 
 	reg := prometheus.NewPedanticRegistry()
+	logger := utiltest.NewTestingLogger(t)
 
 	kvStore, closer := consul.NewInMemoryClient(GetReplicaDescCodec(), log.NewNopLogger(), nil)
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
 	mock := kv.PrefixClient(kvStore, "prefix")
-	c, err := newHATracker(HATrackerConfig{
+	c, err := newHaTracker(HATrackerConfig{
 		EnableHATracker:        true,
 		KVStore:                kv.Config{Mock: mock},
 		UpdateTimeout:          1 * time.Second,
 		UpdateTimeoutJitterMax: 0,
 		FailoverTimeout:        time.Second,
-	}, trackerLimits{maxClusters: 100}, reg, util_log.Logger)
+	}, trackerLimits{maxClusters: 100}, reg, logger)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), c))
 	defer services.StopAndAwaitTerminated(context.Background(), c) //nolint:errcheck
@@ -771,7 +1078,7 @@ func TestCheckReplicaCleanup(t *testing.T) {
 
 	err = c.checkReplica(context.Background(), userID, cluster, replica, now)
 	assert.NoError(t, err)
-	checkReplicaTimestamp(t, time.Second, c, userID, cluster, replica, now)
+	checkReplicaTimestamp(t, 2*time.Second, c, userID, cluster, replica, now, now)
 
 	// Replica is not marked for deletion yet.
 	checkReplicaDeletionState(t, time.Second, c, userID, cluster, true, true, false)
@@ -788,7 +1095,7 @@ func TestCheckReplicaCleanup(t *testing.T) {
 	now = time.Now()
 	err = c.checkReplica(context.Background(), userID, cluster, replica, now)
 	assert.NoError(t, err)
-	checkReplicaTimestamp(t, time.Second, c, userID, cluster, replica, now) // This also checks that entry is not marked for deletion.
+	checkReplicaTimestamp(t, 2*time.Second, c, userID, cluster, replica, now, now) // This also checks that entry is not marked for deletion.
 	checkUserClusters(t, time.Second, c, userID, 1)
 
 	// This will mark replica for deletion again (with new time.Now())
@@ -819,7 +1126,7 @@ func TestCheckReplicaCleanup(t *testing.T) {
 	))
 }
 
-func checkUserClusters(t *testing.T, duration time.Duration, c *haTracker, user string, expectedClusters int) {
+func checkUserClusters(t *testing.T, duration time.Duration, c *defaultHaTracker, user string, expectedClusters int) {
 	t.Helper()
 	test.Poll(t, duration, nil, func() interface{} {
 		c.electedLock.RLock()
@@ -834,7 +1141,7 @@ func checkUserClusters(t *testing.T, duration time.Duration, c *haTracker, user 
 	})
 }
 
-func checkReplicaDeletionState(t *testing.T, duration time.Duration, c *haTracker, user, cluster string, expectedExistsInMemory, expectedExistsInKV, expectedMarkedForDeletion bool) {
+func checkReplicaDeletionState(t *testing.T, duration time.Duration, c *defaultHaTracker, user, cluster string, expectedExistsInMemory, expectedExistsInKV, expectedMarkedForDeletion bool) {
 	key := fmt.Sprintf("%s/%s", user, cluster)
 
 	test.Poll(t, duration, nil, func() interface{} {
@@ -863,11 +1170,12 @@ func checkReplicaDeletionState(t *testing.T, duration time.Duration, c *haTracke
 
 // fromLabelPairsToLabels converts dto.LabelPair into labels.Labels.
 func fromLabelPairsToLabels(pairs []*dto.LabelPair) labels.Labels {
-	builder := labels.NewBuilder(nil)
+	builder := labels.NewScratchBuilder(len(pairs))
 	for _, pair := range pairs {
-		builder.Set(pair.GetName(), pair.GetValue())
+		builder.Add(pair.GetName(), pair.GetValue())
 	}
-	return builder.Labels(nil)
+	builder.Sort()
+	return builder.Labels()
 }
 
 // getSumOfHistogramSampleCount returns the sum of samples count of histograms matching the provided metric name
@@ -895,4 +1203,97 @@ func getSumOfHistogramSampleCount(families []*dto.MetricFamily, metricName strin
 	}
 
 	return sum
+}
+
+func TestHATrackerChangeInElectedReplicaClearsLastSeenTimestamp(t *testing.T) {
+	const userID = "user"
+
+	codec := GetReplicaDescCodec()
+	kvStore, closer := consul.NewInMemoryClient(codec, log.NewLogfmtLogger(os.Stdout), nil)
+	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
+
+	mock := kv.PrefixClient(kvStore, "prefix")
+
+	// Start two trackers.
+	t1, err := newHaTracker(HATrackerConfig{
+		EnableHATracker:        true,
+		KVStore:                kv.Config{Mock: mock},
+		UpdateTimeout:          5 * time.Second,
+		UpdateTimeoutJitterMax: 0,
+		FailoverTimeout:        5 * time.Second,
+	}, trackerLimits{maxClusters: 2}, nil, log.NewNopLogger())
+	require.NoError(t, err)
+
+	t2, err := newHaTracker(HATrackerConfig{
+		EnableHATracker:        true,
+		KVStore:                kv.Config{Mock: mock},
+		UpdateTimeout:          5 * time.Second,
+		UpdateTimeoutJitterMax: 0,
+		FailoverTimeout:        5 * time.Second,
+	}, trackerLimits{maxClusters: 2}, nil, log.NewNopLogger())
+	require.NoError(t, err)
+
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), t1))
+	defer services.StopAndAwaitTerminated(context.Background(), t1) //nolint:errcheck
+
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), t2))
+	defer services.StopAndAwaitTerminated(context.Background(), t2) //nolint:errcheck
+
+	now := time.Now()
+
+	const cluster = "cluster"
+	const firstReplica = "first"
+	const secondReplica = "second"
+
+	assert.NoError(t, t1.checkReplica(context.Background(), userID, cluster, firstReplica, now))
+	// Both trackers will see "first" replica as current.
+	checkReplicaTimestamp(t, 2*time.Second, t1, userID, cluster, firstReplica, now, now)
+	checkReplicaTimestamp(t, 2*time.Second, t2, userID, cluster, firstReplica, now, now)
+
+	// Ten seconds later, t1 receives request from first replica again
+	now = now.Add(10 * time.Second)
+	assert.NoError(t, t1.checkReplica(context.Background(), userID, cluster, firstReplica, now))
+
+	// And t2 receives request from second replica.
+	assert.Error(t, t2.checkReplica(context.Background(), userID, cluster, secondReplica, now))
+	secondReplicaReceivedAtT2 := now
+
+	// Now t2 updates the KV store... and overwrite elected replica.
+	t2.updateKVStoreAll(context.Background(), now)
+
+	// t1 is reading updates from KV store, and should see second replica being the elected one.
+	checkReplicaTimestamp(t, 2*time.Second, t1, userID, cluster, secondReplica, secondReplicaReceivedAtT2, secondReplicaReceivedAtT2)
+
+	// Furthermore, t1 has never seen "second" replica, so it should not have "electedLastSeenTimestamp" set.
+	{
+		t1.electedLock.RLock()
+		info := t1.clusters[userID][cluster]
+		t1.electedLock.RUnlock()
+
+		require.Zero(t, info.electedLastSeenTimestamp)
+	}
+
+	// Continuing the test, say both t1 and t2 receive request from "first" replica now.
+	// They both reject it.
+	now = now.Add(9 * time.Second)
+	firstReceivedAtT1 := now
+	assert.Error(t, t1.checkReplica(context.Background(), userID, cluster, firstReplica, now))
+	now = now.Add(1 * time.Second)
+	firstReceivedAtT2 := now
+	assert.Error(t, t2.checkReplica(context.Background(), userID, cluster, firstReplica, now))
+
+	// Now t1 updates the KV Store.
+	t1.updateKVStoreAll(context.Background(), now)
+
+	// t2 is reading updates from KV store, and should see "second" replica being the elected one.
+	checkReplicaTimestamp(t, 2*time.Second, t2, userID, cluster, firstReplica, firstReceivedAtT1, firstReceivedAtT1)
+
+	// Since t2 has seen new elected replica too, we should have non-zero "electedLastSeenTimestamp".
+	{
+		t2.electedLock.RLock()
+		info := t2.clusters[userID][cluster]
+		t2.electedLock.RUnlock()
+
+		require.Equal(t, firstReceivedAtT2.UnixMilli(), info.electedLastSeenTimestamp)
+	}
 }

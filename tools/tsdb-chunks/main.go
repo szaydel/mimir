@@ -13,7 +13,9 @@ import (
 	"os"
 
 	"github.com/go-kit/log"
+	"github.com/grafana/dskit/flagext"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
 )
@@ -22,9 +24,15 @@ var logger = log.NewLogfmtLogger(os.Stdout)
 
 func main() {
 	samples := flag.Bool("samples", false, "Print samples in chunks")
-	flag.Parse()
 
-	for _, f := range flag.Args() {
+	// Parse CLI arguments.
+	args, err := flagext.ParseFlagsAndArguments(flag.CommandLine)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+
+	for _, f := range args {
 		err := printChunksFile(f, *samples)
 		if err != nil {
 			logger.Log("filename", f, "err", err)
@@ -62,6 +70,11 @@ func printChunksFile(filename string, printSamples bool) error {
 	}
 
 	cix := 0
+	var (
+		h  *histogram.Histogram      // reused in iteration as we just dump the value and move on
+		fh *histogram.FloatHistogram // reused in iteration as we just dump the value and move on
+		ts int64                     // we declare ts here to prevent shadowing of h and fh within the loop
+	)
 	for c, err := nextChunk(cix, file); err == nil; c, err = nextChunk(cix, file) {
 		if printSamples {
 			minTS := int64(math.MaxInt64)
@@ -82,7 +95,7 @@ func printChunksFile(filename string, printSamples bool) error {
 
 					fmt.Printf("Chunk #%d, sample #%d: ts: %d (%s), val: %g\n", cix, six, ts, formatTimestamp(ts), val)
 				case chunkenc.ValHistogram:
-					ts, hist := it.AtHistogram()
+					ts, h = it.AtHistogram(h)
 					if ts < minTS {
 						minTS = ts
 					}
@@ -90,9 +103,9 @@ func printChunksFile(filename string, printSamples bool) error {
 						maxTS = ts
 					}
 
-					fmt.Printf("Chunk #%d, sample #%d: ts: %d (%s), val: %s\n", cix, six, ts, formatTimestamp(ts), hist.String())
+					fmt.Printf("Chunk #%d, sample #%d: ts: %d (%s), val: %s\n", cix, six, ts, formatTimestamp(ts), h.String())
 				case chunkenc.ValFloatHistogram:
-					ts, hist := it.AtFloatHistogram()
+					ts, fh = it.AtFloatHistogram(fh)
 					if ts < minTS {
 						minTS = ts
 					}
@@ -100,7 +113,7 @@ func printChunksFile(filename string, printSamples bool) error {
 						maxTS = ts
 					}
 
-					fmt.Printf("Chunk #%d, sample #%d: ts: %d (%s), val: %s\n", cix, six, ts, formatTimestamp(ts), hist.String())
+					fmt.Printf("Chunk #%d, sample #%d: ts: %d (%s), val: %s\n", cix, six, ts, formatTimestamp(ts), fh.String())
 				default:
 					fmt.Printf("Chunk #%d, sample #%d: ts: N/A (N/A), unsupported value type %v", cix, six, valType)
 				}

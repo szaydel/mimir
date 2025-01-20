@@ -7,6 +7,7 @@
 package integration
 
 import (
+	"fmt"
 	"strconv"
 	"sync"
 	"testing"
@@ -16,7 +17,6 @@ import (
 	e2ecache "github.com/grafana/e2e/cache"
 	e2edb "github.com/grafana/e2e/db"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/prompb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -26,34 +26,33 @@ import (
 type querierShardingTestConfig struct {
 	shuffleShardingEnabled bool
 	querySchedulerEnabled  bool
+	sendHistograms         bool
+	querierResponseFormat  string
 }
 
-func TestQuerierShuffleShardingWithoutQueryScheduler(t *testing.T) {
-	runQuerierShardingTest(t, querierShardingTestConfig{
-		shuffleShardingEnabled: true,
-		querySchedulerEnabled:  false,
-	})
-}
-
-func TestQuerierShuffleShardingWithQueryScheduler(t *testing.T) {
-	runQuerierShardingTest(t, querierShardingTestConfig{
-		shuffleShardingEnabled: true,
-		querySchedulerEnabled:  true,
-	})
-}
-
-func TestQuerierNoShardingWithoutQueryScheduler(t *testing.T) {
-	runQuerierShardingTest(t, querierShardingTestConfig{
-		shuffleShardingEnabled: false,
-		querySchedulerEnabled:  false,
-	})
-}
-
-func TestQuerierNoShardingWithQueryScheduler(t *testing.T) {
-	runQuerierShardingTest(t, querierShardingTestConfig{
-		shuffleShardingEnabled: false,
-		querySchedulerEnabled:  true,
-	})
+func TestQuerySharding(t *testing.T) {
+	for _, shuffleShardingEnabled := range []bool{false, true} {
+		for _, querySchedulerEnabled := range []bool{false, true} {
+			for _, sendHistograms := range []bool{false, true} {
+				for _, querierResponseFormat := range []string{"json", "protobuf"} {
+					if sendHistograms && querierResponseFormat == "json" {
+						// histograms over json are not supported
+						continue
+					}
+					testName := fmt.Sprintf("shuffle shard=%v/query scheduler=%v/histograms=%v/format=%v",
+						shuffleShardingEnabled, querySchedulerEnabled, sendHistograms, querierResponseFormat,
+					)
+					cfg := querierShardingTestConfig{
+						shuffleShardingEnabled: shuffleShardingEnabled,
+						querySchedulerEnabled:  querySchedulerEnabled,
+						sendHistograms:         sendHistograms,
+						querierResponseFormat:  querierResponseFormat,
+					}
+					t.Run(testName, func(t *testing.T) { runQuerierShardingTest(t, cfg) })
+				}
+			}
+		}
+	}
 }
 
 func runQuerierShardingTest(t *testing.T, cfg querierShardingTestConfig) {
@@ -94,7 +93,7 @@ func runQuerierShardingTest(t *testing.T, cfg querierShardingTestConfig) {
 	}
 
 	// Start the query-frontend.
-	queryFrontend := e2emimir.NewQueryFrontend("query-frontend", flags)
+	queryFrontend := e2emimir.NewQueryFrontend("query-frontend", consul.NetworkHTTPEndpoint(), flags)
 	require.NoError(t, s.Start(queryFrontend))
 
 	if !cfg.querySchedulerEnabled {
@@ -122,8 +121,13 @@ func runQuerierShardingTest(t *testing.T, cfg querierShardingTestConfig) {
 	distClient, err := e2emimir.NewClient(distributor.HTTPEndpoint(), "", "", "", userID)
 	require.NoError(t, err)
 
-	var series []prompb.TimeSeries
-	series, expectedVector, _ := generateSeries("series_1", now)
+	var genSeries generateSeriesFunc
+	if !cfg.sendHistograms {
+		genSeries = generateFloatSeries
+	} else {
+		genSeries = generateHistogramSeries
+	}
+	series, expectedVector, _ := genSeries("series_1", now)
 
 	res, err := distClient.Push(series)
 	require.NoError(t, err)
@@ -138,11 +142,11 @@ func runQuerierShardingTest(t *testing.T, cfg querierShardingTestConfig) {
 		require.NoError(t, err)
 	}
 
-	// Wait until both workers connect to the query-frontend or query-scheduler
+	// Wait until both workers connect to the query-frontend or query-scheduler, each with the minimum 4 connections.
 	if cfg.querySchedulerEnabled {
-		require.NoError(t, queryScheduler.WaitSumMetrics(e2e.Equals(2), "cortex_query_scheduler_connected_querier_clients"))
+		require.NoError(t, queryScheduler.WaitSumMetrics(e2e.Equals(8), "cortex_query_scheduler_connected_querier_clients"))
 	} else {
-		require.NoError(t, queryFrontend.WaitSumMetrics(e2e.Equals(2), "cortex_query_frontend_connected_clients"))
+		require.NoError(t, queryFrontend.WaitSumMetrics(e2e.Equals(8), "cortex_query_frontend_connected_clients"))
 	}
 
 	wg := sync.WaitGroup{}

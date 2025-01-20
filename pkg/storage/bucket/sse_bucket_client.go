@@ -51,6 +51,10 @@ func (b *SSEBucketClient) Close() error {
 	return b.bucket.Close()
 }
 
+func (b *SSEBucketClient) Provider() objstore.ObjProvider {
+	return b.bucket.Provider()
+}
+
 // Upload the contents of the reader as an object into the bucket.
 func (b *SSEBucketClient) Upload(ctx context.Context, name string, r io.Reader) error {
 	if sse, err := b.getCustomS3SSEConfig(); err != nil {
@@ -104,6 +108,16 @@ func (b *SSEBucketClient) Iter(ctx context.Context, dir string, f func(string) e
 	return b.bucket.Iter(ctx, dir, f, options...)
 }
 
+// IterWithAttributes implements objstore.Bucket.
+func (b *SSEBucketClient) IterWithAttributes(ctx context.Context, dir string, f func(attrs objstore.IterObjectAttributes) error, options ...objstore.IterOption) error {
+	return b.bucket.IterWithAttributes(ctx, dir, f, options...)
+}
+
+// SupportedIterOptions implements objstore.Bucket.
+func (b *SSEBucketClient) SupportedIterOptions() []objstore.IterOptionType {
+	return b.bucket.SupportedIterOptions()
+}
+
 // Get implements objstore.Bucket.
 func (b *SSEBucketClient) Get(ctx context.Context, name string) (io.ReadCloser, error) {
 	return b.bucket.Get(ctx, name)
@@ -122,6 +136,11 @@ func (b *SSEBucketClient) Exists(ctx context.Context, name string) (bool, error)
 // IsObjNotFoundErr implements objstore.Bucket.
 func (b *SSEBucketClient) IsObjNotFoundErr(err error) bool {
 	return b.bucket.IsObjNotFoundErr(err)
+}
+
+// IsAccessDeniedErr implements objstore.Bucket.
+func (b *SSEBucketClient) IsAccessDeniedErr(err error) bool {
+	return b.bucket.IsAccessDeniedErr(err)
 }
 
 // Attributes implements objstore.Bucket.

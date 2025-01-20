@@ -9,46 +9,53 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"testing"
 
 	"github.com/go-kit/log"
 	"github.com/gorilla/mux"
+	"github.com/grafana/dskit/server"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
-	"github.com/weaveworks/common/server"
 
+	"github.com/grafana/mimir/pkg/querier/tenantfederation"
 	"github.com/grafana/mimir/pkg/util/gziphandler"
 )
 
 type FakeLogger struct{}
 
-func (fl *FakeLogger) Log(keyvals ...interface{}) error {
+func (fl *FakeLogger) Log(...interface{}) error {
 	return nil
 }
 
 func TestNewApiWithoutSourceIPExtractor(t *testing.T) {
 	cfg := Config{}
-	serverCfg := server.Config{
-		MetricsNamespace: "without_source_ip_extractor",
-	}
-	server, err := server.New(serverCfg)
+	serverCfg := getServerConfig(t)
+	serverCfg.MetricsNamespace = "without_source_ip_extractor"
+	federationCfg := tenantfederation.Config{}
+
+	require.NoError(t, serverCfg.LogLevel.Set("info"))
+	srv, err := server.New(serverCfg)
 	require.NoError(t, err)
 
-	api, err := New(cfg, serverCfg, server, &FakeLogger{})
+	api, err := New(cfg, federationCfg, serverCfg, srv, &FakeLogger{})
 	require.NoError(t, err)
 	require.Nil(t, api.sourceIPs)
 }
 
 func TestNewApiWithSourceIPExtractor(t *testing.T) {
 	cfg := Config{}
-	serverCfg := server.Config{
-		LogSourceIPs:     true,
-		MetricsNamespace: "with_source_ip_extractor",
-	}
-	server, err := server.New(serverCfg)
+	serverCfg := getServerConfig(t)
+	serverCfg.LogSourceIPs = true
+	serverCfg.MetricsNamespace = "with_source_ip_extractor"
+	federationCfg := tenantfederation.Config{}
+
+	require.NoError(t, serverCfg.LogLevel.Set("info"))
+	srv, err := server.New(serverCfg)
 	require.NoError(t, err)
 
-	api, err := New(cfg, serverCfg, server, &FakeLogger{})
+	api, err := New(cfg, federationCfg, serverCfg, srv, &FakeLogger{})
 	require.NoError(t, err)
 	require.NotNil(t, api.sourceIPs)
 }
@@ -58,14 +65,14 @@ func TestNewApiWithInvalidSourceIPExtractor(t *testing.T) {
 	s := server.Server{
 		HTTP: &mux.Router{},
 	}
-	serverCfg := server.Config{
-		LogSourceIPs:       true,
-		LogSourceIPsHeader: "SomeHeader",
-		LogSourceIPsRegex:  "[*",
-		MetricsNamespace:   "with_invalid_source_ip_extractor",
-	}
+	serverCfg := getServerConfig(t)
+	serverCfg.LogSourceIPs = true
+	serverCfg.LogSourceIPsHeader = "SomeHeader"
+	serverCfg.LogSourceIPsRegex = "[*"
+	serverCfg.MetricsNamespace = "with_invalid_source_ip_extractor"
+	federationCfg := tenantfederation.Config{}
 
-	api, err := New(cfg, serverCfg, &s, &FakeLogger{})
+	api, err := New(cfg, federationCfg, serverCfg, &s, &FakeLogger{})
 	require.Error(t, err)
 	require.Nil(t, api)
 }
@@ -73,12 +80,13 @@ func TestNewApiWithInvalidSourceIPExtractor(t *testing.T) {
 func TestApiGzip(t *testing.T) {
 	cfg := Config{}
 	serverCfg := getServerConfig(t)
+	federationCfg := tenantfederation.Config{}
 	srv, err := server.New(serverCfg)
 	require.NoError(t, err)
 	go func() { _ = srv.Run() }()
 	t.Cleanup(srv.Stop)
 
-	api, err := New(cfg, serverCfg, srv, log.NewNopLogger())
+	api, err := New(cfg, federationCfg, serverCfg, srv, log.NewNopLogger())
 	require.NoError(t, err)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -178,8 +186,57 @@ func TestApiGzip(t *testing.T) {
 		})
 	}
 
-	t.Run("compressed with gzip", func(t *testing.T) {
+	t.Run("compressed with gzip", func(*testing.T) {
 	})
+}
+
+type MockIngester struct {
+	Ingester
+}
+
+func (mi MockIngester) ShutdownHandler(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func TestApiIngesterShutdown(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		expectedStatusCode int
+	}{
+		{
+			name:               "flag not set (default), disable GET request for ingester shutdown",
+			expectedStatusCode: http.StatusMethodNotAllowed,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{}
+			serverCfg := getServerConfig(t)
+			federationCfg := tenantfederation.Config{}
+			srv, err := server.New(serverCfg)
+			require.NoError(t, err)
+
+			api, err := New(cfg, federationCfg, serverCfg, srv, log.NewNopLogger())
+			require.NoError(t, err)
+			api.RegisterIngester(&MockIngester{})
+
+			go func() { _ = srv.Run() }()
+			t.Cleanup(func() {
+				srv.Stop()
+				srv.Shutdown()
+			})
+
+			req := httptest.NewRequest("GET", "/ingester/shutdown", nil)
+			w := httptest.NewRecorder()
+			api.server.HTTP.ServeHTTP(w, req)
+			require.Equal(t, tc.expectedStatusCode, w.Code)
+
+			// for POST request, it should always return 204
+			req = httptest.NewRequest("POST", "/ingester/shutdown", nil)
+			w = httptest.NewRecorder()
+			api.server.HTTP.ServeHTTP(w, req)
+			require.Equal(t, http.StatusNoContent, w.Code)
+		})
+	}
 }
 
 // Generates server config, with gRPC listening on random port.
@@ -187,15 +244,20 @@ func getServerConfig(t *testing.T) server.Config {
 	grpcHost, grpcPortNum := getHostnameAndRandomPort(t)
 	httpHost, httpPortNum := getHostnameAndRandomPort(t)
 
-	return server.Config{
+	cfg := server.Config{
 		HTTPListenAddress: httpHost,
 		HTTPListenPort:    httpPortNum,
 
 		GRPCListenAddress: grpcHost,
 		GRPCListenPort:    grpcPortNum,
 
-		GPRCServerMaxRecvMsgSize: 1024,
+		GRPCServerMaxRecvMsgSize: 1024,
+
+		// Use new registry to avoid using default one and panic due to duplicate metrics.
+		Registerer: prometheus.NewPedanticRegistry(),
 	}
+	require.NoError(t, cfg.LogLevel.Set("info"))
+	return cfg
 }
 
 func getHostnameAndRandomPort(t *testing.T) (string, int) {

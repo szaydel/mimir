@@ -244,3 +244,27 @@
 {{- fail "You have enabled gateway.autoscaling.targetMemoryUtilizationPercentage, you must also set gateway.resources.requests.memory." -}}
 {{- end -}}
 {{- end -}}
+
+{{- if eq .Values.rbac.type "scc" -}}
+{{- with .Values.rbac.podSecurityContext -}}
+{{- if or (hasKey . "fsGroup") (hasKey . "runAsGroup") (hasKey . "runAsUser") -}}
+{{- fail "You have selected rbac.type=scc, you must set the values fsGroup, runAsGroup, runAsUser to null in rbac.podSecurityContext" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- if eq .Values.rbac.type "scc" -}}
+{{- with .Values.rollout_operator.podSecurityContext -}}
+{{- if or (hasKey . "fsGroup") (hasKey . "runAsGroup") (hasKey . "runAsUser") -}}
+{{- fail "You have selected rbac.type=scc, you must set the values fsGroup, runAsGroup, runAsUser to null in rollout_operator.podSecurityContext" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- if and .Values.ingress.enabled .Values.gateway.ingress.enabled -}}
+{{- fail "You have selected both ingress.enabled and gateway.ingress.enabled, you must select either ingress or gateway but not both" -}}
+{{- end -}}
+
+{{- if and (not .Values.enterprise.enabled) .Values.federation_frontend.enabled -}}
+{{- fail "You have federation_frontend.enabled=true, but enterprise.enabled=false. Federation Frontend is an enterprise-only feature and requires enterprise mode to be enabled." }}
+{{- end -}}

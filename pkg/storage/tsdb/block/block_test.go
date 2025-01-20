@@ -28,10 +28,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
 
-	"github.com/grafana/mimir/pkg/storage/tsdb/metadata"
-	"github.com/grafana/mimir/pkg/storegateway/testhelper"
-	e2eutil "github.com/grafana/mimir/pkg/storegateway/testhelper"
-	"github.com/grafana/mimir/pkg/util/test"
 	testutil "github.com/grafana/mimir/pkg/util/test"
 )
 
@@ -99,7 +95,7 @@ func TestDelete(t *testing.T) {
 
 	bkt := objstore.NewInMemBucket()
 	{
-		b1, err := e2eutil.CreateBlock(ctx, tmpDir, fiveLabels,
+		b1, err := CreateBlock(ctx, tmpDir, fiveLabels,
 			100, 0, 1000, labels.FromStrings("ext1", "val1"))
 		require.NoError(t, err)
 		require.NoError(t, Upload(ctx, log.NewNopLogger(), bkt, path.Join(tmpDir, b1.String()), nil))
@@ -113,7 +109,7 @@ func TestDelete(t *testing.T) {
 		require.Equal(t, 0, len(bkt.Objects()))
 	}
 	{
-		b2, err := e2eutil.CreateBlock(ctx, tmpDir, fiveLabels,
+		b2, err := CreateBlock(ctx, tmpDir, fiveLabels,
 			100, 0, 1000, labels.FromStrings("ext1", "val1"))
 		require.NoError(t, err)
 		require.NoError(t, Upload(ctx, log.NewNopLogger(), bkt, path.Join(tmpDir, b2.String()), nil))
@@ -132,7 +128,7 @@ func TestUpload(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	bkt := objstore.NewInMemBucket()
-	b1, err := testhelper.CreateBlock(ctx, tmpDir, []labels.Labels{
+	b1, err := CreateBlock(ctx, tmpDir, []labels.Labels{
 		labels.FromStrings("a", "1"),
 		labels.FromStrings("a", "2"),
 		labels.FromStrings("a", "3"),
@@ -161,7 +157,7 @@ func TestUpload(t *testing.T) {
 	})
 
 	t.Run("missing chunks", func(t *testing.T) {
-		test.Copy(t, path.Join(tmpDir, b1.String(), MetaFilename), path.Join(tmpDir, "test", b1.String(), MetaFilename))
+		testutil.Copy(t, path.Join(tmpDir, b1.String(), MetaFilename), path.Join(tmpDir, "test", b1.String(), MetaFilename))
 
 		err := Upload(ctx, log.NewNopLogger(), bkt, path.Join(tmpDir, "test", b1.String()), nil)
 		require.Error(t, err)
@@ -170,7 +166,7 @@ func TestUpload(t *testing.T) {
 
 	t.Run("missing index file", func(t *testing.T) {
 		require.NoError(t, os.MkdirAll(path.Join(tmpDir, "test", b1.String(), ChunksDirname), 0777))
-		test.Copy(t, path.Join(tmpDir, b1.String(), ChunksDirname, "000001"), path.Join(tmpDir, "test", b1.String(), ChunksDirname, "000001"))
+		testutil.Copy(t, path.Join(tmpDir, b1.String(), ChunksDirname, "000001"), path.Join(tmpDir, "test", b1.String(), ChunksDirname, "000001"))
 
 		err := Upload(ctx, log.NewNopLogger(), bkt, path.Join(tmpDir, "test", b1.String()), nil)
 		require.Error(t, err)
@@ -178,7 +174,7 @@ func TestUpload(t *testing.T) {
 	})
 
 	t.Run("missing meta.json file", func(t *testing.T) {
-		test.Copy(t, path.Join(tmpDir, b1.String(), IndexFilename), path.Join(tmpDir, "test", b1.String(), IndexFilename))
+		testutil.Copy(t, path.Join(tmpDir, b1.String(), IndexFilename), path.Join(tmpDir, "test", b1.String(), IndexFilename))
 		require.NoError(t, os.Remove(path.Join(tmpDir, "test", b1.String(), MetaFilename)))
 
 		// Missing meta.json file.
@@ -189,7 +185,7 @@ func TestUpload(t *testing.T) {
 
 	t.Run("missing meta.json file, but valid metadata supplied as argument", func(t *testing.T) {
 		// Read meta.json from original block
-		meta, err := metadata.ReadFromDir(path.Join(tmpDir, b1.String()))
+		meta, err := ReadMetaFromDir(path.Join(tmpDir, b1.String()))
 		require.NoError(t, err)
 
 		// Make sure meta.json doesn't exist in "test"
@@ -201,7 +197,7 @@ func TestUpload(t *testing.T) {
 		require.Contains(t, err.Error(), "/meta.json: no such file or directory")
 	})
 
-	test.Copy(t, path.Join(tmpDir, b1.String(), MetaFilename), path.Join(tmpDir, "test", b1.String(), MetaFilename))
+	testutil.Copy(t, path.Join(tmpDir, b1.String(), MetaFilename), path.Join(tmpDir, "test", b1.String(), MetaFilename))
 
 	t.Run("full block", func(t *testing.T) {
 		// Full
@@ -209,10 +205,11 @@ func TestUpload(t *testing.T) {
 		require.Equal(t, 3, len(bkt.Objects()))
 		chunkFileSize := getFileSize(t, filepath.Join(tmpDir, b1.String(), ChunksDirname, "000001"))
 		require.Equal(t, chunkFileSize, int64(len(bkt.Objects()[path.Join(b1.String(), ChunksDirname, "000001")])))
-		require.Equal(t, 401, len(bkt.Objects()[path.Join(b1.String(), IndexFilename)]))
+		indexFileSize := getFileSize(t, path.Join(tmpDir, b1.String(), IndexFilename))
+		require.Equal(t, indexFileSize, int64(len(bkt.Objects()[path.Join(b1.String(), IndexFilename)])))
 		require.Equal(t, 568, len(bkt.Objects()[path.Join(b1.String(), MetaFilename)]))
 
-		origMeta, err := metadata.ReadFromDir(path.Join(tmpDir, "test", b1.String()))
+		origMeta, err := ReadMetaFromDir(path.Join(tmpDir, "test", b1.String()))
 		require.NoError(t, err)
 
 		uploadedMeta, err := DownloadMeta(context.Background(), log.NewNopLogger(), bkt, b1)
@@ -220,9 +217,9 @@ func TestUpload(t *testing.T) {
 
 		files := uploadedMeta.Thanos.Files
 		require.Len(t, files, 3)
-		require.Equal(t, metadata.File{RelPath: "chunks/000001", SizeBytes: chunkFileSize}, files[0])
-		require.Equal(t, metadata.File{RelPath: "index", SizeBytes: 401}, files[1])
-		require.Equal(t, metadata.File{RelPath: "meta.json", SizeBytes: 0}, files[2]) // meta.json is added to the files without its size.
+		require.Equal(t, File{RelPath: "chunks/000001", SizeBytes: chunkFileSize}, files[0])
+		require.Equal(t, File{RelPath: "index", SizeBytes: indexFileSize}, files[1])
+		require.Equal(t, File{RelPath: "meta.json", SizeBytes: 0}, files[2]) // meta.json is added to the files without its size.
 
 		// clear files before comparing against original meta.json
 		uploadedMeta.Thanos.Files = nil
@@ -236,13 +233,14 @@ func TestUpload(t *testing.T) {
 		require.Equal(t, 3, len(bkt.Objects()))
 		chunkFileSize := getFileSize(t, filepath.Join(tmpDir, b1.String(), ChunksDirname, "000001"))
 		require.Equal(t, chunkFileSize, int64(len(bkt.Objects()[path.Join(b1.String(), ChunksDirname, "000001")])))
-		require.Equal(t, 401, len(bkt.Objects()[path.Join(b1.String(), IndexFilename)]))
+		indexFileSize := getFileSize(t, path.Join(tmpDir, b1.String(), IndexFilename))
+		require.Equal(t, indexFileSize, int64(len(bkt.Objects()[path.Join(b1.String(), IndexFilename)])))
 		require.Equal(t, 568, len(bkt.Objects()[path.Join(b1.String(), MetaFilename)]))
 	})
 
 	t.Run("upload with no external labels works just fine", func(t *testing.T) {
 		// Upload with no external labels should be blocked.
-		b2, err := testhelper.CreateBlock(ctx, tmpDir, []labels.Labels{
+		b2, err := CreateBlock(ctx, tmpDir, []labels.Labels{
 			labels.FromStrings("a", "1"),
 			labels.FromStrings("a", "2"),
 			labels.FromStrings("a", "3"),
@@ -257,10 +255,11 @@ func TestUpload(t *testing.T) {
 		chunkFileSize := getFileSize(t, filepath.Join(tmpDir, b2.String(), ChunksDirname, "000001"))
 		require.Equal(t, 6, len(bkt.Objects())) // 3 from b1, 3 from b2
 		require.Equal(t, chunkFileSize, int64(len(bkt.Objects()[path.Join(b2.String(), ChunksDirname, "000001")])))
-		require.Equal(t, 401, len(bkt.Objects()[path.Join(b2.String(), IndexFilename)]))
+		indexFileSize := getFileSize(t, path.Join(tmpDir, b2.String(), IndexFilename))
+		require.Equal(t, indexFileSize, int64(len(bkt.Objects()[path.Join(b2.String(), IndexFilename)])))
 		require.Equal(t, 547, len(bkt.Objects()[path.Join(b2.String(), MetaFilename)]))
 
-		origMeta, err := metadata.ReadFromDir(path.Join(tmpDir, b2.String()))
+		origMeta, err := ReadMetaFromDir(path.Join(tmpDir, b2.String()))
 		require.NoError(t, err)
 
 		uploadedMeta, err := DownloadMeta(context.Background(), log.NewNopLogger(), bkt, b2)
@@ -273,7 +272,7 @@ func TestUpload(t *testing.T) {
 
 	t.Run("upload with supplied meta.json", func(t *testing.T) {
 		// Upload with no external labels should be blocked.
-		b3, err := testhelper.CreateBlock(ctx, tmpDir, []labels.Labels{
+		b3, err := CreateBlock(ctx, tmpDir, []labels.Labels{
 			labels.FromStrings("a", "1"),
 			labels.FromStrings("a", "2"),
 			labels.FromStrings("a", "3"),
@@ -283,10 +282,10 @@ func TestUpload(t *testing.T) {
 		require.NoError(t, err)
 
 		// Prepare metadata that will be uploaded to the bucket.
-		updatedMeta, err := metadata.ReadFromDir(path.Join(tmpDir, b3.String()))
+		updatedMeta, err := ReadMetaFromDir(path.Join(tmpDir, b3.String()))
 		require.NoError(t, err)
 		require.Empty(t, updatedMeta.Thanos.Labels)
-		require.Equal(t, metadata.TestSource, updatedMeta.Thanos.Source)
+		require.Equal(t, TestSource, updatedMeta.Thanos.Source)
 		updatedMeta.Thanos.Labels = map[string]string{"a": "b", "c": "d"}
 		updatedMeta.Thanos.Source = "hello world"
 
@@ -295,10 +294,10 @@ func TestUpload(t *testing.T) {
 		require.NoError(t, err)
 
 		// Verify that original (on-disk) meta.json is not changed
-		origMeta, err := metadata.ReadFromDir(path.Join(tmpDir, b3.String()))
+		origMeta, err := ReadMetaFromDir(path.Join(tmpDir, b3.String()))
 		require.NoError(t, err)
 		require.Empty(t, origMeta.Thanos.Labels)
-		require.Equal(t, metadata.TestSource, origMeta.Thanos.Source)
+		require.Equal(t, TestSource, origMeta.Thanos.Source)
 
 		// Verify that meta.json uploaded in the bucket has updated values.
 		bucketMeta, err := DownloadMeta(context.Background(), log.NewNopLogger(), bkt, b3)
@@ -330,26 +329,26 @@ func TestMarkForDeletion(t *testing.T) {
 	}{
 		{
 			name:         "block marked for deletion",
-			preUpload:    func(t testing.TB, id ulid.ULID, bkt objstore.Bucket) {},
+			preUpload:    func(testing.TB, ulid.ULID, objstore.Bucket) {},
 			blocksMarked: 1,
 		},
 		{
 			name: "block with deletion mark already, expected log and no metric increment",
 			preUpload: func(t testing.TB, id ulid.ULID, bkt objstore.Bucket) {
-				deletionMark, err := json.Marshal(metadata.DeletionMark{
+				deletionMark, err := json.Marshal(DeletionMark{
 					ID:           id,
 					DeletionTime: time.Now().Unix(),
-					Version:      metadata.DeletionMarkVersion1,
+					Version:      DeletionMarkVersion1,
 				})
 				require.NoError(t, err)
-				require.NoError(t, bkt.Upload(ctx, path.Join(id.String(), metadata.DeletionMarkFilename), bytes.NewReader(deletionMark)))
+				require.NoError(t, bkt.Upload(ctx, path.Join(id.String(), DeletionMarkFilename), bytes.NewReader(deletionMark)))
 			},
 			blocksMarked: 0,
 		},
 	} {
 		t.Run(tcase.name, func(t *testing.T) {
 			bkt := objstore.NewInMemBucket()
-			id, err := e2eutil.CreateBlock(ctx, tmpDir, fiveLabels,
+			id, err := CreateBlock(ctx, tmpDir, fiveLabels,
 				100, 0, 1000, labels.FromStrings("ext1", "val1"))
 			require.NoError(t, err)
 
@@ -379,26 +378,26 @@ func TestMarkForNoCompact(t *testing.T) {
 	}{
 		{
 			name:         "block marked",
-			preUpload:    func(t testing.TB, id ulid.ULID, bkt objstore.Bucket) {},
+			preUpload:    func(testing.TB, ulid.ULID, objstore.Bucket) {},
 			blocksMarked: 1,
 		},
 		{
 			name: "block with no-compact mark already, expected log and no metric increment",
 			preUpload: func(t testing.TB, id ulid.ULID, bkt objstore.Bucket) {
-				m, err := json.Marshal(metadata.NoCompactMark{
+				m, err := json.Marshal(NoCompactMark{
 					ID:            id,
 					NoCompactTime: time.Now().Unix(),
-					Version:       metadata.NoCompactMarkVersion1,
+					Version:       NoCompactMarkVersion1,
 				})
 				require.NoError(t, err)
-				require.NoError(t, bkt.Upload(ctx, path.Join(id.String(), metadata.NoCompactMarkFilename), bytes.NewReader(m)))
+				require.NoError(t, bkt.Upload(ctx, path.Join(id.String(), NoCompactMarkFilename), bytes.NewReader(m)))
 			},
 			blocksMarked: 0,
 		},
 	} {
 		t.Run(tcase.name, func(t *testing.T) {
 			bkt := objstore.NewInMemBucket()
-			id, err := e2eutil.CreateBlock(ctx, tmpDir, fiveLabels,
+			id, err := CreateBlock(ctx, tmpDir, fiveLabels,
 				100, 0, 1000, labels.FromStrings("ext1", "val1"))
 			require.NoError(t, err)
 
@@ -407,9 +406,59 @@ func TestMarkForNoCompact(t *testing.T) {
 			require.NoError(t, Upload(ctx, log.NewNopLogger(), bkt, path.Join(tmpDir, id.String()), nil))
 
 			c := promauto.With(nil).NewCounter(prometheus.CounterOpts{})
-			err = MarkForNoCompact(ctx, log.NewNopLogger(), bkt, id, metadata.ManualNoCompactReason, "", c)
+			err = MarkForNoCompact(ctx, log.NewNopLogger(), bkt, id, ManualNoCompactReason, "", c)
 			require.NoError(t, err)
 			require.Equal(t, float64(tcase.blocksMarked), promtest.ToFloat64(c))
+		})
+	}
+}
+
+func TestUnMarkForNoCompact(t *testing.T) {
+	testutil.VerifyNoLeak(t)
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	for tname, tcase := range map[string]struct {
+		setupTest     func(t testing.TB, id ulid.ULID, bkt objstore.Bucket)
+		expectedError func(id ulid.ULID) error
+	}{
+		"unmark existing block should succeed": {
+			setupTest: func(t testing.TB, id ulid.ULID, bkt objstore.Bucket) {
+				// upload blocks and no-compact marker
+				err := Upload(ctx, log.NewNopLogger(), bkt, path.Join(tmpDir, id.String()), nil)
+				require.NoError(t, err)
+				m, err := json.Marshal(NoCompactMark{
+					ID:            id,
+					NoCompactTime: time.Now().Unix(),
+					Version:       NoCompactMarkVersion1,
+				})
+				require.NoError(t, err)
+				require.NoError(t, bkt.Upload(ctx, path.Join(id.String(), NoCompactMarkFilename), bytes.NewReader(m)))
+			},
+			expectedError: func(_ ulid.ULID) error {
+				return nil
+			},
+		},
+		"unmark non-existing block should fail": {
+			setupTest: func(testing.TB, ulid.ULID, objstore.Bucket) {},
+			expectedError: func(id ulid.ULID) error {
+				return errors.Errorf("deletion of no-compaction marker for block %s has failed: inmem: object not found", id.String())
+			},
+		},
+	} {
+		t.Run(tname, func(t *testing.T) {
+			bkt := objstore.NewInMemBucket()
+			id, err := CreateBlock(ctx, tmpDir, fiveLabels,
+				100, 0, 1000, labels.FromStrings("ext1", "val1"))
+			require.NoError(t, err)
+			tcase.setupTest(t, id, bkt)
+			err = DeleteNoCompactMarker(ctx, log.NewNopLogger(), bkt, id)
+			if expErr := tcase.expectedError(id); expErr != nil {
+				require.EqualError(t, err, expErr.Error())
+			} else {
+				require.NoError(t, err)
+				_, ok := bkt.Objects()[path.Join(id.String(), NoCompactMarkFilename)]
+				require.False(t, ok)
+			}
 		})
 	}
 }
@@ -422,7 +471,7 @@ func TestUploadCleanup(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	bkt := objstore.NewInMemBucket()
-	b1, err := e2eutil.CreateBlock(ctx, tmpDir, fiveLabels,
+	b1, err := CreateBlock(ctx, tmpDir, fiveLabels,
 		100, 0, 1000, labels.FromStrings("ext1", "val1"))
 	require.NoError(t, err)
 

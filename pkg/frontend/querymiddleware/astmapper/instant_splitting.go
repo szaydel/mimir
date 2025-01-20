@@ -11,6 +11,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/promql/parser/posrange"
 )
 
 type instantSplitter struct {
@@ -194,7 +195,7 @@ func (i *instantSplitter) mapParenExpr(expr *parser.ParenExpr) (mapped parser.Ex
 
 	return &parser.ParenExpr{
 		Expr:     parenExpr,
-		PosRange: parser.PositionRange{},
+		PosRange: posrange.PositionRange{},
 	}, true, nil
 }
 
@@ -331,7 +332,7 @@ func (i *instantSplitter) mapCallByRangeInterval(expr *parser.Call, rangeInterva
 		Param:    nil,
 		Grouping: grouping,
 		Without:  groupingWithout,
-		PosRange: parser.PositionRange{},
+		PosRange: posrange.PositionRange{},
 	}, true, nil
 }
 
@@ -357,7 +358,7 @@ func (i *instantSplitter) splitAndSquashCall(expr *parser.Call, rangeInterval ti
 	}
 
 	// Create a partial query for each split
-	embeddedQueries := make([]parser.Expr, 0, splitCount)
+	embeddedQueries := make([]EmbeddedQuery, 0, splitCount)
 	for split := 0; split < splitCount; split++ {
 		splitOffset := time.Duration(split) * i.interval
 		// The range interval of the last embedded query can be smaller than i.interval
@@ -376,10 +377,10 @@ func (i *instantSplitter) splitAndSquashCall(expr *parser.Call, rangeInterval ti
 		}
 
 		// Prepend to embedded queries
-		embeddedQueries = append([]parser.Expr{splitExpr}, embeddedQueries...)
+		embeddedQueries = append([]EmbeddedQuery{NewEmbeddedQuery(splitExpr.String(), nil)}, embeddedQueries...)
 	}
 
-	squashExpr, err := vectorSquasher(embeddedQueries...)
+	squashExpr, err := VectorSquasher(embeddedQueries...)
 	if err != nil {
 		return nil, false, err
 	}

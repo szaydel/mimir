@@ -1,3 +1,4 @@
+{{- if not .Values.federation_frontend.disableOtherComponents }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -11,8 +12,10 @@ spec:
   ports:
     - name: gossip-ring
       port: {{ include "mimir.memberlistBindPort" . }}
+      appProtocol: tcp
       protocol: TCP
       targetPort: {{ include "mimir.memberlistBindPort" . }}
   publishNotReadyAddresses: true
   selector:
     {{- include "mimir.gossipRingSelectorLabels" (dict "ctx" .) | nindent 4 }}
+{{- end }}

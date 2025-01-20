@@ -17,19 +17,19 @@ import (
 	"github.com/go-kit/log"
 	"github.com/gorilla/mux"
 	"github.com/grafana/dskit/flagext"
+	"github.com/grafana/dskit/user"
 	"github.com/pkg/errors"
 	"github.com/prometheus/alertmanager/config"
+	"github.com/prometheus/alertmanager/featurecontrol"
 	"github.com/prometheus/client_golang/prometheus"
 	commoncfg "github.com/prometheus/common/config"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
 
 	"github.com/grafana/mimir/pkg/alertmanager/alertspb"
 	"github.com/grafana/mimir/pkg/alertmanager/alertstore/bucketclient"
-	util_log "github.com/grafana/mimir/pkg/util/log"
-
-	"github.com/stretchr/testify/require"
-	"github.com/weaveworks/common/user"
+	"github.com/grafana/mimir/pkg/util/test"
 )
 
 func TestAMConfigValidationAPI(t *testing.T) {
@@ -289,6 +289,34 @@ alertmanager_config: |
 			err: errors.Wrap(errPasswordFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
+			name: "Should NOT return error if global HTTP proxy_url is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    http_config:
+      proxy_url: http://example.com
+  route:
+    receiver: 'default-receiver'
+  receivers:
+    - name: default-receiver
+`,
+			err: nil,
+		},
+		{
+			name: "Should NOT return error if global HTTP proxy_from_environment is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    http_config:
+      proxy_from_environment: true
+  route:
+    receiver: 'default-receiver'
+  receivers:
+    - name: default-receiver
+`,
+			err: nil,
+		},
+		{
 			name: "Should return error if global OAuth2 client_secret_file is set",
 			cfg: `
 alertmanager_config: |
@@ -325,7 +353,25 @@ alertmanager_config: |
 			err: errors.Wrap(errProxyURLNotAllowed, "error validating Alertmanager config"),
 		},
 		{
-			name: "Should return error if global OAuth2 TLS key_file is set",
+			name: "Should return error if global OAuth2 proxy_from_environment is set",
+			cfg: `
+alertmanager_config: |
+  global:
+    http_config:
+      oauth2:
+        client_id: test
+        client_secret: xxx
+        token_url: http://example.com
+        proxy_from_environment: true
+  route:
+    receiver: 'default-receiver'
+  receivers:
+    - name: default-receiver
+`,
+			err: errors.Wrap(errProxyFromEnvironmentURLNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if global OAuth2 TLS is configured through files",
 			cfg: `
 alertmanager_config: |
   global:
@@ -335,14 +381,36 @@ alertmanager_config: |
         client_secret: secret
         token_url: http://example.com
         tls_config:
-          key_file: /secrets
+          key_file: /secrets/key
+          cert_file: /secrets/cert
 
   route:
     receiver: 'default-receiver'
   receivers:
     - name: default-receiver
 `,
-			err: errors.Wrap(errTLSFileNotAllowed, "error validating Alertmanager config"),
+			err: errors.Wrap(errTLSConfigNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if global OAuth2 TLS is configured through byte slices",
+			cfg: `
+alertmanager_config: |
+  global:
+    http_config:
+      oauth2:
+        client_id: test
+        client_secret: secret
+        token_url: http://example.com
+        tls_config:
+          key: key
+          cert: cert
+
+  route:
+    receiver: 'default-receiver'
+  receivers:
+    - name: default-receiver
+`,
+			err: errors.Wrap(errTLSConfigNotAllowed, "error validating Alertmanager config"),
 		},
 		{
 			name: "Should return error if receiver's HTTP password_file is set",
@@ -395,6 +463,36 @@ alertmanager_config: |
 			err: errors.Wrap(errPasswordFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
+			name: "Should NOT return error if receiver's HTTP proxy_url is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://localhost
+          http_config:
+            proxy_url: http://example.com
+  route:
+    receiver: 'default-receiver'
+`,
+			err: nil,
+		},
+		{
+			name: "Should NOT return error if receiver's HTTP proxy_from_environment is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://localhost
+          http_config:
+            proxy_from_environment: true
+  route:
+    receiver: 'default-receiver'
+`,
+			err: nil,
+		},
+		{
 			name: "Should return error if receiver's OAuth2 client_secret_file is set",
 			cfg: `
 alertmanager_config: |
@@ -431,6 +529,25 @@ alertmanager_config: |
     receiver: 'default-receiver'
 `,
 			err: errors.Wrap(errProxyURLNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "Should return error if receiver's OAuth2 proxy_from_environment is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url: http://localhost
+          http_config:
+            oauth2:
+              client_id: test
+              token_url: http://example.com
+              client_secret: xxx
+              proxy_from_environment: true
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errProxyFromEnvironmentURLNotAllowed, "error validating Alertmanager config"),
 		},
 		{
 			name: "Should return error if global slack_api_url_file is set",
@@ -585,6 +702,35 @@ alertmanager_config: |
 			err: errors.Wrap(errPushoverTokenFileNotAllowed, "error validating Alertmanager config"),
 		},
 		{
+			name: "should return error if Telegram bot_token_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      telegram_configs:
+        - bot_token_file: /secrets
+          chat_id: 123
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errTelegramBotTokenFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
+			name: "should return error if Webhook url_file is set",
+			cfg: `
+alertmanager_config: |
+  receivers:
+    - name: default-receiver
+      webhook_configs:
+        - url_file: /secrets
+
+  route:
+    receiver: 'default-receiver'
+`,
+			err: errors.Wrap(errWebhookURLFileNotAllowed, "error validating Alertmanager config"),
+		},
+		{
 			name: "should return error if template is wrong",
 			cfg: `
 alertmanager_config: |
@@ -598,6 +744,23 @@ alertmanager_config: |
     - name: default-receiver
   templates:
     - "*.tmpl"
+template_files:
+  "test.tmpl": "{{ invalid Go template }}"
+`,
+			err: fmt.Errorf(`error validating Alertmanager config: template: test.tmpl:1: function "invalid" not defined`),
+		},
+		{
+			name: "should return error if template is wrong even when not referenced by config",
+			cfg: `
+alertmanager_config: |
+  route:
+    receiver: 'default-receiver'
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 4h
+    group_by: [cluster, alertname]
+  receivers:
+    - name: default-receiver
 template_files:
   "test.tmpl": "{{ invalid Go template }}"
 `,
@@ -735,8 +898,9 @@ alertmanager_config: |
 
 	limits := &mockAlertManagerLimits{}
 	am := &MultitenantAlertmanager{
+		cfg:    mockAlertmanagerConfig(t),
 		store:  prepareInMemoryAlertStore(),
-		logger: util_log.Logger,
+		logger: test.NewTestingLogger(t),
 		limits: limits,
 	}
 	for _, tc := range testCases {
@@ -745,7 +909,7 @@ alertmanager_config: |
 			limits.maxTemplatesCount = tc.maxTemplates
 			limits.maxSizeOfTemplate = tc.maxTemplateSize
 
-			req := httptest.NewRequest(http.MethodPost, "http://alertmanager/api/v1/alerts", bytes.NewReader([]byte(tc.cfg)))
+			req := httptest.NewRequest(http.MethodPost, "http://alertmanager/api/v2/alerts", bytes.NewReader([]byte(tc.cfg)))
 			ctx := user.InjectOrgID(req.Context(), "testing")
 			w := httptest.NewRecorder()
 			am.SetUserConfig(w, req.WithContext(ctx))
@@ -767,11 +931,11 @@ alertmanager_config: |
 
 func TestMultitenantAlertmanager_DeleteUserConfig(t *testing.T) {
 	storage := objstore.NewInMemBucket()
-	alertStore := bucketclient.NewBucketAlertStore(storage, nil, log.NewNopLogger())
+	alertStore := bucketclient.NewBucketAlertStore(bucketclient.BucketAlertStoreConfig{}, storage, nil, log.NewNopLogger())
 
 	am := &MultitenantAlertmanager{
 		store:  alertStore,
-		logger: util_log.Logger,
+		logger: test.NewTestingLogger(t),
 	}
 
 	require.NoError(t, alertStore.SetAlertConfig(context.Background(), alertspb.AlertConfigDesc{
@@ -851,7 +1015,7 @@ receivers:
 	}
 
 	storage := objstore.NewInMemBucket()
-	alertStore := bucketclient.NewBucketAlertStore(storage, nil, log.NewNopLogger())
+	alertStore := bucketclient.NewBucketAlertStore(bucketclient.BucketAlertStoreConfig{}, storage, nil, log.NewNopLogger())
 
 	for u, cfg := range testCases {
 		err := alertStore.SetAlertConfig(context.Background(), alertspb.AlertConfigDesc{
@@ -868,7 +1032,7 @@ receivers:
 	// Create the Multitenant Alertmanager.
 	reg := prometheus.NewPedanticRegistry()
 	cfg := mockAlertmanagerConfig(t)
-	am := setupSingleMultitenantAlertmanager(t, cfg, alertStore, nil, log.NewNopLogger(), reg)
+	am := setupSingleMultitenantAlertmanager(t, cfg, alertStore, nil, featurecontrol.NoopFlags{}, log.NewNopLogger(), reg)
 
 	err = am.loadAndSyncConfigs(context.Background(), reasonPeriodic)
 	require.NoError(t, err)
@@ -950,13 +1114,13 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 			input: &commoncfg.TLSConfig{
 				CertFile: "/cert",
 			},
-			expected: errTLSFileNotAllowed,
+			expected: errTLSConfigNotAllowed,
 		},
 		"TLSConfig": {
 			input: commoncfg.TLSConfig{
 				CertFile: "/cert",
 			},
-			expected: errTLSFileNotAllowed,
+			expected: errTLSConfigNotAllowed,
 		},
 		"*GlobalConfig.SMTPAuthPasswordFile": {
 			input: &config.GlobalConfig{
@@ -970,6 +1134,34 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 			},
 			expected: errPasswordFileNotAllowed,
 		},
+		"*DiscordConfig.HTTPConfig": {
+			input: &config.DiscordConfig{
+				HTTPConfig: &commoncfg.HTTPClientConfig{
+					BearerTokenFile: "/file",
+				},
+			},
+			expected: errPasswordFileNotAllowed,
+		},
+		"DiscordConfig.HTTPConfig": {
+			input: &config.DiscordConfig{
+				HTTPConfig: &commoncfg.HTTPClientConfig{
+					BearerTokenFile: "/file",
+				},
+			},
+			expected: errPasswordFileNotAllowed,
+		},
+		"*DiscordConfig.WebhookURLFile": {
+			input: &config.DiscordConfig{
+				WebhookURLFile: "/file",
+			},
+			expected: errWebhookURLFileNotAllowed,
+		},
+		"DiscordConfig.WebhookURLFile": {
+			input: config.DiscordConfig{
+				WebhookURLFile: "/file",
+			},
+			expected: errWebhookURLFileNotAllowed,
+		},
 		"*EmailConfig.AuthPasswordFile": {
 			input: &config.EmailConfig{
 				AuthPasswordFile: "/file",
@@ -981,6 +1173,34 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 				AuthPasswordFile: "/file",
 			},
 			expected: errPasswordFileNotAllowed,
+		},
+		"*MSTeams.HTTPConfig": {
+			input: &config.MSTeamsConfig{
+				HTTPConfig: &commoncfg.HTTPClientConfig{
+					BearerTokenFile: "/file",
+				},
+			},
+			expected: errPasswordFileNotAllowed,
+		},
+		"MSTeams.HTTPConfig": {
+			input: &config.MSTeamsConfig{
+				HTTPConfig: &commoncfg.HTTPClientConfig{
+					BearerTokenFile: "/file",
+				},
+			},
+			expected: errPasswordFileNotAllowed,
+		},
+		"*MSTeams.WebhookURLFile": {
+			input: &config.MSTeamsConfig{
+				WebhookURLFile: "/file",
+			},
+			expected: errWebhookURLFileNotAllowed,
+		},
+		"MSTeams.WebhookURLFile": {
+			input: config.MSTeamsConfig{
+				WebhookURLFile: "/file",
+			},
+			expected: errWebhookURLFileNotAllowed,
 		},
 		"struct containing *HTTPClientConfig as direct child": {
 			input: config.GlobalConfig{
@@ -1037,7 +1257,7 @@ func TestValidateAlertmanagerConfig(t *testing.T) {
 					},
 				}},
 			},
-			expected: errTLSFileNotAllowed,
+			expected: errTLSConfigNotAllowed,
 		},
 	}
 

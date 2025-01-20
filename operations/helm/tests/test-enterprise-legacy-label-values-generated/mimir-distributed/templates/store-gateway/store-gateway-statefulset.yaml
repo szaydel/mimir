@@ -12,9 +12,10 @@ metadata:
     rollout-group: store-gateway
     zone: zone-a
   annotations:
-    rollout-max-unavailable: "10"
+    rollout-max-unavailable: "50"
   namespace: "citestns"
 spec:
+  podManagementPolicy: OrderedReady
   replicas: 1
   selector:
     matchLabels:
@@ -26,7 +27,9 @@ spec:
     type: OnDelete
   serviceName: test-enterprise-legacy-label-values-enterprise-metrics-store-gateway
   volumeClaimTemplates:
-    - metadata:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
         name: storage
       spec:
         accessModes:
@@ -55,23 +58,15 @@ spec:
         runAsUser: 10001
         seccompProfile:
           type: RuntimeDefault
-      initContainers:
-        []
-      nodeSelector:
-        {}
-      affinity:
-        {}
       topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              app: enterprise-metrics-store-gateway
-              release: test-enterprise-legacy-label-values
-      tolerations:
-        []
-      terminationGracePeriodSeconds: 240
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: enterprise-metrics-store-gateway
+            release: test-enterprise-legacy-label-values
+      terminationGracePeriodSeconds: 120
       volumes:
         - name: config
           secret:
@@ -131,7 +126,12 @@ spec:
               - ALL
             readOnlyRootFilesystem: true
           env:
-          envFrom:
+            - name: "GOMAXPROCS"
+              value: "5"
+            - name: "GOMEMLIMIT"
+              value: "536870912"
+            - name: "JAEGER_REPORTER_MAX_QUEUE_SIZE"
+              value: "1000"
 ---
 # Source: mimir-distributed/templates/store-gateway/store-gateway-statefulset.yaml
 apiVersion: apps/v1
@@ -146,9 +146,10 @@ metadata:
     rollout-group: store-gateway
     zone: zone-b
   annotations:
-    rollout-max-unavailable: "10"
+    rollout-max-unavailable: "50"
   namespace: "citestns"
 spec:
+  podManagementPolicy: OrderedReady
   replicas: 1
   selector:
     matchLabels:
@@ -160,7 +161,9 @@ spec:
     type: OnDelete
   serviceName: test-enterprise-legacy-label-values-enterprise-metrics-store-gateway
   volumeClaimTemplates:
-    - metadata:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
         name: storage
       spec:
         accessModes:
@@ -189,23 +192,15 @@ spec:
         runAsUser: 10001
         seccompProfile:
           type: RuntimeDefault
-      initContainers:
-        []
-      nodeSelector:
-        {}
-      affinity:
-        {}
       topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              app: enterprise-metrics-store-gateway
-              release: test-enterprise-legacy-label-values
-      tolerations:
-        []
-      terminationGracePeriodSeconds: 240
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: enterprise-metrics-store-gateway
+            release: test-enterprise-legacy-label-values
+      terminationGracePeriodSeconds: 120
       volumes:
         - name: config
           secret:
@@ -265,7 +260,12 @@ spec:
               - ALL
             readOnlyRootFilesystem: true
           env:
-          envFrom:
+            - name: "GOMAXPROCS"
+              value: "5"
+            - name: "GOMEMLIMIT"
+              value: "536870912"
+            - name: "JAEGER_REPORTER_MAX_QUEUE_SIZE"
+              value: "1000"
 ---
 # Source: mimir-distributed/templates/store-gateway/store-gateway-statefulset.yaml
 apiVersion: apps/v1
@@ -280,9 +280,10 @@ metadata:
     rollout-group: store-gateway
     zone: zone-c
   annotations:
-    rollout-max-unavailable: "10"
+    rollout-max-unavailable: "50"
   namespace: "citestns"
 spec:
+  podManagementPolicy: OrderedReady
   replicas: 1
   selector:
     matchLabels:
@@ -294,7 +295,9 @@ spec:
     type: OnDelete
   serviceName: test-enterprise-legacy-label-values-enterprise-metrics-store-gateway
   volumeClaimTemplates:
-    - metadata:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
         name: storage
       spec:
         accessModes:
@@ -323,23 +326,15 @@ spec:
         runAsUser: 10001
         seccompProfile:
           type: RuntimeDefault
-      initContainers:
-        []
-      nodeSelector:
-        {}
-      affinity:
-        {}
       topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              app: enterprise-metrics-store-gateway
-              release: test-enterprise-legacy-label-values
-      tolerations:
-        []
-      terminationGracePeriodSeconds: 240
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: enterprise-metrics-store-gateway
+            release: test-enterprise-legacy-label-values
+      terminationGracePeriodSeconds: 120
       volumes:
         - name: config
           secret:
@@ -399,4 +394,9 @@ spec:
               - ALL
             readOnlyRootFilesystem: true
           env:
-          envFrom:
+            - name: "GOMAXPROCS"
+              value: "5"
+            - name: "GOMEMLIMIT"
+              value: "536870912"
+            - name: "JAEGER_REPORTER_MAX_QUEUE_SIZE"
+              value: "1000"

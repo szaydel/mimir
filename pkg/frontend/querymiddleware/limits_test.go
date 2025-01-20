@@ -7,25 +7,31 @@ package querymiddleware
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/prometheus/common/model"
+	"github.com/grafana/dskit/user"
+	"github.com/prometheus/prometheus/prompb"
+	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/storage/remote"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
-	"github.com/weaveworks/common/user"
 	"go.uber.org/atomic"
 
 	"github.com/grafana/mimir/pkg/util"
+	"github.com/grafana/mimir/pkg/util/validation"
 )
 
-func TestLimitsMiddleware_MaxQueryLookback(t *testing.T) {
+func TestLimitsMiddleware_MaxQueryLookback_RangeQueryAndRemoteRead(t *testing.T) {
 	const (
 		thirtyDays = 30 * 24 * time.Hour
+		sixtyDays  = 60 * 24 * time.Hour
 	)
 
 	now := time.Now()
@@ -39,7 +45,7 @@ func TestLimitsMiddleware_MaxQueryLookback(t *testing.T) {
 		expectedStartTime     time.Time
 		expectedEndTime       time.Time
 	}{
-		"should not manipulate time range if max lookback is disabled": {
+		"should not manipulate time range if maxQueryLookback and blocksRetentionPeriod are both disabled": {
 			maxQueryLookback:      0,
 			blocksRetentionPeriod: 0,
 			reqStartTime:          time.Unix(0, 0),
@@ -63,16 +69,54 @@ func TestLimitsMiddleware_MaxQueryLookback(t *testing.T) {
 			expectedStartTime:     now.Add(-thirtyDays).Add(time.Hour),
 			expectedEndTime:       now,
 		},
-		"should manipulate a query on large time range over the limit": {
+		"should manipulate a query on large time range over the maxQueryLookback limit, and blocksRetentionPeriod is not set": {
 			maxQueryLookback:      thirtyDays,
+			blocksRetentionPeriod: 0,
+			reqStartTime:          now.Add(-thirtyDays).Add(-100 * time.Hour),
+			reqEndTime:            now,
+			expectedStartTime:     now.Add(-thirtyDays),
+			expectedEndTime:       now,
+		},
+		"should manipulate a query on large time range over the blocksRetentionPeriod, and maxQueryLookback limit is not set": {
+			maxQueryLookback:      0,
 			blocksRetentionPeriod: thirtyDays,
 			reqStartTime:          now.Add(-thirtyDays).Add(-100 * time.Hour),
 			reqEndTime:            now,
 			expectedStartTime:     now.Add(-thirtyDays),
 			expectedEndTime:       now,
 		},
-		"should skip executing a query outside the allowed time range": {
+		"should manipulate a query on large time range over the maxQueryLookback limit, and blocksRetentionPeriod is set to an higher value": {
 			maxQueryLookback:      thirtyDays,
+			blocksRetentionPeriod: sixtyDays,
+			reqStartTime:          now.Add(-thirtyDays).Add(-100 * time.Hour),
+			reqEndTime:            now,
+			expectedStartTime:     now.Add(-thirtyDays),
+			expectedEndTime:       now,
+		},
+		"should manipulate a query on large time range over the blocksRetentionPeriod, and maxQueryLookback limit is set to an higher value": {
+			maxQueryLookback:      sixtyDays,
+			blocksRetentionPeriod: thirtyDays,
+			reqStartTime:          now.Add(-thirtyDays).Add(-100 * time.Hour),
+			reqEndTime:            now,
+			expectedStartTime:     now.Add(-thirtyDays),
+			expectedEndTime:       now,
+		},
+		"should skip executing a query outside the allowed maxQueryLookback limit, and blocksRetentionPeriod is not set": {
+			maxQueryLookback:      thirtyDays,
+			blocksRetentionPeriod: 0,
+			reqStartTime:          now.Add(-thirtyDays).Add(-100 * time.Hour),
+			reqEndTime:            now.Add(-thirtyDays).Add(-90 * time.Hour),
+			expectedSkipped:       true,
+		},
+		"should skip executing a query outside the allowed maxQueryLookback limit, and blocksRetentionPeriod is set to an higher value": {
+			maxQueryLookback:      thirtyDays,
+			blocksRetentionPeriod: sixtyDays,
+			reqStartTime:          now.Add(-thirtyDays).Add(-100 * time.Hour),
+			reqEndTime:            now.Add(-thirtyDays).Add(-90 * time.Hour),
+			expectedSkipped:       true,
+		},
+		"should skip executing a query outside the blocksRetentionPeriod, and maxQueryLookback limit is set to an higher value": {
+			maxQueryLookback:      sixtyDays,
 			blocksRetentionPeriod: thirtyDays,
 			reqStartTime:          now.Add(-thirtyDays).Add(-100 * time.Hour),
 			reqEndTime:            now.Add(-thirtyDays).Add(-90 * time.Hour),
@@ -90,9 +134,119 @@ func TestLimitsMiddleware_MaxQueryLookback(t *testing.T) {
 
 	for testName, testData := range tests {
 		t.Run(testName, func(t *testing.T) {
-			req := &PrometheusRangeQueryRequest{
-				Start: util.TimeToMillis(testData.reqStartTime),
-				End:   util.TimeToMillis(testData.reqEndTime),
+			reqs := map[string]MetricsQueryRequest{
+				"range query": &PrometheusRangeQueryRequest{
+					start: util.TimeToMillis(testData.reqStartTime),
+					end:   util.TimeToMillis(testData.reqEndTime),
+				},
+				"remote read": &remoteReadQueryRequest{
+					path: remoteReadPathSuffix,
+					query: &prompb.Query{
+						StartTimestampMs: util.TimeToMillis(testData.reqStartTime),
+						EndTimestampMs:   util.TimeToMillis(testData.reqEndTime),
+					},
+				},
+			}
+
+			for reqType, req := range reqs {
+				t.Run(reqType, func(t *testing.T) {
+					limits := mockLimits{maxQueryLookback: testData.maxQueryLookback, compactorBlocksRetentionPeriod: testData.blocksRetentionPeriod}
+					middleware := newLimitsMiddleware(limits, log.NewNopLogger())
+
+					innerRes := newEmptyPrometheusResponse()
+					inner := &mockHandler{}
+					inner.On("Do", mock.Anything, mock.Anything).Return(innerRes, nil)
+
+					ctx := user.InjectOrgID(context.Background(), "test")
+					outer := middleware.Wrap(inner)
+					res, err := outer.Do(ctx, req)
+					require.NoError(t, err)
+
+					if testData.expectedSkipped {
+						// We expect an empty response, but not the one returned by the inner handler
+						// which we expect has been skipped.
+						assert.NotSame(t, innerRes, res)
+						assert.Len(t, inner.Calls, 0)
+					} else {
+						// We expect the response returned by the inner handler.
+						assert.Same(t, innerRes, res)
+
+						// Assert on the time range of the request passed to the inner handler (5s delta).
+						delta := float64(5000)
+						require.Len(t, inner.Calls, 1)
+
+						assert.InDelta(t, util.TimeToMillis(testData.expectedStartTime), inner.Calls[0].Arguments.Get(1).(MetricsQueryRequest).GetStart(), delta)
+						assert.InDelta(t, util.TimeToMillis(testData.expectedEndTime), inner.Calls[0].Arguments.Get(1).(MetricsQueryRequest).GetEnd(), delta)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestLimitsMiddleware_MaxQueryLookback_InstantQuery(t *testing.T) {
+	const (
+		thirtyDays = 30 * 24 * time.Hour
+		sixtyDays  = 60 * 24 * time.Hour
+	)
+
+	now := time.Now()
+
+	tests := map[string]struct {
+		maxQueryLookback      time.Duration
+		blocksRetentionPeriod time.Duration
+		reqTime               time.Time
+		expectedSkipped       bool
+		expectedTime          time.Time
+	}{
+		"should allow executing a query if maxQueryLookback and blocksRetentionPeriod are both disabled": {
+			maxQueryLookback:      0,
+			blocksRetentionPeriod: 0,
+			reqTime:               time.Unix(0, 0),
+			expectedTime:          time.Unix(0, 0),
+		},
+		"should allow executing a query with time within maxQueryLookback and blocksRetentionPeriod": {
+			maxQueryLookback:      thirtyDays,
+			blocksRetentionPeriod: thirtyDays,
+			reqTime:               now.Add(-time.Hour),
+			expectedTime:          now.Add(-time.Hour),
+		},
+		"should allow executing a query with time close to maxQueryLookback and blocksRetentionPeriod": {
+			maxQueryLookback:      thirtyDays,
+			blocksRetentionPeriod: thirtyDays,
+			reqTime:               now.Add(-thirtyDays).Add(time.Hour),
+			expectedTime:          now.Add(-thirtyDays).Add(time.Hour),
+		},
+		"should skip executing a query with time before the maxQueryLookback limit, and blocksRetentionPeriod is not set": {
+			maxQueryLookback:      thirtyDays,
+			blocksRetentionPeriod: 0,
+			reqTime:               now.Add(-thirtyDays).Add(-100 * time.Hour),
+			expectedSkipped:       true,
+		},
+		"should skip executing a query with time before the blocksRetentionPeriod, and maxQueryLookback limit is not set": {
+			maxQueryLookback:      0,
+			blocksRetentionPeriod: thirtyDays,
+			reqTime:               now.Add(-thirtyDays).Add(-100 * time.Hour),
+			expectedSkipped:       true,
+		},
+		"should skip executing a query with time before the maxQueryLookback limit, and blocksRetentionPeriod is set to an higher value": {
+			maxQueryLookback:      thirtyDays,
+			blocksRetentionPeriod: sixtyDays,
+			reqTime:               now.Add(-thirtyDays).Add(-100 * time.Hour),
+			expectedSkipped:       true,
+		},
+		"should skip executing a query with time before the blocksRetentionPeriod, and maxQueryLookback limit is set to an higher value": {
+			maxQueryLookback:      sixtyDays,
+			blocksRetentionPeriod: thirtyDays,
+			reqTime:               now.Add(-thirtyDays).Add(-100 * time.Hour),
+			expectedSkipped:       true,
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			req := &PrometheusInstantQueryRequest{
+				time: testData.reqTime.UnixMilli(),
 			}
 
 			limits := mockLimits{maxQueryLookback: testData.maxQueryLookback, compactorBlocksRetentionPeriod: testData.blocksRetentionPeriod}
@@ -120,8 +274,111 @@ func TestLimitsMiddleware_MaxQueryLookback(t *testing.T) {
 				delta := float64(5000)
 				require.Len(t, inner.Calls, 1)
 
-				assert.InDelta(t, util.TimeToMillis(testData.expectedStartTime), inner.Calls[0].Arguments.Get(1).(Request).GetStart(), delta)
-				assert.InDelta(t, util.TimeToMillis(testData.expectedEndTime), inner.Calls[0].Arguments.Get(1).(Request).GetEnd(), delta)
+				assert.InDelta(t, util.TimeToMillis(testData.expectedTime), inner.Calls[0].Arguments.Get(1).(MetricsQueryRequest).GetStart(), delta)
+				assert.InDelta(t, util.TimeToMillis(testData.expectedTime), inner.Calls[0].Arguments.Get(1).(MetricsQueryRequest).GetEnd(), delta)
+			}
+		})
+	}
+}
+
+func TestLimitsMiddleware_MaxQueryExpressionSizeBytes(t *testing.T) {
+	now := time.Now()
+
+	tests := map[string]struct {
+		query       string
+		queryLimits map[string]int
+		expectError bool
+	}{
+		"should fail for queries longer than the limit": {
+			query:       fmt.Sprintf("up{foo=\"%s\"}", strings.Repeat("a", 1000)),
+			queryLimits: map[string]int{"test1": 100, "test2": 100},
+			expectError: true,
+		},
+		"should fail for queries longer than a one tenant limit": {
+			query:       fmt.Sprintf("up{foo=\"%s\"}", strings.Repeat("a", 1000)),
+			queryLimits: map[string]int{"test1": 100, "test2": 2000},
+			expectError: true,
+		},
+		"should fail for queries longer than a one tenant limit with one limit disabled": {
+			query:       fmt.Sprintf("up{foo=\"%s\"}", strings.Repeat("a", 1000)),
+			queryLimits: map[string]int{"test1": 100, "test2": 0},
+			expectError: true,
+		},
+		"should work for queries under the limit": {
+			query:       fmt.Sprintf("up{foo=\"%s\"}", strings.Repeat("a", 50)),
+			queryLimits: map[string]int{"test1": 100, "test2": 100},
+			expectError: false,
+		},
+		"should work for queries when the limit is disabled": {
+			query:       fmt.Sprintf("up{foo=\"%s\"}", strings.Repeat("a", 50)),
+			queryLimits: map[string]int{"test1": 0, "test2": 0},
+			expectError: false,
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			startMs := util.TimeToMillis(now.Add(-time.Hour * 2))
+			endMs := util.TimeToMillis(now.Add(-time.Hour))
+
+			reqs := map[string]MetricsQueryRequest{
+				"range query": &PrometheusRangeQueryRequest{
+					queryExpr: parseQuery(t, testData.query),
+					start:     startMs,
+					end:       endMs,
+				},
+				"instant query": &PrometheusInstantQueryRequest{
+					queryExpr: parseQuery(t, testData.query),
+				},
+				"remote read": &remoteReadQueryRequest{
+					path:      remoteReadPathSuffix,
+					promQuery: testData.query,
+					query: &prompb.Query{
+						StartTimestampMs: startMs,
+						EndTimestampMs:   endMs,
+						Matchers: func() []*prompb.LabelMatcher {
+							v := &findVectorSelectorsVisitor{}
+							require.NoError(t, parser.Walk(v, parseQuery(t, testData.query), nil))
+
+							// This test requires the query has only 1 vector selector.
+							require.Len(t, v.selectors, 1)
+							require.NotEmpty(t, v.selectors[0].LabelMatchers)
+
+							matchers, err := remote.ToLabelMatchers(v.selectors[0].LabelMatchers)
+							require.NoError(t, err)
+
+							return matchers
+						}(),
+					},
+				},
+			}
+
+			for reqType, req := range reqs {
+				t.Run(reqType, func(t *testing.T) {
+					limits := multiTenantMockLimits{
+						byTenant: map[string]mockLimits{
+							"test1": {maxQueryExpressionSizeBytes: testData.queryLimits["test1"]},
+							"test2": {maxQueryExpressionSizeBytes: testData.queryLimits["test2"]},
+						},
+					}
+					middleware := newLimitsMiddleware(limits, log.NewNopLogger())
+
+					innerRes := newEmptyPrometheusResponse()
+					inner := &mockHandler{}
+					inner.On("Do", mock.Anything, mock.Anything).Return(innerRes, nil)
+
+					ctx := user.InjectOrgID(context.Background(), "test1|test2")
+					outer := middleware.Wrap(inner)
+					res, err := outer.Do(ctx, req)
+
+					if testData.expectError {
+						require.Error(t, err)
+						require.Contains(t, err.Error(), "err-mimir-max-query-expression-size-bytes")
+					} else {
+						require.NoError(t, err)
+						require.Same(t, innerRes, res)
+					}
+				})
 			}
 		})
 	}
@@ -183,122 +440,199 @@ func TestLimitsMiddleware_MaxQueryLength(t *testing.T) {
 
 	for testName, testData := range tests {
 		t.Run(testName, func(t *testing.T) {
-			req := &PrometheusRangeQueryRequest{
-				Start: util.TimeToMillis(testData.reqStartTime),
-				End:   util.TimeToMillis(testData.reqEndTime),
+			// NOTE: instant queries are not tested because they don't have a time range.
+			reqs := map[string]MetricsQueryRequest{
+				"range query": &PrometheusRangeQueryRequest{
+					start: util.TimeToMillis(testData.reqStartTime),
+					end:   util.TimeToMillis(testData.reqEndTime),
+				},
+				"remote read": &remoteReadQueryRequest{
+					path: remoteReadPathSuffix,
+					query: &prompb.Query{
+						StartTimestampMs: util.TimeToMillis(testData.reqStartTime),
+						EndTimestampMs:   util.TimeToMillis(testData.reqEndTime),
+					},
+				},
 			}
 
-			limits := mockLimits{maxQueryLength: testData.maxQueryLength, maxTotalQueryLength: testData.maxTotalQueryLength}
-			middleware := newLimitsMiddleware(limits, log.NewNopLogger())
+			for reqType, req := range reqs {
+				t.Run(reqType, func(t *testing.T) {
+					limits := mockLimits{maxQueryLength: testData.maxQueryLength, maxTotalQueryLength: testData.maxTotalQueryLength}
+					middleware := newLimitsMiddleware(limits, log.NewNopLogger())
 
-			innerRes := newEmptyPrometheusResponse()
-			inner := &mockHandler{}
-			inner.On("Do", mock.Anything, mock.Anything).Return(innerRes, nil)
+					innerRes := newEmptyPrometheusResponse()
+					inner := &mockHandler{}
+					inner.On("Do", mock.Anything, mock.Anything).Return(innerRes, nil)
 
-			ctx := user.InjectOrgID(context.Background(), "test")
-			outer := middleware.Wrap(inner)
-			res, err := outer.Do(ctx, req)
+					ctx := user.InjectOrgID(context.Background(), "test")
+					outer := middleware.Wrap(inner)
+					res, err := outer.Do(ctx, req)
 
-			if testData.expectedErr != "" {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), testData.expectedErr)
-				assert.Nil(t, res)
-				assert.Len(t, inner.Calls, 0)
-			} else {
-				// We expect the response returned by the inner handler.
-				require.NoError(t, err)
-				assert.Same(t, innerRes, res)
+					if testData.expectedErr != "" {
+						require.Error(t, err)
+						assert.Contains(t, err.Error(), testData.expectedErr)
+						assert.Nil(t, res)
+						assert.Len(t, inner.Calls, 0)
+					} else {
+						// We expect the response returned by the inner handler.
+						require.NoError(t, err)
+						assert.Same(t, innerRes, res)
 
-				// The time range of the request passed to the inner handler should have not been manipulated.
-				require.Len(t, inner.Calls, 1)
-				assert.Equal(t, util.TimeToMillis(testData.reqStartTime), inner.Calls[0].Arguments.Get(1).(Request).GetStart())
-				assert.Equal(t, util.TimeToMillis(testData.reqEndTime), inner.Calls[0].Arguments.Get(1).(Request).GetEnd())
+						// The time range of the request passed to the inner handler should have not been manipulated.
+						require.Len(t, inner.Calls, 1)
+						assert.Equal(t, util.TimeToMillis(testData.reqStartTime), inner.Calls[0].Arguments.Get(1).(MetricsQueryRequest).GetStart())
+						assert.Equal(t, util.TimeToMillis(testData.reqEndTime), inner.Calls[0].Arguments.Get(1).(MetricsQueryRequest).GetEnd())
+					}
+				})
 			}
 		})
 	}
 }
 
-func TestLimitsMiddleware_CreationGracePeriod(t *testing.T) {
-	now := time.Now()
+type multiTenantMockLimits struct {
+	byTenant map[string]mockLimits
+}
 
-	tests := map[string]struct {
-		reqStartTime        time.Time
-		reqEndTime          time.Time
-		creationGracePeriod time.Duration
-		expectedEndTime     time.Time
-	}{
-		"should not manipulate time range if creation grace period is disabled": {
-			reqStartTime:        now.Add(-time.Hour),
-			reqEndTime:          now.Add(2 * time.Hour),
-			creationGracePeriod: 0,
-			expectedEndTime:     now.Add(2 * time.Hour),
-		},
-		"should not manipulate time range for a query in now + creation_grace_period": {
-			reqStartTime:        now.Add(-time.Hour),
-			reqEndTime:          now.Add(30 * time.Minute),
-			creationGracePeriod: time.Hour,
-			expectedEndTime:     now.Add(30 * time.Minute),
-		},
-		"should manipulate time range for a query over now + creation_grace_period": {
-			reqStartTime:        now.Add(-time.Hour),
-			reqEndTime:          now.Add(2 * time.Hour),
-			creationGracePeriod: time.Hour,
-			expectedEndTime:     now.Add(time.Hour),
-		},
-	}
+func (m multiTenantMockLimits) MaxQueryLookback(userID string) time.Duration {
+	return m.byTenant[userID].maxQueryLookback
+}
 
-	for testName, testData := range tests {
-		t.Run(testName, func(t *testing.T) {
-			req := &PrometheusRangeQueryRequest{
-				Start: util.TimeToMillis(testData.reqStartTime),
-				End:   util.TimeToMillis(testData.reqEndTime),
-			}
+func (m multiTenantMockLimits) MaxQueryLength(userID string) time.Duration {
+	return m.byTenant[userID].maxQueryLength
+}
 
-			limits := mockLimits{creationGracePeriod: testData.creationGracePeriod}
-			middleware := newLimitsMiddleware(limits, log.NewNopLogger())
+func (m multiTenantMockLimits) MaxTotalQueryLength(userID string) time.Duration {
+	return m.byTenant[userID].maxTotalQueryLength
+}
 
-			innerRes := newEmptyPrometheusResponse()
-			inner := &mockHandler{}
-			inner.On("Do", mock.Anything, mock.Anything).Return(innerRes, nil)
+func (m multiTenantMockLimits) MaxQueryExpressionSizeBytes(userID string) int {
+	return m.byTenant[userID].maxQueryExpressionSizeBytes
+}
 
-			ctx := user.InjectOrgID(context.Background(), "test")
-			outer := middleware.Wrap(inner)
-			res, err := outer.Do(ctx, req)
-			require.NoError(t, err)
+func (m multiTenantMockLimits) MaxQueryParallelism(userID string) int {
+	return m.byTenant[userID].maxQueryParallelism
+}
 
-			// We expect the response returned by the inner handler.
-			assert.Same(t, innerRes, res)
+func (m multiTenantMockLimits) MaxCacheFreshness(userID string) time.Duration {
+	return m.byTenant[userID].maxCacheFreshness
+}
 
-			// Assert on the time range of the request passed to the inner handler (5s delta).
-			delta := float64(5000)
-			require.Len(t, inner.Calls, 1)
+func (m multiTenantMockLimits) QueryShardingTotalShards(userID string) int {
+	return m.byTenant[userID].totalShards
+}
 
-			assert.InDelta(t, util.TimeToMillis(testData.expectedEndTime), inner.Calls[0].Arguments.Get(1).(Request).GetEnd(), delta)
-		})
-	}
+func (m multiTenantMockLimits) QueryShardingMaxShardedQueries(userID string) int {
+	return m.byTenant[userID].maxShardedQueries
+}
+
+func (m multiTenantMockLimits) QueryShardingMaxRegexpSizeBytes(userID string) int {
+	return m.byTenant[userID].maxRegexpSizeBytes
+}
+
+func (m multiTenantMockLimits) SplitInstantQueriesByInterval(userID string) time.Duration {
+	return m.byTenant[userID].splitInstantQueriesInterval
+}
+
+func (m multiTenantMockLimits) CompactorSplitAndMergeShards(userID string) int {
+	return m.byTenant[userID].compactorShards
+}
+
+func (m multiTenantMockLimits) CompactorBlocksRetentionPeriod(userID string) time.Duration {
+	return m.byTenant[userID].compactorBlocksRetentionPeriod
+}
+
+func (m multiTenantMockLimits) OutOfOrderTimeWindow(userID string) time.Duration {
+	return m.byTenant[userID].outOfOrderTimeWindow
+}
+
+func (m multiTenantMockLimits) ResultsCacheTTL(userID string) time.Duration {
+	return m.byTenant[userID].resultsCacheTTL
+}
+
+func (m multiTenantMockLimits) ResultsCacheTTLForOutOfOrderTimeWindow(userID string) time.Duration {
+	return m.byTenant[userID].resultsCacheOutOfOrderWindowTTL
+}
+
+func (m multiTenantMockLimits) ResultsCacheTTLForCardinalityQuery(userID string) time.Duration {
+	return m.byTenant[userID].resultsCacheTTLForCardinalityQuery
+}
+
+func (m multiTenantMockLimits) ResultsCacheTTLForLabelsQuery(userID string) time.Duration {
+	return m.byTenant[userID].resultsCacheTTLForLabelsQuery
+}
+
+func (m multiTenantMockLimits) ResultsCacheTTLForErrors(userID string) time.Duration {
+	return m.byTenant[userID].resultsCacheTTLForErrors
+}
+
+func (m multiTenantMockLimits) ResultsCacheForUnalignedQueryEnabled(userID string) bool {
+	return m.byTenant[userID].resultsCacheForUnalignedQueryEnabled
+}
+
+func (m multiTenantMockLimits) EnabledPromQLExperimentalFunctions(userID string) []string {
+	return m.byTenant[userID].enabledPromQLExperimentalFunctions
+}
+
+func (m multiTenantMockLimits) Prom2RangeCompat(userID string) bool {
+	return m.byTenant[userID].prom2RangeCompat
+}
+
+func (m multiTenantMockLimits) BlockedQueries(userID string) []*validation.BlockedQuery {
+	return m.byTenant[userID].blockedQueries
+}
+
+func (m multiTenantMockLimits) CreationGracePeriod(userID string) time.Duration {
+	return m.byTenant[userID].creationGracePeriod
+}
+
+func (m multiTenantMockLimits) NativeHistogramsIngestionEnabled(userID string) bool {
+	return m.byTenant[userID].nativeHistogramsIngestionEnabled
+}
+
+func (m multiTenantMockLimits) AlignQueriesWithStep(userID string) bool {
+	return m.byTenant[userID].alignQueriesWithStep
+}
+
+func (m multiTenantMockLimits) QueryIngestersWithin(userID string) time.Duration {
+	return m.byTenant[userID].queryIngestersWithin
+}
+
+func (m multiTenantMockLimits) IngestStorageReadConsistency(userID string) string {
+	return m.byTenant[userID].ingestStorageReadConsistency
 }
 
 type mockLimits struct {
-	maxQueryLookback               time.Duration
-	maxQueryLength                 time.Duration
-	maxTotalQueryLength            time.Duration
-	maxCacheFreshness              time.Duration
-	maxQueryParallelism            int
-	maxShardedQueries              int
-	splitInstantQueriesInterval    time.Duration
-	totalShards                    int
-	compactorShards                int
-	compactorBlocksRetentionPeriod time.Duration
-	outOfOrderTimeWindow           model.Duration
-	creationGracePeriod            time.Duration
+	maxQueryLookback                     time.Duration
+	maxQueryLength                       time.Duration
+	maxTotalQueryLength                  time.Duration
+	maxQueryExpressionSizeBytes          int
+	maxCacheFreshness                    time.Duration
+	maxQueryParallelism                  int
+	maxShardedQueries                    int
+	maxRegexpSizeBytes                   int
+	splitInstantQueriesInterval          time.Duration
+	totalShards                          int
+	compactorShards                      int
+	compactorBlocksRetentionPeriod       time.Duration
+	outOfOrderTimeWindow                 time.Duration
+	creationGracePeriod                  time.Duration
+	nativeHistogramsIngestionEnabled     bool
+	resultsCacheTTL                      time.Duration
+	resultsCacheOutOfOrderWindowTTL      time.Duration
+	resultsCacheTTLForCardinalityQuery   time.Duration
+	resultsCacheTTLForLabelsQuery        time.Duration
+	resultsCacheTTLForErrors             time.Duration
+	resultsCacheForUnalignedQueryEnabled bool
+	enabledPromQLExperimentalFunctions   []string
+	prom2RangeCompat                     bool
+	blockedQueries                       []*validation.BlockedQuery
+	alignQueriesWithStep                 bool
+	queryIngestersWithin                 time.Duration
+	ingestStorageReadConsistency         string
 }
 
 func (m mockLimits) MaxQueryLookback(string) time.Duration {
 	return m.maxQueryLookback
-}
-
-func (m mockLimits) MaxQueryLength(string) time.Duration {
-	return m.maxQueryLength
 }
 
 func (m mockLimits) MaxTotalQueryLength(string) time.Duration {
@@ -306,6 +640,10 @@ func (m mockLimits) MaxTotalQueryLength(string) time.Duration {
 		return m.maxQueryLength
 	}
 	return m.maxTotalQueryLength
+}
+
+func (m mockLimits) MaxQueryExpressionSizeBytes(string) int {
+	return m.maxQueryExpressionSizeBytes
 }
 
 func (m mockLimits) MaxQueryParallelism(string) int {
@@ -327,31 +665,87 @@ func (m mockLimits) QueryShardingMaxShardedQueries(string) int {
 	return m.maxShardedQueries
 }
 
+func (m mockLimits) QueryShardingMaxRegexpSizeBytes(string) int {
+	return m.maxRegexpSizeBytes
+}
+
 func (m mockLimits) SplitInstantQueriesByInterval(string) time.Duration {
 	return m.splitInstantQueriesInterval
 }
 
-func (m mockLimits) CompactorSplitAndMergeShards(userID string) int {
+func (m mockLimits) CompactorSplitAndMergeShards(string) int {
 	return m.compactorShards
 }
 
-func (m mockLimits) CompactorBlocksRetentionPeriod(userID string) time.Duration {
+func (m mockLimits) CompactorBlocksRetentionPeriod(string) time.Duration {
 	return m.compactorBlocksRetentionPeriod
 }
 
-func (m mockLimits) OutOfOrderTimeWindow(userID string) model.Duration {
+func (m mockLimits) OutOfOrderTimeWindow(string) time.Duration {
 	return m.outOfOrderTimeWindow
 }
 
-func (m mockLimits) CreationGracePeriod(userID string) time.Duration {
+func (m mockLimits) ResultsCacheTTL(string) time.Duration {
+	return m.resultsCacheTTL
+}
+
+func (m mockLimits) ResultsCacheTTLForOutOfOrderTimeWindow(string) time.Duration {
+	return m.resultsCacheOutOfOrderWindowTTL
+}
+
+func (m mockLimits) ResultsCacheTTLForErrors(string) time.Duration {
+	return m.resultsCacheTTLForErrors
+}
+
+func (m mockLimits) ResultsCacheTTLForCardinalityQuery(string) time.Duration {
+	return m.resultsCacheTTLForCardinalityQuery
+}
+
+func (m mockLimits) BlockedQueries(string) []*validation.BlockedQuery {
+	return m.blockedQueries
+}
+
+func (m mockLimits) ResultsCacheTTLForLabelsQuery(string) time.Duration {
+	return m.resultsCacheTTLForLabelsQuery
+}
+
+func (m mockLimits) ResultsCacheForUnalignedQueryEnabled(string) bool {
+	return m.resultsCacheForUnalignedQueryEnabled
+}
+
+func (m mockLimits) EnabledPromQLExperimentalFunctions(string) []string {
+	return m.enabledPromQLExperimentalFunctions
+}
+
+func (m mockLimits) Prom2RangeCompat(string) bool {
+	return m.prom2RangeCompat
+}
+
+func (m mockLimits) CreationGracePeriod(string) time.Duration {
 	return m.creationGracePeriod
+}
+
+func (m mockLimits) NativeHistogramsIngestionEnabled(string) bool {
+	return m.nativeHistogramsIngestionEnabled
+}
+
+func (m mockLimits) AlignQueriesWithStep(string) bool {
+	return m.alignQueriesWithStep
+}
+
+func (m mockLimits) QueryIngestersWithin(string) time.Duration {
+	return m.queryIngestersWithin
+}
+
+func (m mockLimits) IngestStorageReadConsistency(string) string {
+	return m.ingestStorageReadConsistency
 }
 
 type mockHandler struct {
 	mock.Mock
 }
 
-func (m *mockHandler) Do(ctx context.Context, req Request) (Response, error) {
+func (m *mockHandler) Do(ctx context.Context, req MetricsQueryRequest) (Response, error) {
 	args := m.Called(ctx, req)
 	return args.Get(0).(Response), args.Error(1)
 }
@@ -377,18 +771,18 @@ func TestLimitedRoundTripper_MaxQueryParallelism(t *testing.T) {
 	)
 
 	codec := newTestPrometheusCodec()
-	r, err := codec.EncodeRequest(ctx, &PrometheusRangeQueryRequest{
-		Path:  "/query_range",
-		Start: time.Now().Add(time.Hour).Unix(),
-		End:   util.TimeToMillis(time.Now()),
-		Step:  int64(1 * time.Second * time.Millisecond),
-		Query: `foo`,
+	r, err := codec.EncodeMetricsQueryRequest(ctx, &PrometheusRangeQueryRequest{
+		path:      "/api/v1/query_range",
+		start:     time.Now().Add(time.Hour).Unix(),
+		end:       util.TimeToMillis(time.Now()),
+		step:      int64(1 * time.Second * time.Millisecond),
+		queryExpr: parseQuery(t, `foo`),
 	})
 	require.Nil(t, err)
 
-	_, err = newLimitedParallelismRoundTripper(downstream, codec, mockLimits{maxQueryParallelism: maxQueryParallelism},
-		MiddlewareFunc(func(next Handler) Handler {
-			return HandlerFunc(func(c context.Context, _ Request) (Response, error) {
+	_, err = NewLimitedParallelismRoundTripper(downstream, codec, mockLimits{maxQueryParallelism: maxQueryParallelism},
+		MetricsQueryMiddlewareFunc(func(next MetricsQueryHandler) MetricsQueryHandler {
+			return HandlerFunc(func(c context.Context, _ MetricsQueryRequest) (Response, error) {
 				var wg sync.WaitGroup
 				for i := 0; i < maxQueryParallelism+20; i++ {
 					wg.Add(1)
@@ -421,18 +815,18 @@ func TestLimitedRoundTripper_MaxQueryParallelismLateScheduling(t *testing.T) {
 	)
 
 	codec := newTestPrometheusCodec()
-	r, err := codec.EncodeRequest(ctx, &PrometheusRangeQueryRequest{
-		Path:  "/query_range",
-		Start: time.Now().Add(time.Hour).Unix(),
-		End:   util.TimeToMillis(time.Now()),
-		Step:  int64(1 * time.Second * time.Millisecond),
-		Query: `foo`,
+	r, err := codec.EncodeMetricsQueryRequest(ctx, &PrometheusRangeQueryRequest{
+		path:      "/api/v1/query_range",
+		start:     time.Now().Add(time.Hour).Unix(),
+		end:       util.TimeToMillis(time.Now()),
+		step:      int64(1 * time.Second * time.Millisecond),
+		queryExpr: parseQuery(t, `foo`),
 	})
 	require.Nil(t, err)
 
-	_, err = newLimitedParallelismRoundTripper(downstream, codec, mockLimits{maxQueryParallelism: maxQueryParallelism},
-		MiddlewareFunc(func(next Handler) Handler {
-			return HandlerFunc(func(c context.Context, _ Request) (Response, error) {
+	_, err = NewLimitedParallelismRoundTripper(downstream, codec, mockLimits{maxQueryParallelism: maxQueryParallelism},
+		MetricsQueryMiddlewareFunc(func(next MetricsQueryHandler) MetricsQueryHandler {
+			return HandlerFunc(func(c context.Context, _ MetricsQueryRequest) (Response, error) {
 				// fire up work and we don't wait.
 				for i := 0; i < 10; i++ {
 					go func() {
@@ -462,18 +856,18 @@ func TestLimitedRoundTripper_OriginalRequestContextCancellation(t *testing.T) {
 	)
 
 	codec := newTestPrometheusCodec()
-	r, err := codec.EncodeRequest(reqCtx, &PrometheusRangeQueryRequest{
-		Path:  "/query_range",
-		Start: time.Now().Add(time.Hour).Unix(),
-		End:   util.TimeToMillis(time.Now()),
-		Step:  int64(1 * time.Second * time.Millisecond),
-		Query: `foo`,
+	r, err := codec.EncodeMetricsQueryRequest(reqCtx, &PrometheusRangeQueryRequest{
+		path:      "/api/v1/query_range",
+		start:     time.Now().Add(time.Hour).Unix(),
+		end:       util.TimeToMillis(time.Now()),
+		step:      int64(1 * time.Second * time.Millisecond),
+		queryExpr: parseQuery(t, `foo`),
 	})
 	require.Nil(t, err)
 
-	_, err = newLimitedParallelismRoundTripper(downstream, codec, mockLimits{maxQueryParallelism: maxQueryParallelism},
-		MiddlewareFunc(func(next Handler) Handler {
-			return HandlerFunc(func(c context.Context, _ Request) (Response, error) {
+	_, err = NewLimitedParallelismRoundTripper(downstream, codec, mockLimits{maxQueryParallelism: maxQueryParallelism},
+		MetricsQueryMiddlewareFunc(func(next MetricsQueryHandler) MetricsQueryHandler {
+			return HandlerFunc(func(c context.Context, _ MetricsQueryRequest) (Response, error) {
 				var wg sync.WaitGroup
 
 				// Fire up some work. Each sub-request will either be blocked in the sleep or in the queue
@@ -503,4 +897,92 @@ func TestLimitedRoundTripper_OriginalRequestContextCancellation(t *testing.T) {
 		}),
 	).RoundTrip(r)
 	require.NoError(t, err)
+}
+
+func BenchmarkLimitedParallelismRoundTripper(b *testing.B) {
+	maxParallelism := 10
+	workDuration := 20 * time.Millisecond
+	ctx := user.InjectOrgID(context.Background(), "test-org-id")
+
+	downstream := RoundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		// Simulate some work
+		time.Sleep(workDuration)
+		return &http.Response{
+			Body: http.NoBody,
+		}, nil
+	})
+
+	codec := newTestPrometheusCodec()
+	r, err := codec.EncodeMetricsQueryRequest(ctx, &PrometheusRangeQueryRequest{
+		path:      "/api/v1/query_range",
+		start:     time.Now().Add(time.Hour).Unix(),
+		end:       util.TimeToMillis(time.Now()),
+		step:      int64(1 * time.Second * time.Millisecond),
+		queryExpr: parseQuery(b, `foo`),
+	})
+	require.Nil(b, err)
+
+	for _, concurrentRequestCount := range []int{1, 10, 100} {
+		for _, subRequestCount := range []int{1, 2, 5, 10, 20, 50, 100} {
+			tripper := NewLimitedParallelismRoundTripper(downstream, codec, mockLimits{maxQueryParallelism: maxParallelism},
+				MetricsQueryMiddlewareFunc(func(next MetricsQueryHandler) MetricsQueryHandler {
+					return HandlerFunc(func(c context.Context, _ MetricsQueryRequest) (Response, error) {
+						wg := sync.WaitGroup{}
+						for i := 0; i < subRequestCount; i++ {
+							wg.Add(1)
+							go func() {
+								defer wg.Done()
+								_, _ = next.Do(c, &PrometheusRangeQueryRequest{})
+							}()
+						}
+						wg.Wait()
+						return newEmptyPrometheusResponse(), nil
+					})
+				}),
+			)
+
+			b.Run(fmt.Sprintf("%v concurrent requests with %v sub requests each, max parallelism %v, sub request duration %v", concurrentRequestCount, subRequestCount, maxParallelism, workDuration.String()), func(b *testing.B) {
+				for i := 0; i < b.N; i++ {
+					wg := sync.WaitGroup{}
+
+					for i := 0; i < concurrentRequestCount; i++ {
+						wg.Add(1)
+						go func() {
+							defer wg.Done()
+							_, err := tripper.RoundTrip(r)
+
+							if err != nil {
+								require.NoError(b, err)
+							}
+						}()
+					}
+
+					wg.Wait()
+				}
+			})
+		}
+	}
+}
+
+func TestSmallestPositiveNonZeroDuration(t *testing.T) {
+	assert.Equal(t, time.Duration(0), smallestPositiveNonZeroDuration())
+	assert.Equal(t, time.Duration(0), smallestPositiveNonZeroDuration(0))
+	assert.Equal(t, time.Duration(0), smallestPositiveNonZeroDuration(-1))
+
+	assert.Equal(t, time.Duration(1), smallestPositiveNonZeroDuration(0, 1, -1))
+	assert.Equal(t, time.Duration(1), smallestPositiveNonZeroDuration(0, 2, 1))
+}
+
+type findVectorSelectorsVisitor struct {
+	selectors []*parser.VectorSelector
+}
+
+func (v *findVectorSelectorsVisitor) Visit(node parser.Node, _ []parser.Node) (parser.Visitor, error) {
+	selector, ok := node.(*parser.VectorSelector)
+	if !ok {
+		return v, nil
+	}
+
+	v.selectors = append(v.selectors, selector)
+	return v, nil
 }

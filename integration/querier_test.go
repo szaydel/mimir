@@ -15,7 +15,7 @@ import (
 	"github.com/grafana/e2e"
 	e2ecache "github.com/grafana/e2e/cache"
 	e2edb "github.com/grafana/e2e/db"
-	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
+	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/prompb"
@@ -28,10 +28,17 @@ import (
 )
 
 func TestQuerierWithBlocksStorageRunningInMicroservicesMode(t *testing.T) {
+	testQuerierWithBlocksStorageRunningInMicroservicesMode(t, generateFloatSeries)
+}
+
+func TestQuerierWithBlocksStorageRunningInMicroservicesModeWithHistograms(t *testing.T) {
+	testQuerierWithBlocksStorageRunningInMicroservicesMode(t, generateHistogramSeries)
+}
+
+func testQuerierWithBlocksStorageRunningInMicroservicesMode(t *testing.T, seriesGenerator func(name string, ts time.Time, additionalLabels ...prompb.Label) (series []prompb.TimeSeries, vector model.Vector, matrix model.Matrix)) {
 	tests := map[string]struct {
 		tenantShardSize      int
 		indexCacheBackend    string
-		bucketIndexEnabled   bool
 		queryShardingEnabled bool
 	}{
 		"shard size 0, inmemory index cache": {
@@ -46,19 +53,9 @@ func TestQuerierWithBlocksStorageRunningInMicroservicesMode(t *testing.T) {
 			tenantShardSize:   1,
 			indexCacheBackend: tsdb.IndexCacheBackendMemcached,
 		},
-		"shard size 0, inmemory index cache, bucket index enabled": {
-			indexCacheBackend:  tsdb.IndexCacheBackendInMemory,
-			bucketIndexEnabled: true,
-		},
-		"shard size 1, memcached index cache, bucket index enabled": {
-			tenantShardSize:    1,
-			indexCacheBackend:  tsdb.IndexCacheBackendMemcached,
-			bucketIndexEnabled: true,
-		},
-		"shard size 1, ingester gRPC streaming enabled, memcached index cache, bucket index enabled, query sharding enabled": {
+		"shard size 1, memcached index cache, query sharding enabled": {
 			tenantShardSize:      1,
 			indexCacheBackend:    tsdb.IndexCacheBackendMemcached,
-			bucketIndexEnabled:   true,
 			queryShardingEnabled: true,
 		},
 	}
@@ -72,9 +69,10 @@ func TestQuerierWithBlocksStorageRunningInMicroservicesMode(t *testing.T) {
 	// Configure the blocks storage to frequently compact TSDB head
 	// and ship blocks to the storage.
 	commonFlags := mergeFlags(BlocksStorageFlags(), BlocksStorageS3Flags(), map[string]string{
-		"-blocks-storage.tsdb.block-ranges-period": blockRangePeriod.String(),
-		"-blocks-storage.tsdb.ship-interval":       "1s",
-		"-blocks-storage.tsdb.retention-period":    "1ms", // Retention period counts from the moment the block was uploaded to storage so we're setting it deliberatelly small so block gets deleted as soon as possible
+		"-blocks-storage.tsdb.block-ranges-period":      blockRangePeriod.String(),
+		"-blocks-storage.tsdb.ship-interval":            "1s",
+		"-blocks-storage.tsdb.retention-period":         "1ms", // Retention period counts from the moment the block was uploaded to storage so we're setting it deliberatelly small so block gets deleted as soon as possible
+		"-compactor.first-level-compaction-wait-period": "1m",  // Do not compact aggressively
 	})
 
 	// Start dependencies in common with all test cases.
@@ -96,10 +94,12 @@ func TestQuerierWithBlocksStorageRunningInMicroservicesMode(t *testing.T) {
 	writeClient, err := e2emimir.NewClient(distributor.HTTPEndpoint(), "", "", "", "user-1")
 	require.NoError(t, err)
 
+	series1Name := "series_1"
+	series2Name := "series_2"
 	series1Timestamp := time.Now()
 	series2Timestamp := series1Timestamp.Add(blockRangePeriod * 2)
-	series1, expectedVector1, _ := generateSeries("series_1", series1Timestamp, prompb.Label{Name: "series_1", Value: "series_1"})
-	series2, expectedVector2, _ := generateSeries("series_2", series2Timestamp, prompb.Label{Name: "series_2", Value: "series_2"})
+	series1, expectedVector1, _ := seriesGenerator(series1Name, series1Timestamp, prompb.Label{Name: series1Name, Value: series1Name})
+	series2, expectedVector2, _ := seriesGenerator(series2Name, series2Timestamp, prompb.Label{Name: series2Name, Value: series2Name})
 
 	res, err := writeClient.Push(series1)
 	require.NoError(t, err)
@@ -118,8 +118,9 @@ func TestQuerierWithBlocksStorageRunningInMicroservicesMode(t *testing.T) {
 
 	// Push another series to further compact another block and delete the first block
 	// due to expired retention.
+	series3Name := "series_3"
 	series3Timestamp := series2Timestamp.Add(blockRangePeriod * 2)
-	series3, expectedVector3, _ := generateSeries("series_3", series3Timestamp, prompb.Label{Name: "series_3", Value: "series_3"})
+	series3, expectedVector3, _ := seriesGenerator(series3Name, series3Timestamp, prompb.Label{Name: series3Name, Value: series3Name})
 
 	res, err = writeClient.Push(series3)
 	require.NoError(t, err)
@@ -131,7 +132,6 @@ func TestQuerierWithBlocksStorageRunningInMicroservicesMode(t *testing.T) {
 	require.NoError(t, ingester.WaitSumMetrics(e2e.Equals(2), "cortex_ingester_memory_series_removed_total"))
 
 	// Start the compactor to have the bucket index created before querying.
-	// This is only required for tests using the bucket index, but doesn't hurt doing it for all of them.
 	compactor := e2emimir.NewCompactor("compactor", consul.NetworkHTTPEndpoint(), commonFlags)
 	require.NoError(t, s.StartAndWaitReady(compactor))
 
@@ -147,7 +147,6 @@ func TestQuerierWithBlocksStorageRunningInMicroservicesMode(t *testing.T) {
 				"-blocks-storage.bucket-store.index-cache.memcached.addresses": "dns+" + memcached.NetworkEndpoint(e2ecache.MemcachedPort),
 				"-blocks-storage.bucket-store.sync-interval":                   "1s",
 				"-blocks-storage.bucket-store.index-cache.backend":             testCfg.indexCacheBackend,
-				"-blocks-storage.bucket-store.bucket-index.enabled":            strconv.FormatBool(testCfg.bucketIndexEnabled),
 				"-store-gateway.tenant-shard-size":                             fmt.Sprintf("%d", testCfg.tenantShardSize),
 				"-query-frontend.query-stats-enabled":                          "true",
 				"-query-frontend.parallelize-shardable-queries":                strconv.FormatBool(testCfg.queryShardingEnabled),
@@ -161,7 +160,7 @@ func TestQuerierWithBlocksStorageRunningInMicroservicesMode(t *testing.T) {
 			require.NoError(t, s.StartAndWaitReady(storeGateway1, storeGateway2))
 
 			// Start the query-frontend but do not check for readiness yet.
-			queryFrontend := e2emimir.NewQueryFrontend("query-frontend", flags)
+			queryFrontend := e2emimir.NewQueryFrontend("query-frontend", consul.NetworkHTTPEndpoint(), flags)
 			t.Cleanup(func() { require.NoError(t, s.Stop(queryFrontend)) })
 			require.NoError(t, s.Start(queryFrontend))
 
@@ -177,11 +176,6 @@ func TestQuerierWithBlocksStorageRunningInMicroservicesMode(t *testing.T) {
 			// Wait until the querier has updated the ring. The querier will also watch
 			// the store-gateway ring if blocks sharding is enabled.
 			require.NoError(t, querier.WaitSumMetrics(e2e.Equals(float64(512+(512*storeGateways.NumInstances()))), "cortex_ring_tokens_total"))
-
-			if !testCfg.bucketIndexEnabled {
-				// Wait until the querier has discovered the uploaded blocks.
-				require.NoError(t, querier.WaitSumMetrics(e2e.Equals(2), "cortex_blocks_meta_synced"))
-			}
 
 			// Wait until the store-gateway has synched the new uploaded blocks. When sharding is enabled
 			// we don't known which store-gateway instance will synch the blocks, so we need to wait on
@@ -204,7 +198,7 @@ func TestQuerierWithBlocksStorageRunningInMicroservicesMode(t *testing.T) {
 			require.NoError(t, err)
 			instantQueriesCount++
 
-			result, err := c.Query("series_1", series1Timestamp)
+			result, err := c.Query(series1Name, series1Timestamp)
 			require.NoError(t, err)
 			require.Equal(t, model.ValVector, result.Type())
 			assert.Equal(t, expectedVector1, result.(model.Vector))
@@ -212,7 +206,7 @@ func TestQuerierWithBlocksStorageRunningInMicroservicesMode(t *testing.T) {
 			// thanos_store_index_cache_requests_total: ExpandedPostings: 1, Postings: 1, Series: 1
 			instantQueriesCount++
 
-			result, err = c.Query("series_2", series2Timestamp)
+			result, err = c.Query(series2Name, series2Timestamp)
 			require.NoError(t, err)
 			require.Equal(t, model.ValVector, result.Type())
 			assert.Equal(t, expectedVector2, result.(model.Vector))
@@ -220,13 +214,16 @@ func TestQuerierWithBlocksStorageRunningInMicroservicesMode(t *testing.T) {
 			// thanos_store_index_cache_requests_total: ExpandedPostings: 3, Postings: 2, Series: 2
 			instantQueriesCount++
 
-			result, err = c.Query("series_3", series3Timestamp)
+			result, err = c.Query(series3Name, series3Timestamp)
 			require.NoError(t, err)
 			require.Equal(t, model.ValVector, result.Type())
 			assert.Equal(t, expectedVector3, result.(model.Vector))
 			expectedFetchedSeries++ // Ingester only.
 			// thanos_store_index_cache_requests_total: ExpandedPostings: 5, Postings: 2, Series: 2
 			instantQueriesCount++
+
+			// Make sure the querier is using the bucket index blocks finder.
+			require.NoError(t, querier.WaitSumMetrics(e2e.Greater(0), "cortex_bucket_index_loads_total"))
 
 			// Check the in-memory index cache metrics (in the store-gateway).
 			require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(9), "thanos_store_index_cache_requests_total")) // 5 + 2 + 2
@@ -236,11 +233,11 @@ func TestQuerierWithBlocksStorageRunningInMicroservicesMode(t *testing.T) {
 				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(2*2+2+3), "thanos_store_index_cache_items"))             // 2 series both for postings and series cache, 2 expanded postings on one block, 3 on another one
 				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(2*2+2+3), "thanos_store_index_cache_items_added_total")) // 2 series both for postings and series cache, 2 expanded postings on one block, 3 on another one
 			} else if testCfg.indexCacheBackend == tsdb.IndexCacheBackendMemcached {
-				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(9*2), "thanos_memcached_operations_total")) // one set for each get
+				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(9*2), "thanos_cache_operations_total")) // one set for each get
 			}
 
 			// Query back again the 1st series from storage. This time it should use the index cache.
-			result, err = c.Query("series_1", series1Timestamp)
+			result, err = c.Query(series1Name, series1Timestamp)
 			require.NoError(t, err)
 			require.Equal(t, model.ValVector, result.Type())
 			assert.Equal(t, expectedVector1, result.(model.Vector))
@@ -253,7 +250,7 @@ func TestQuerierWithBlocksStorageRunningInMicroservicesMode(t *testing.T) {
 				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(2*2+2+3), "thanos_store_index_cache_items"))             // as before
 				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(2*2+2+3), "thanos_store_index_cache_items_added_total")) // as before
 			} else if testCfg.indexCacheBackend == tsdb.IndexCacheBackendMemcached {
-				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(9*2+2), "thanos_memcached_operations_total")) // as before + 2 gets (expanded postings and series)
+				require.NoError(t, storeGateways.WaitSumMetrics(e2e.Equals(9*2+2), "thanos_cache_operations_total")) // as before + 2 gets (expanded postings and series)
 			}
 
 			// Query range. We expect 1 data point with a value of 3 (number of series).
@@ -308,7 +305,6 @@ func TestQuerierWithBlocksStorageRunningInMicroservicesMode(t *testing.T) {
 func TestQuerierWithBlocksStorageRunningInSingleBinaryMode(t *testing.T) {
 	tests := map[string]struct {
 		indexCacheBackend    string
-		bucketIndexEnabled   bool
 		queryShardingEnabled bool
 	}{
 		"inmemory index cache": {
@@ -316,10 +312,6 @@ func TestQuerierWithBlocksStorageRunningInSingleBinaryMode(t *testing.T) {
 		},
 		"memcached index cache": {
 			indexCacheBackend: tsdb.IndexCacheBackendMemcached,
-		},
-		"memcached index cache, bucket index enabled": {
-			indexCacheBackend:  tsdb.IndexCacheBackendMemcached,
-			bucketIndexEnabled: true,
 		},
 		"inmemory index cache, query sharding enabled": {
 			indexCacheBackend:    tsdb.IndexCacheBackendInMemory,
@@ -355,11 +347,12 @@ func TestQuerierWithBlocksStorageRunningInSingleBinaryMode(t *testing.T) {
 				"-blocks-storage.tsdb.retention-period":                        ((blockRangePeriod * 2) - 1).String(),
 				"-blocks-storage.bucket-store.index-cache.backend":             testCfg.indexCacheBackend,
 				"-blocks-storage.bucket-store.index-cache.memcached.addresses": "dns+" + memcached.NetworkEndpoint(e2ecache.MemcachedPort),
-				"-blocks-storage.bucket-store.bucket-index.enabled":            strconv.FormatBool(testCfg.bucketIndexEnabled),
 
 				// Ingester.
-				"-ingester.ring.store":           "consul",
-				"-ingester.ring.consul.hostname": consul.NetworkHTTPEndpoint(),
+				"-ingester.ring.store":                     "consul",
+				"-ingester.ring.consul.hostname":           consul.NetworkHTTPEndpoint(),
+				"-ingester.partition-ring.store":           "consul",
+				"-ingester.partition-ring.consul.hostname": consul.NetworkHTTPEndpoint(),
 				// Distributor.
 				"-ingester.ring.replication-factor": strconv.FormatInt(seriesReplicationFactor, 10),
 				"-distributor.ring.store":           "consul",
@@ -395,10 +388,12 @@ func TestQuerierWithBlocksStorageRunningInSingleBinaryMode(t *testing.T) {
 			require.NoError(t, err)
 
 			// Push some series to Mimir.
+			series1Name := "series_1"
+			series2Name := "series_2"
 			series1Timestamp := time.Now()
 			series2Timestamp := series1Timestamp.Add(blockRangePeriod * 2)
-			series1, expectedVector1, _ := generateSeries("series_1", series1Timestamp, prompb.Label{Name: "series_1", Value: "series_1"})
-			series2, expectedVector2, _ := generateSeries("series_2", series2Timestamp, prompb.Label{Name: "series_2", Value: "series_2"})
+			series1, expectedVector1, _ := generateFloatSeries(series1Name, series1Timestamp, prompb.Label{Name: series1Name, Value: series1Name})
+			series2, expectedVector2, _ := generateHistogramSeries(series2Name, series2Timestamp, prompb.Label{Name: series2Name, Value: series2Name})
 
 			res, err := c.Push(series1)
 			require.NoError(t, err)
@@ -417,8 +412,9 @@ func TestQuerierWithBlocksStorageRunningInSingleBinaryMode(t *testing.T) {
 
 			// Push another series to further compact another block and delete the first block
 			// due to expired retention.
+			series3Name := "series_3"
 			series3Timestamp := series2Timestamp.Add(blockRangePeriod * 2)
-			series3, expectedVector3, _ := generateSeries("series_3", series3Timestamp, prompb.Label{Name: "series_3", Value: "series_3"})
+			series3, expectedVector3, _ := generateFloatSeries(series3Name, series3Timestamp, prompb.Label{Name: series3Name, Value: series3Name})
 
 			res, err = c.Push(series3)
 			require.NoError(t, err)
@@ -429,18 +425,14 @@ func TestQuerierWithBlocksStorageRunningInSingleBinaryMode(t *testing.T) {
 			require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(3*cluster.NumInstances())), "cortex_ingester_memory_series_created_total"))
 			require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(2*cluster.NumInstances())), "cortex_ingester_memory_series_removed_total"))
 
-			if !testCfg.bucketIndexEnabled {
-				// Wait until the querier has discovered the uploaded blocks (discovered both by the querier and store-gateway).
-				require.NoError(t, cluster.WaitSumMetricsWithOptions(e2e.Equals(float64(2*cluster.NumInstances()*2)), []string{"cortex_blocks_meta_synced"}, e2e.WithLabelMatchers(
-					labels.MustNewMatcher(labels.MatchEqual, "component", "querier"))))
-			}
-
 			// Wait until the store-gateway has synched the new uploaded blocks. The number of blocks loaded
 			// may be greater than expected if the compactor is running (there may have been compacted).
 			const shippedBlocks = 2
 			require.NoError(t, cluster.WaitSumMetrics(e2e.GreaterOrEqual(float64(shippedBlocks*seriesReplicationFactor)), "cortex_bucket_store_blocks_loaded"))
 
 			var expectedCacheRequests int
+			var expectedCacheHits int
+			var expectedMemcachedOps int
 
 			// Query back the series (1 only in the storage, 1 only in the ingesters, 1 on both).
 			// For every series in a block we expect
@@ -450,61 +442,109 @@ func TestQuerierWithBlocksStorageRunningInSingleBinaryMode(t *testing.T) {
 			//
 			// If the series does not exist in the block, then we return early after checking expanded postings and
 			// subsequently the index on disk.
-			result, err := c.Query("series_1", series1Timestamp)
+			result, err := c.Query(series1Name, series1Timestamp)
 			require.NoError(t, err)
 			require.Equal(t, model.ValVector, result.Type())
 			assert.Equal(t, expectedVector1, result.(model.Vector))
-			expectedCacheRequests += seriesReplicationFactor * 3 // expanded postings, postings, series
+			expectedCacheRequests += seriesReplicationFactor * 3                                  // expanded postings, postings, series
+			expectedMemcachedOps += (seriesReplicationFactor * 3) + (seriesReplicationFactor * 3) // Same reasoning as for expectedCacheRequests, but this also includes a set for each get that is not a hit
 
-			result, err = c.Query("series_2", series2Timestamp)
+			result, err = c.Query(series2Name, series2Timestamp)
 			require.NoError(t, err)
 			require.Equal(t, model.ValVector, result.Type())
 			assert.Equal(t, expectedVector2, result.(model.Vector))
-			expectedCacheRequests += seriesReplicationFactor*3 + seriesReplicationFactor // expanded postings, postings, series for 1 time range; only expaned postings for another
+			expectedCacheRequests += seriesReplicationFactor*3 + seriesReplicationFactor      // expanded postings, postings, series for 1 time range; only expanded postings for another
+			expectedMemcachedOps += 2 * (seriesReplicationFactor*3 + seriesReplicationFactor) // Same reasoning as for expectedCacheRequests, but this also includes a set for each get that is not a hit
 
-			result, err = c.Query("series_3", series3Timestamp)
+			result, err = c.Query(series3Name, series3Timestamp)
 			require.NoError(t, err)
 			require.Equal(t, model.ValVector, result.Type())
 			assert.Equal(t, expectedVector3, result.(model.Vector))
-			expectedCacheRequests += seriesReplicationFactor * 2 // expanded postings for 2 time ranges
-
-			expectedMemcachedOps := 2 * expectedCacheRequests // Same reasoning as for expectedCacheRequests, but this also includes a set for each get
+			expectedCacheRequests += seriesReplicationFactor * 2                          // expanded postings for 2 time ranges
+			expectedMemcachedOps += seriesReplicationFactor*2 + seriesReplicationFactor*2 // Same reasoning as for expectedCacheRequests, but this also includes a set for each get that is not a hit
 
 			// Check the in-memory index cache metrics (in the store-gateway).
-			require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(expectedCacheRequests)), "thanos_store_index_cache_requests_total"))
-			require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(0), "thanos_store_index_cache_hits_total")) // no cache hit cause the cache was empty
+			require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(expectedCacheRequests)), "thanos_store_index_cache_requests_total"), "expected %v requests", expectedCacheRequests)
+			require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(expectedCacheHits)), "thanos_store_index_cache_hits_total"), "expected %v hits", expectedCacheHits)
 			if testCfg.indexCacheBackend == tsdb.IndexCacheBackendInMemory {
 				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64((2*2+2+3)*seriesReplicationFactor)), "thanos_store_index_cache_items"))             // 2 series both for postings and series cache, 2 expanded postings on one block, 3 on another one
 				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64((2*2+2+3)*seriesReplicationFactor)), "thanos_store_index_cache_items_added_total")) // 2 series both for postings and series cache, 2 expanded postings on one block, 3 on another one
 			} else if testCfg.indexCacheBackend == tsdb.IndexCacheBackendMemcached {
-				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(expectedMemcachedOps)), "thanos_memcached_operations_total"))
+				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(expectedMemcachedOps)), "thanos_cache_operations_total"), "expected %v operations", expectedMemcachedOps)
 			}
 
 			// Query back again the 1st series from storage. This time it should use the index cache.
 			// It should get a hit on expanded postings; this means that it will not request individual postings for matchers.
 			// It should get a hit on series.
-			// We expect 3 cache requests and 3 cache hits.
-			result, err = c.Query("series_1", series1Timestamp)
+			// We expect 2 cache requests and 2 cache hits.
+			result, err = c.Query(series1Name, series1Timestamp)
 			require.NoError(t, err)
 			require.Equal(t, model.ValVector, result.Type())
 			assert.Equal(t, expectedVector1, result.(model.Vector))
 			expectedCacheRequests += seriesReplicationFactor * 2 // expanded postings and series
-			expectedMemcachedOps += seriesReplicationFactor * 2  // there is no set after the gets this time
+			expectedCacheHits += seriesReplicationFactor * 2
+			expectedMemcachedOps += seriesReplicationFactor * 2 // there is no set after the gets this time
 
-			require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(expectedCacheRequests)), "thanos_store_index_cache_requests_total"))
-			require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(2*seriesReplicationFactor)), "thanos_store_index_cache_hits_total")) // this time has used the index cache
+			require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(expectedCacheRequests)), "thanos_store_index_cache_requests_total"), "expected %v requests", expectedCacheRequests)
+			require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(expectedCacheHits)), "thanos_store_index_cache_hits_total"), "expected %v hits", expectedCacheHits) // this time has used the index cache
 
 			if testCfg.indexCacheBackend == tsdb.IndexCacheBackendInMemory {
 				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64((2*2+2+3)*seriesReplicationFactor)), "thanos_store_index_cache_items"))             // as before
 				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64((2*2+2+3)*seriesReplicationFactor)), "thanos_store_index_cache_items_added_total")) // as before
 			} else if testCfg.indexCacheBackend == tsdb.IndexCacheBackendMemcached {
-				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(expectedMemcachedOps)), "thanos_memcached_operations_total"))
+				require.NoError(t, cluster.WaitSumMetrics(e2e.Equals(float64(expectedMemcachedOps)), "thanos_cache_operations_total"), "expected %v operations", expectedMemcachedOps)
 			}
 
 			// Query metadata.
 			testMetadataQueriesWithBlocksStorage(t, c, series1[0], series2[0], series3[0], blockRangePeriod)
 		})
 	}
+}
+
+func TestMimirPromQLEngine(t *testing.T) {
+	s, err := e2e.NewScenario(networkName)
+	require.NoError(t, err)
+	defer s.Close()
+
+	flags := mergeFlags(BlocksStorageFlags(), BlocksStorageS3Flags(), map[string]string{
+		"-querier.query-engine": "mimir",
+	})
+
+	consul := e2edb.NewConsul()
+	minio := e2edb.NewMinio(9000, flags["-blocks-storage.s3.bucket-name"])
+	require.NoError(t, s.StartAndWaitReady(consul, minio))
+
+	distributor := e2emimir.NewDistributor("distributor", consul.NetworkHTTPEndpoint(), flags)
+	ingester := e2emimir.NewIngester("ingester", consul.NetworkHTTPEndpoint(), flags)
+	querier := e2emimir.NewQuerier("querier", consul.NetworkHTTPEndpoint(), flags)
+	require.NoError(t, s.StartAndWaitReady(distributor, ingester, querier))
+
+	// Wait until the distributor and querier have updated the ring.
+	// The distributor should have 512 tokens for the ingester ring and 1 for the distributor ring,
+	// and the querier should have 512 tokens for the ingester ring.
+	require.NoError(t, distributor.WaitSumMetrics(e2e.Equals(512+1), "cortex_ring_tokens_total"))
+	require.NoError(t, querier.WaitSumMetrics(e2e.Equals(512), "cortex_ring_tokens_total"))
+
+	// Push a series to Mimir.
+	writeClient, err := e2emimir.NewClient(distributor.HTTPEndpoint(), "", "", "", "user-1")
+	require.NoError(t, err)
+
+	seriesName := "series_1"
+	seriesTimestamp := time.Now()
+	series, expectedVector, _ := generateFloatSeries(seriesName, seriesTimestamp, prompb.Label{Name: seriesName, Value: seriesName})
+
+	res, err := writeClient.Push(series)
+	require.NoError(t, err)
+	require.Equal(t, 200, res.StatusCode)
+
+	// Query back the same series using the streaming PromQL engine.
+	c, err := e2emimir.NewClient("", querier.HTTPEndpoint(), "", "", "user-1")
+	require.NoError(t, err)
+
+	result, err := c.Query(seriesName, seriesTimestamp)
+	require.NoError(t, err)
+	require.Equal(t, model.ValVector, result.Type())
+	assert.Equal(t, expectedVector, result.(model.Vector))
 }
 
 func testMetadataQueriesWithBlocksStorage(
@@ -515,14 +555,25 @@ func testMetadataQueriesWithBlocksStorage(
 	firstSeriesInIngesterHead prompb.TimeSeries,
 	blockRangePeriod time.Duration,
 ) {
+	// This is hacky, don't use for anything serious
+	timeStampFromSeries := func(ts prompb.TimeSeries) time.Time {
+		if len(ts.Samples) > 0 {
+			return util.TimeFromMillis(ts.Samples[0].Timestamp)
+		}
+		if len(ts.Histograms) > 0 {
+			return util.TimeFromMillis(ts.Histograms[0].Timestamp)
+		}
+		panic("No samples or histograms")
+	}
+
 	var (
 		lastSeriesInIngesterBlocksName = getMetricName(lastSeriesInIngesterBlocks.Labels)
 		firstSeriesInIngesterHeadName  = getMetricName(firstSeriesInIngesterHead.Labels)
 		lastSeriesInStorageName        = getMetricName(lastSeriesInStorage.Labels)
 
-		lastSeriesInStorageTs        = util.TimeFromMillis(lastSeriesInStorage.Samples[0].Timestamp)
-		lastSeriesInIngesterBlocksTs = util.TimeFromMillis(lastSeriesInIngesterBlocks.Samples[0].Timestamp)
-		firstSeriesInIngesterHeadTs  = util.TimeFromMillis(firstSeriesInIngesterHead.Samples[0].Timestamp)
+		lastSeriesInStorageTs        = timeStampFromSeries(lastSeriesInStorage)
+		lastSeriesInIngesterBlocksTs = timeStampFromSeries(lastSeriesInIngesterBlocks)
+		firstSeriesInIngesterHeadTs  = timeStampFromSeries(firstSeriesInIngesterHead)
 	)
 
 	type seriesTest struct {
@@ -531,7 +582,6 @@ func testMetadataQueriesWithBlocksStorage(
 		resp   []prompb.Label
 	}
 	type labelValuesTest struct {
-		label   string
 		matches []string
 		resp    []string
 	}
@@ -566,16 +616,13 @@ func testMetadataQueriesWithBlocksStorage(
 			},
 			labelValuesTests: []labelValuesTest{
 				{
-					label: labels.MetricName,
-					resp:  []string{firstSeriesInIngesterHeadName},
+					resp: []string{firstSeriesInIngesterHeadName},
 				},
 				{
-					label:   labels.MetricName,
 					resp:    []string{firstSeriesInIngesterHeadName},
 					matches: []string{firstSeriesInIngesterHeadName},
 				},
 				{
-					label:   labels.MetricName,
 					resp:    []string{},
 					matches: []string{lastSeriesInStorageName},
 				},
@@ -602,17 +649,13 @@ func testMetadataQueriesWithBlocksStorage(
 			},
 			labelValuesTests: []labelValuesTest{
 				{
-					label: labels.MetricName,
-					resp:  []string{lastSeriesInIngesterBlocksName},
+					resp: []string{lastSeriesInIngesterBlocksName},
 				},
-
 				{
-					label:   labels.MetricName,
 					resp:    []string{lastSeriesInIngesterBlocksName},
 					matches: []string{lastSeriesInIngesterBlocksName},
 				},
 				{
-					label:   labels.MetricName,
 					resp:    []string{},
 					matches: []string{firstSeriesInIngesterHeadName},
 				},
@@ -641,21 +684,17 @@ func testMetadataQueriesWithBlocksStorage(
 			},
 			labelValuesTests: []labelValuesTest{
 				{
-					label: labels.MetricName,
-					resp:  []string{lastSeriesInStorageName, lastSeriesInIngesterBlocksName, firstSeriesInIngesterHeadName},
+					resp: []string{lastSeriesInStorageName, lastSeriesInIngesterBlocksName, firstSeriesInIngesterHeadName},
 				},
 				{
-					label:   labels.MetricName,
 					resp:    []string{lastSeriesInStorageName},
 					matches: []string{lastSeriesInStorageName},
 				},
 				{
-					label:   labels.MetricName,
 					resp:    []string{lastSeriesInIngesterBlocksName},
 					matches: []string{lastSeriesInIngesterBlocksName},
 				},
 				{
-					label:   labels.MetricName,
 					resp:    []string{lastSeriesInStorageName, lastSeriesInIngesterBlocksName},
 					matches: []string{lastSeriesInStorageName, lastSeriesInIngesterBlocksName},
 				},
@@ -683,16 +722,13 @@ func testMetadataQueriesWithBlocksStorage(
 			},
 			labelValuesTests: []labelValuesTest{
 				{
-					label: labels.MetricName,
-					resp:  []string{lastSeriesInStorageName},
+					resp: []string{lastSeriesInStorageName},
 				},
 				{
-					label:   labels.MetricName,
 					resp:    []string{lastSeriesInStorageName},
 					matches: []string{lastSeriesInStorageName},
 				},
 				{
-					label:   labels.MetricName,
 					resp:    []string{},
 					matches: []string{firstSeriesInIngesterHeadName},
 				},
@@ -707,24 +743,24 @@ func testMetadataQueriesWithBlocksStorage(
 				seriesRes, err := c.Series([]string{st.lookup}, tc.from, tc.to)
 				require.NoError(t, err)
 				if st.ok {
-					require.Equal(t, 1, len(seriesRes))
-					require.Equal(t, model.LabelSet(prompbLabelsToModelMetric(st.resp)), seriesRes[0])
+					require.Equal(t, 1, len(seriesRes), st)
+					require.Equal(t, model.LabelSet(prompbLabelsToMetric(st.resp)), seriesRes[0], st)
 				} else {
-					require.Equal(t, 0, len(seriesRes))
+					require.Equal(t, 0, len(seriesRes), st)
 				}
 			}
 
 			for _, lvt := range tc.labelValuesTests {
-				labelsRes, err := c.LabelValues(lvt.label, tc.from, tc.to, lvt.matches)
+				labelsRes, err := c.LabelValues(labels.MetricName, tc.from, tc.to, lvt.matches)
 				require.NoError(t, err)
 				exp := model.LabelValues{}
 				for _, val := range lvt.resp {
 					exp = append(exp, model.LabelValue(val))
 				}
-				require.Equal(t, exp, labelsRes)
+				require.Equal(t, exp, labelsRes, lvt)
 			}
 
-			labelNames, err := c.LabelNames(tc.from, tc.to)
+			labelNames, err := c.LabelNames(tc.from, tc.to, nil)
 			require.NoError(t, err)
 			require.Equal(t, tc.labelNames, labelNames)
 		})
@@ -764,10 +800,12 @@ func TestQuerierWithBlocksStorageOnMissingBlocksFromStorage(t *testing.T) {
 	c, err := e2emimir.NewClient(distributor.HTTPEndpoint(), "", "", "", "user-1")
 	require.NoError(t, err)
 
+	series1Name := "series_1"
+	series2Name := "series_2"
 	series1Timestamp := time.Now()
 	series2Timestamp := series1Timestamp.Add(blockRangePeriod * 2)
-	series1, expectedVector1, _ := generateSeries("series_1", series1Timestamp)
-	series2, _, _ := generateSeries("series_2", series2Timestamp)
+	series1, expectedVector1, _ := generateFloatSeries(series1Name, series1Timestamp)
+	series2, expectedVector2, _ := generateHistogramSeries(series2Name, series2Timestamp)
 
 	res, err := c.Push(series1)
 	require.NoError(t, err)
@@ -778,11 +816,15 @@ func TestQuerierWithBlocksStorageOnMissingBlocksFromStorage(t *testing.T) {
 	require.Equal(t, 200, res.StatusCode)
 
 	// Wait until the TSDB head is compacted and shipped to the storage.
-	// The shipped block contains the 1st series, while the 2ns series in in the head.
+	// The shipped block contains the 1st series, while the 2nd series in in the head.
 	require.NoError(t, ingester.WaitSumMetrics(e2e.Equals(1), "cortex_ingester_shipper_uploads_total"))
 	require.NoError(t, ingester.WaitSumMetrics(e2e.Equals(2), "cortex_ingester_memory_series_created_total"))
 	require.NoError(t, ingester.WaitSumMetrics(e2e.Equals(1), "cortex_ingester_memory_series_removed_total"))
 	require.NoError(t, ingester.WaitSumMetrics(e2e.Equals(1), "cortex_ingester_memory_series"))
+
+	// Start the compactor to have the bucket index created before querying.
+	compactor := e2emimir.NewCompactor("compactor", consul.NetworkHTTPEndpoint(), flags)
+	require.NoError(t, s.StartAndWaitReady(compactor))
 
 	// Start the querier and store-gateway, and configure them to frequently sync blocks fast enough to trigger consistency check
 	// We will induce an error in the store gateway by deleting blocks and the querier ignores the direct error
@@ -803,16 +845,21 @@ func TestQuerierWithBlocksStorageOnMissingBlocksFromStorage(t *testing.T) {
 
 	// Wait until the blocks are old enough for consistency check
 	// 1 sync on startup, 3 to go over the consistency check limit explained above
-	require.NoError(t, querier.WaitSumMetrics(e2e.GreaterOrEqual(1+3), "cortex_blocks_meta_syncs_total"))
+	require.NoError(t, storeGateway.WaitSumMetrics(e2e.GreaterOrEqual(1+3), "cortex_blocks_meta_syncs_total"))
 
 	// Query back the series.
 	c, err = e2emimir.NewClient("", querier.HTTPEndpoint(), "", "", "user-1")
 	require.NoError(t, err)
 
-	result, err := c.Query("series_1", series1Timestamp)
+	result, err := c.Query(series1Name, series1Timestamp)
 	require.NoError(t, err)
 	require.Equal(t, model.ValVector, result.Type())
 	assert.Equal(t, expectedVector1, result.(model.Vector))
+
+	result, err = c.Query(series2Name, series2Timestamp)
+	require.NoError(t, err)
+	require.Equal(t, model.ValVector, result.Type())
+	assert.Equal(t, expectedVector2, result.(model.Vector))
 
 	// Delete all blocks from the storage.
 	storage, err := e2emimir.NewS3ClientForMinio(minio, flags["-blocks-storage.s3.bucket-name"])
@@ -821,10 +868,17 @@ func TestQuerierWithBlocksStorageOnMissingBlocksFromStorage(t *testing.T) {
 
 	// Query back again the series. Now we do expect a 500 error because the blocks are
 	// missing from the storage.
-	_, err = c.Query("series_1", series1Timestamp)
+	_, err = c.Query(series1Name, series1Timestamp)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "500")
-	assert.Contains(t, err.(*promv1.Error).Detail, "consistency check failed because some blocks were not queried")
+	var apiErr *v1.Error
+	require.ErrorAs(t, err, &apiErr)
+	assert.Contains(t, apiErr.Detail, "get range reader: The specified key does not exist")
+
+	// We expect this to still be queryable as it was not in the cleared storage
+	_, err = c.Query(series2Name, series2Timestamp)
+	require.NoError(t, err)
+	require.Equal(t, model.ValVector, result.Type())
+	assert.Equal(t, expectedVector2, result.(model.Vector))
 }
 
 func TestQueryLimitsWithBlocksStorageRunningInMicroServices(t *testing.T) {
@@ -866,15 +920,19 @@ func TestQueryLimitsWithBlocksStorageRunningInMicroServices(t *testing.T) {
 	require.NoError(t, err)
 
 	// Push some series to Mimir.
+	series1Name := "series_1"
+	series2Name := "series_2"
+	series3Name := "series_3"
+	series4Name := "series_4"
 	series1Timestamp := time.Now()
 	series2Timestamp := series1Timestamp.Add(blockRangePeriod * 2)
 	series3Timestamp := series1Timestamp.Add(blockRangePeriod * 2)
 	series4Timestamp := series1Timestamp.Add(blockRangePeriod * 3)
 
-	series1, _, _ := generateSeries("series_1", series1Timestamp, prompb.Label{Name: "series_1", Value: "series_1"})
-	series2, _, _ := generateSeries("series_2", series2Timestamp, prompb.Label{Name: "series_2", Value: "series_2"})
-	series3, _, _ := generateSeries("series_3", series3Timestamp, prompb.Label{Name: "series_3", Value: "series_3"})
-	series4, _, _ := generateSeries("series_4", series4Timestamp, prompb.Label{Name: "series_4", Value: "series_4"})
+	series1, _, _ := generateFloatSeries(series1Name, series1Timestamp, prompb.Label{Name: series1Name, Value: series1Name})
+	series2, _, _ := generateHistogramSeries(series2Name, series2Timestamp, prompb.Label{Name: series2Name, Value: series2Name})
+	series3, _, _ := generateFloatSeries(series3Name, series3Timestamp, prompb.Label{Name: series3Name, Value: series3Name})
+	series4, _, _ := generateHistogramSeries(series4Name, series4Timestamp, prompb.Label{Name: series4Name, Value: series4Name})
 
 	res, err := c.Push(series1)
 	require.NoError(t, err)
@@ -950,7 +1008,7 @@ func TestHashCollisionHandling(t *testing.T) {
 		},
 	})
 	expectedVector = append(expectedVector, &model.Sample{
-		Metric:    prompbLabelsToModelMetric(metric1),
+		Metric:    prompbLabelsToMetric(metric1),
 		Value:     model.SampleValue(float64(0)),
 		Timestamp: model.Time(tsMillis),
 	})
@@ -961,7 +1019,7 @@ func TestHashCollisionHandling(t *testing.T) {
 		},
 	})
 	expectedVector = append(expectedVector, &model.Sample{
-		Metric:    prompbLabelsToModelMetric(metric2),
+		Metric:    prompbLabelsToMetric(metric2),
 		Value:     model.SampleValue(float64(1)),
 		Timestamp: model.Time(tsMillis),
 	})
@@ -994,14 +1052,4 @@ func getMetricName(lbls []prompb.Label) string {
 	}
 
 	panic(fmt.Sprintf("series %v has no metric name", lbls))
-}
-
-func prompbLabelsToModelMetric(pbLabels []prompb.Label) model.Metric {
-	metric := model.Metric{}
-
-	for _, l := range pbLabels {
-		metric[model.LabelName(l.Name)] = model.LabelValue(l.Value)
-	}
-
-	return metric
 }

@@ -9,21 +9,24 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/grafana/dskit/cache"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/rulefmt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
-	"golang.org/x/exp/slices"
 
 	"github.com/grafana/mimir/pkg/mimirpb"
 	"github.com/grafana/mimir/pkg/ruler/rulespb"
 	"github.com/grafana/mimir/pkg/ruler/rulestore"
+	"github.com/grafana/mimir/pkg/storage/tsdb/bucketcache"
 )
 
 type testGroup struct {
@@ -111,15 +114,21 @@ func TestLoadRules(t *testing.T) {
 		require.NoError(t, rs.SetRuleGroup(context.Background(), g.user, g.namespace, desc))
 	}
 
-	allGroupsMap := map[string]rulespb.RuleGroupList{}
-	for _, u := range []string{"user1", "user2", "user3"} {
-		rgl, err := rs.ListRuleGroupsForUserAndNamespace(context.Background(), u, "")
-		require.NoError(t, err)
-		allGroupsMap[u] = rgl
+	// Utility function used to run each test case in isolation.
+	listAllRuleGroups := func() map[string]rulespb.RuleGroupList {
+		allGroupsMap := map[string]rulespb.RuleGroupList{}
+		for _, u := range []string{"user1", "user2", "user3"} {
+			rgl, err := rs.ListRuleGroupsForUserAndNamespace(context.Background(), u, "")
+			require.NoError(t, err)
+			allGroupsMap[u] = rgl
+		}
+		return allGroupsMap
 	}
 
 	// Before load, rules are not loaded
 	{
+		allGroupsMap := listAllRuleGroups()
+
 		require.Len(t, allGroupsMap, 3)
 		require.ElementsMatch(t, []*rulespb.RuleGroupDesc{
 			{User: "user1", Namespace: "hello", Name: "first testGroup"},
@@ -131,11 +140,14 @@ func TestLoadRules(t *testing.T) {
 		}, allGroupsMap["user2"])
 	}
 
-	err := rs.LoadRuleGroups(context.Background(), allGroupsMap)
-	require.NoError(t, err)
-
 	// After load, rules are loaded.
 	{
+		allGroupsMap := listAllRuleGroups()
+
+		missing, err := rs.LoadRuleGroups(context.Background(), allGroupsMap)
+		require.NoError(t, err)
+		require.Empty(t, missing)
+
 		require.NoError(t, err)
 		require.Len(t, allGroupsMap, 3)
 
@@ -160,13 +172,39 @@ func TestLoadRules(t *testing.T) {
 		}, allGroupsMap["user3"])
 	}
 
-	// Loading group with mismatched info fails.
-	require.NoError(t, rs.SetRuleGroup(context.Background(), "user1", "hello", &rulespb.RuleGroupDesc{User: "user2", Namespace: "world", Name: "first testGroup"}))
-	require.EqualError(t, rs.LoadRuleGroups(context.Background(), allGroupsMap), "mismatch between requested rule group and loaded rule group, requested: user=\"user1\", namespace=\"hello\", group=\"first testGroup\", loaded: user=\"user2\", namespace=\"world\", group=\"first testGroup\"")
+	// Load a missing rule groups doesn't fail but return missing ones.
+	{
+		allGroupsMap := listAllRuleGroups()
 
-	// Load with missing rule groups fails.
-	require.NoError(t, rs.DeleteRuleGroup(context.Background(), "user1", "hello", "first testGroup"))
-	require.EqualError(t, rs.LoadRuleGroups(context.Background(), allGroupsMap), "get rule group user=\"user2\", namespace=\"world\", name=\"first testGroup\": group does not exist")
+		require.NoError(t, rs.DeleteRuleGroup(context.Background(), "user1", "hello", "first testGroup"))
+		missing, err := rs.LoadRuleGroups(context.Background(), allGroupsMap)
+		require.NoError(t, err)
+		require.ElementsMatch(t, rulespb.RuleGroupList{{User: "user1", Namespace: "hello", Name: "first testGroup"}}, missing)
+
+		require.ElementsMatch(t, []*rulespb.RuleGroupDesc{
+			{User: "user1", Namespace: "hello", Name: "first testGroup"}, // The missing one still exists in the rule groups map, but has not been loaded.
+			{User: "user1", Namespace: "hello", Name: "second testGroup", Interval: 2 * time.Minute},
+			{User: "user1", Namespace: "world", Name: "another namespace testGroup", Interval: 1 * time.Hour},
+		}, allGroupsMap["user1"])
+
+		require.ElementsMatch(t, []*rulespb.RuleGroupDesc{
+			{User: "user2", Namespace: "+-!@#$%. ", Name: "different user", Interval: 5 * time.Minute},
+		}, allGroupsMap["user2"])
+
+		require.ElementsMatch(t, []*rulespb.RuleGroupDesc{
+			{User: "user3", Namespace: "hello", Name: "third user", SourceTenants: []string{"tenant-1"}},
+		}, allGroupsMap["user3"])
+	}
+
+	// Loading group with mismatched info fails.
+	{
+		require.NoError(t, rs.SetRuleGroup(context.Background(), "user1", "hello", &rulespb.RuleGroupDesc{User: "user2", Namespace: "world", Name: "first testGroup"}))
+
+		allGroupsMap := listAllRuleGroups()
+		missing, err := rs.LoadRuleGroups(context.Background(), allGroupsMap)
+		require.EqualError(t, err, "mismatch between requested rule group and loaded rule group, requested: user=\"user1\", namespace=\"hello\", group=\"first testGroup\", loaded: user=\"user2\", namespace=\"world\", group=\"first testGroup\"")
+		require.Empty(t, missing)
+	}
 }
 
 func TestDelete(t *testing.T) {
@@ -400,11 +438,179 @@ type mockBucket struct {
 	names []string
 }
 
-func (mb mockBucket) Iter(_ context.Context, dir string, f func(string) error, options ...objstore.IterOption) error {
+func (mb mockBucket) Iter(_ context.Context, _ string, f func(string) error, _ ...objstore.IterOption) error {
 	for _, n := range mb.names {
 		if err := f(n); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func TestCachingAndInvalidation(t *testing.T) {
+	fixtureGroups := []testGroup{
+		{user: "user1", namespace: "hello", ruleGroup: rulefmt.RuleGroup{Name: "first testGroup"}},
+		{user: "user1", namespace: "hello", ruleGroup: rulefmt.RuleGroup{Name: "second testGroup"}},
+		{user: "user1", namespace: "world", ruleGroup: rulefmt.RuleGroup{Name: "another namespace testGroup"}},
+		{user: "user2", namespace: "+-!@#$%. ", ruleGroup: rulefmt.RuleGroup{Name: "different user"}},
+	}
+
+	setup := func(t *testing.T) (*cache.InstrumentedMockCache, *BucketRuleStore) {
+		iterCodec := &bucketcache.JSONIterCodec{}
+		baseClient := objstore.NewInMemBucket()
+		mockCache := cache.NewInstrumentedMockCache()
+
+		cacheCfg := bucketcache.NewCachingBucketConfig()
+		cacheCfg.CacheIter("rule-iter", mockCache, matchAll, time.Minute, iterCodec)
+		cacheCfg.CacheGet("rule-groups", mockCache, matchAll, 1024^2, time.Minute, time.Minute, time.Minute)
+		cacheClient, err := bucketcache.NewCachingBucket("rule-store", baseClient, cacheCfg, log.NewNopLogger(), prometheus.NewPedanticRegistry())
+		require.NoError(t, err)
+
+		ruleStore := NewBucketRuleStore(cacheClient, nil, log.NewNopLogger())
+
+		for _, g := range fixtureGroups {
+			desc := rulespb.ToProto(g.user, g.namespace, g.ruleGroup)
+			require.NoError(t, ruleStore.SetRuleGroup(context.Background(), g.user, g.namespace, desc))
+		}
+
+		return mockCache, ruleStore
+	}
+
+	t.Run("list users with cache", func(t *testing.T) {
+		mockCache, ruleStore := setup(t)
+		startStores := mockCache.CountStoreCalls()
+		startFetches := mockCache.CountFetchCalls()
+
+		users, err := ruleStore.ListAllUsers(context.Background())
+
+		require.NoError(t, err)
+		require.Equal(t, []string{"user1", "user2"}, users)
+
+		require.Equal(t, 1, mockCache.CountStoreCalls()-startStores)
+		require.Equal(t, 1, mockCache.CountFetchCalls()-startFetches)
+	})
+
+	t.Run("list users no cache", func(t *testing.T) {
+		mockCache, rs := setup(t)
+		startStores := mockCache.CountStoreCalls()
+		startFetches := mockCache.CountFetchCalls()
+
+		users, err := rs.ListAllUsers(context.Background(), rulestore.WithCacheDisabled())
+
+		require.NoError(t, err)
+		require.Equal(t, []string{"user1", "user2"}, users)
+
+		require.Equal(t, 1, mockCache.CountStoreCalls()-startStores)
+		require.Equal(t, 0, mockCache.CountFetchCalls()-startFetches)
+	})
+
+	t.Run("list rule groups with cache", func(t *testing.T) {
+		mockCache, ruleStore := setup(t)
+		startStores := mockCache.CountStoreCalls()
+		startFetches := mockCache.CountFetchCalls()
+
+		groups, err := ruleStore.ListRuleGroupsForUserAndNamespace(context.Background(), "user1", "")
+
+		require.NoError(t, err)
+		require.Equal(t, rulespb.RuleGroupList{
+			{
+				Name:      "first testGroup",
+				User:      "user1",
+				Namespace: "hello",
+			},
+			{
+				Name:      "second testGroup",
+				User:      "user1",
+				Namespace: "hello",
+			},
+			{
+				Name:      "another namespace testGroup",
+				User:      "user1",
+				Namespace: "world",
+			},
+		}, groups)
+
+		require.Equal(t, 1, mockCache.CountStoreCalls()-startStores)
+		require.Equal(t, 1, mockCache.CountFetchCalls()-startFetches)
+	})
+
+	t.Run("list rule groups no cache", func(t *testing.T) {
+		mockCache, ruleStore := setup(t)
+		startStores := mockCache.CountStoreCalls()
+		startFetches := mockCache.CountFetchCalls()
+
+		groups, err := ruleStore.ListRuleGroupsForUserAndNamespace(context.Background(), "user1", "", rulestore.WithCacheDisabled())
+
+		require.NoError(t, err)
+		require.Equal(t, rulespb.RuleGroupList{
+			{
+				Name:      "first testGroup",
+				User:      "user1",
+				Namespace: "hello",
+			},
+			{
+				Name:      "second testGroup",
+				User:      "user1",
+				Namespace: "hello",
+			},
+			{
+				Name:      "another namespace testGroup",
+				User:      "user1",
+				Namespace: "world",
+			},
+		}, groups)
+
+		require.Equal(t, 1, mockCache.CountStoreCalls()-startStores)
+		require.Equal(t, 0, mockCache.CountFetchCalls()-startFetches)
+	})
+
+	t.Run("get rule group from cache", func(t *testing.T) {
+		mockCache, ruleStore := setup(t)
+		startStores := mockCache.CountStoreCalls()
+		startFetches := mockCache.CountFetchCalls()
+
+		group, err := ruleStore.GetRuleGroup(context.Background(), "user1", "world", "another namespace testGroup")
+
+		require.NoError(t, err)
+		require.NotNil(t, group)
+
+		require.Equal(t, 2, mockCache.CountStoreCalls()-startStores) // content set + exists set
+		require.Equal(t, 1, mockCache.CountFetchCalls()-startFetches)
+	})
+
+	t.Run("get rule groups after invalidation", func(t *testing.T) {
+		mockCache, ruleStore := setup(t)
+		startStores := mockCache.CountStoreCalls()
+		startFetches := mockCache.CountFetchCalls()
+		startDeletes := mockCache.CountDeleteCalls()
+
+		group, err := ruleStore.GetRuleGroup(context.Background(), "user1", "world", "another namespace testGroup")
+
+		require.NoError(t, err)
+		require.NotNil(t, group)
+		require.Zero(t, group.QueryOffset)
+
+		require.Equal(t, 2, mockCache.CountStoreCalls()-startStores) // content set + exists set
+		require.Equal(t, 1, mockCache.CountFetchCalls()-startFetches)
+
+		group.QueryOffset = 42 * time.Second
+		require.NoError(t, ruleStore.SetRuleGroup(context.Background(), group.User, group.Namespace, group))
+
+		require.Equal(t, 4, mockCache.CountStoreCalls()-startStores) // += content lock + exists lock
+		require.Equal(t, 1, mockCache.CountFetchCalls()-startFetches)
+		require.Equal(t, 2, mockCache.CountDeleteCalls()-startDeletes)
+
+		modifiedGroup, err := ruleStore.GetRuleGroup(context.Background(), "user1", "world", "another namespace testGroup")
+		require.NoError(t, err)
+		require.NotNil(t, modifiedGroup)
+		require.Equal(t, 42*time.Second, modifiedGroup.QueryOffset)
+
+		require.Equal(t, 6, mockCache.CountStoreCalls()-startStores) // += content set + exists set
+		require.Equal(t, 2, mockCache.CountFetchCalls()-startFetches)
+		require.Equal(t, 2, mockCache.CountDeleteCalls()-startDeletes)
+	})
+}
+
+func matchAll(string) bool {
+	return true
 }

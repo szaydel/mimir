@@ -1,5 +1,4 @@
-{{- if .Values.enterprise.enabled -}}
-{{ if .Values.tokengenJob.enable }}
+{{- if and .Values.enterprise.enabled .Values.tokengenJob.enable (not .Values.federation_frontend.disableOtherComponents) -}}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -21,6 +20,8 @@ spec:
     metadata:
       labels:
         {{- include "mimir.podLabels" (dict "ctx" . "component" "tokengen") | nindent 8 }}
+      annotations:
+        {{- include "mimir.podAnnotations" (dict "ctx" . "component" "tokengen") | nindent 8 }}
       namespace: {{ .Release.Namespace | quote }}
     spec:
       serviceAccountName: {{ template "mimir.serviceAccountName" . }}
@@ -28,7 +29,7 @@ spec:
       priorityClassName: {{ .Values.tokengenJob.priorityClassName }}
       {{- end }}
       securityContext:
-        {{- toYaml .Values.tokengenJob.securityContext | nindent 8 }}
+        {{- include "mimir.lib.podSecurityContext" (dict "ctx" . "component" "tokengen") | nindent 8 }}
       {{- if .Values.image.pullSecrets }}
       imagePullSecrets:
       {{- range .Values.image.pullSecrets }}
@@ -39,18 +40,21 @@ spec:
         {{- toYaml .Values.tokengenJob.initContainers | nindent 8 }}
       containers:
         - name: tokengen
-          image: "{{ include "mimir.imageReference" . }}"
+          image: {{ include "mimir.imageReference" (dict "ctx" . "component" "tokengen") }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - "-target=tokengen"
             - "-config.expand-env=true"
             - "-config.file=/etc/mimir/mimir.yaml"
             {{- range $key, $value := .Values.tokengenJob.extraArgs }}
-            - "-{{ $key }}={{ $value }}"
+            - -{{ $key }}={{ $value }}
             {{- end }}
           volumeMounts:
             {{- if .Values.tokengenJob.extraVolumeMounts }}
               {{ toYaml .Values.tokengenJob.extraVolumeMounts | nindent 12 }}
+            {{- end }}
+            {{- if .Values.global.extraVolumeMounts }}
+              {{ toYaml .Values.global.extraVolumeMounts | nindent 12 }}
             {{- end }}
             - name: config
               mountPath: /etc/mimir
@@ -58,6 +62,7 @@ spec:
               mountPath: /license
             - name: active-queries
               mountPath: /active-query-tracker
+          {{- if or .Values.global.extraEnv .Values.tokengenJob.env }}
           env:
             {{- with .Values.global.extraEnv }}
               {{ toYaml . | nindent 12 }}
@@ -65,6 +70,8 @@ spec:
             {{- with .Values.tokengenJob.env }}
               {{ toYaml . | nindent 12 }}
             {{- end }}
+          {{- end }}
+          {{- if or .Values.global.extraEnvFrom .Values.tokengenJob.extraEnvFrom }}
           envFrom:
             {{- with .Values.global.extraEnvFrom }}
               {{- toYaml . | nindent 12 }}
@@ -72,6 +79,7 @@ spec:
             {{- with .Values.tokengenJob.extraEnvFrom }}
               {{- toYaml . | nindent 12 }}
             {{- end }}
+          {{- end }}
           securityContext:
             {{- toYaml .Values.tokengenJob.containerSecurityContext | nindent 12 }}
       restartPolicy: OnFailure
@@ -81,6 +89,9 @@ spec:
         {{- if .Values.tokengenJob.extraVolumes }}
         {{ toYaml .Values.tokengenJob.extraVolumes | nindent 8 }}
         {{- end }}
+        {{- if .Values.global.extraVolumes }}
+        {{ toYaml .Values.global.extraVolumes | nindent 8 }}
+        {{- end }}
         - name: license
           secret:
             secretName: {{ tpl .Values.license.secretName . }}
@@ -88,5 +99,4 @@ spec:
           emptyDir: {}
         - name: active-queries
           emptyDir: {}
-{{- end -}}
 {{- end -}}

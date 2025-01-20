@@ -12,8 +12,6 @@ import (
 
 	"github.com/dennwc/varint"
 	"github.com/pkg/errors"
-
-	"github.com/grafana/mimir/pkg/util/math"
 )
 
 var (
@@ -49,7 +47,7 @@ func (d *Decbuf) CheckCrc32(castagnoliTable *crc32.Table) {
 	rawBuf := make([]byte, maxChunkSize)
 
 	for bytesToRead > 0 {
-		chunkSize := math.Min(bytesToRead, maxChunkSize)
+		chunkSize := min(bytesToRead, maxChunkSize)
 		chunkBuf := rawBuf[0:chunkSize]
 
 		err := d.r.readInto(chunkBuf)
@@ -102,6 +100,13 @@ func (d *Decbuf) SkipUvarintBytes() {
 // E to an error and not advance the pointer of fileReader.
 func (d *Decbuf) ResetAt(off int) {
 	if d.E != nil {
+		return
+	}
+
+	// If we are trying to reset at a position which is already buffered,
+	// we can avoid resetting the fileReader and just discard some of the buffer instead.
+	if dist := off - d.Position(); dist >= 0 && dist < d.r.buffered() {
+		d.E = d.r.skip(dist)
 		return
 	}
 

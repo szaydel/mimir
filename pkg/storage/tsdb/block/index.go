@@ -12,6 +12,7 @@ import (
 	"math"
 	"math/rand"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -22,18 +23,19 @@ import (
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/index"
-	"golang.org/x/exp/slices"
 
-	"github.com/grafana/mimir/pkg/storage/tsdb/metadata"
+	util_log "github.com/grafana/mimir/pkg/util/log"
 )
 
-// VerifyIndex does a full run over a block index and verifies that it fulfills the order invariants.
-func VerifyIndex(logger log.Logger, fn string, minTime, maxTime int64) error {
-	stats, err := GatherIndexHealthStats(logger, fn, minTime, maxTime)
+// VerifyBlock does a full run over a block index and chunk data and verifies that they fulfill the order invariants.
+func VerifyBlock(ctx context.Context, logger log.Logger, blockDir string, minTime, maxTime int64, checkChunks bool) error {
+	stats, err := GatherBlockHealthStats(ctx, logger, blockDir, minTime, maxTime, checkChunks)
 	if err != nil {
 		return err
 	}
@@ -53,13 +55,13 @@ type HealthStats struct {
 	DuplicatedChunks int
 	// OutsideChunks represents number of all chunks that are before or after time range specified in block meta.
 	OutsideChunks int
-	// CompleteOutsideChunks is subset of OutsideChunks that will be never accessed. They are completely out of time range specified in block meta.
+	// CompleteOutsideChunks is subset of OutsideChunks that will never be accessed. They are completely out of time range specified in block meta.
 	CompleteOutsideChunks int
 	// Issue347OutsideChunks represents subset of OutsideChunks that are outsiders caused by https://github.com/prometheus/tsdb/issues/347
 	// and is something that Thanos handle.
 	//
 	// Specifically we mean here chunks with minTime == block.maxTime and maxTime > block.MaxTime. These are
-	// are segregated into separate counters. These chunks are safe to be deleted, since they are duplicated across 2 blocks.
+	// segregated into separate counters. These chunks are safe to be deleted, since they are duplicated across 2 blocks.
 	Issue347OutsideChunks int
 	// OutOfOrderLabels represents the number of postings that contained out
 	// of order labels, a bug present in Prometheus 2.8.0 and below.
@@ -96,7 +98,7 @@ type HealthStats struct {
 }
 
 // OutOfOrderLabelsErr returns an error if the HealthStats object indicates
-// postings with out of order labels.  This is corrected by Prometheus Issue
+// postings without of order labels.  This is corrected by Prometheus Issue
 // #5372 and affects Prometheus versions 2.8.0 and below.
 func (i HealthStats) OutOfOrderLabelsErr() error {
 	if i.OutOfOrderLabels > 0 {
@@ -128,13 +130,13 @@ func (i HealthStats) OutOfOrderChunksErr() error {
 	return nil
 }
 
-// CriticalErr returns error if stats indicates critical block issue, that might solved only by manual repair procedure.
+// CriticalErr returns error if stats indicates critical block issue, that might be solved only by manual repair procedure.
 func (i HealthStats) CriticalErr() error {
 	var errMsg []string
 
 	n := i.OutsideChunks - (i.CompleteOutsideChunks + i.Issue347OutsideChunks)
 	if n > 0 {
-		errMsg = append(errMsg, fmt.Sprintf("found %d chunks non-completely outside the block time range", n))
+		errMsg = append(errMsg, fmt.Sprintf("found %d chunks partially outside the block time range", n))
 	}
 
 	if i.CompleteOutsideChunks > 0 {
@@ -208,18 +210,22 @@ func (n *minMaxSumInt64) Avg() int64 {
 	return n.sum / n.cnt
 }
 
-// GatherIndexHealthStats returns useful counters as well as outsider chunks (chunks outside of block time range) that
-// helps to assess index health.
+// GatherBlockHealthStats returns useful counters as well as outsider chunks (chunks outside of block time range) that
+// helps to assess index and optionally chunk health.
 // It considers https://github.com/prometheus/tsdb/issues/347 as something that Thanos can handle.
 // See HealthStats.Issue347OutsideChunks for details.
-func GatherIndexHealthStats(logger log.Logger, fn string, minTime, maxTime int64) (stats HealthStats, err error) {
-	r, err := index.NewFileReader(fn)
+func GatherBlockHealthStats(ctx context.Context, logger log.Logger, blockDir string, minTime, maxTime int64, checkChunkData bool) (stats HealthStats, err error) {
+	indexFn := filepath.Join(blockDir, IndexFilename)
+	chunkDir := filepath.Join(blockDir, ChunksDirname)
+	// index reader
+	r, err := index.NewFileReader(indexFn, index.DecodePostingsRaw)
 	if err != nil {
 		return stats, errors.Wrap(err, "open index file")
 	}
 	defer runutil.CloseWithErrCapture(&err, r, "gather index issue file reader")
 
-	p, err := r.Postings(index.AllPostingsKey())
+	n, v := index.AllPostingsKey()
+	p, err := r.Postings(ctx, n, v)
 	if err != nil {
 		return stats, errors.Wrap(err, "get all postings")
 	}
@@ -228,6 +234,7 @@ func GatherIndexHealthStats(logger log.Logger, fn string, minTime, maxTime int64
 		lset     labels.Labels
 		builder  labels.ScratchBuilder
 		chks     []chunks.Meta
+		cr       *chunks.Reader
 
 		seriesLifeDuration                          = newMinMaxSumInt64()
 		seriesLifeDurationWithoutSingleSampleSeries = newMinMaxSumInt64()
@@ -236,13 +243,22 @@ func GatherIndexHealthStats(logger log.Logger, fn string, minTime, maxTime int64
 		chunkSize                                   = newMinMaxSumInt64()
 	)
 
-	lnames, err := r.LabelNames()
+	// chunk reader
+	if checkChunkData {
+		cr, err = chunks.NewDirReader(chunkDir, nil)
+		if err != nil {
+			return stats, errors.Wrapf(err, "failed to open chunk dir %s", chunkDir)
+		}
+		defer runutil.CloseWithErrCapture(&err, cr, "closing chunks reader")
+	}
+
+	lnames, err := r.LabelNames(ctx)
 	if err != nil {
 		return stats, errors.Wrap(err, "label names")
 	}
 	stats.LabelNamesCount = int64(len(lnames))
 
-	lvals, err := r.LabelValues("__name__")
+	lvals, err := r.LabelValues(ctx, "__name__")
 	if err != nil {
 		return stats, errors.Wrap(err, "metric label values")
 	}
@@ -259,15 +275,16 @@ func GatherIndexHealthStats(logger log.Logger, fn string, minTime, maxTime int64
 			return stats, errors.Wrap(err, "read series")
 		}
 		lset = builder.Labels()
-		if len(lset) == 0 {
+		if lset.IsEmpty() {
 			return stats, errors.Errorf("empty label set detected for series %d", id)
 		}
-		if lastLset != nil && labels.Compare(lastLset, lset) >= 0 {
+		if !lastLset.IsEmpty() && labels.Compare(lastLset, lset) >= 0 {
 			return stats, errors.Errorf("series %v out of order; previous %v", lset, lastLset)
 		}
-		l0 := lset[0]
-		for _, l := range lset[1:] {
-			if l.Name < l0.Name {
+		first := true
+		var lastName string
+		lset.Range(func(l labels.Label) {
+			if !first && l.Name < lastName {
 				stats.OutOfOrderLabels++
 				level.Warn(logger).Log("msg",
 					"out-of-order label set: known bug in Prometheus 2.8.0 and below",
@@ -275,8 +292,9 @@ func GatherIndexHealthStats(logger log.Logger, fn string, minTime, maxTime int64
 					"series", fmt.Sprintf("%d", id),
 				)
 			}
-			l0 = l
-		}
+			first = false
+			lastName = l.Name
+		})
 		if len(chks) == 0 {
 			return stats, errors.Errorf("empty chunks for series %d", id)
 		}
@@ -285,6 +303,14 @@ func GatherIndexHealthStats(logger log.Logger, fn string, minTime, maxTime int64
 		seriesLifeTimeMs := int64(0)
 		// Per chunk in series.
 		for i, c := range chks {
+			// Check if chunk data is valid.
+			if checkChunkData {
+				err := verifyChunks(cr, c)
+				if err != nil {
+					return stats, errors.Wrapf(err, "verify chunk %d of series %d", i, id)
+				}
+			}
+
 			stats.TotalChunks++
 
 			chkDur := c.MaxTime - c.MinTime
@@ -373,14 +399,14 @@ func GatherIndexHealthStats(logger log.Logger, fn string, minTime, maxTime int64
 
 type ignoreFnType func(mint, maxt int64, prev *chunks.Meta, curr *chunks.Meta) (bool, error)
 
-// Repair open the block with given id in dir and creates a new one with fixed data.
+// Repair opens the block with given id in dir and creates a new one with fixed data.
 // It:
 // - removes out of order duplicates
 // - all "complete" outsiders (they will not accessed anyway)
 // - removes all near "complete" outside chunks introduced by https://github.com/prometheus/tsdb/issues/347.
 // Fixable inconsistencies are resolved in the new block.
 // TODO(bplotka): https://github.com/thanos-io/thanos/issues/378.
-func Repair(logger log.Logger, dir string, id ulid.ULID, source metadata.SourceType, ignoreChkFns ...ignoreFnType) (resid ulid.ULID, err error) {
+func Repair(ctx context.Context, logger log.Logger, dir string, id ulid.ULID, source SourceType, clampChunks bool, ignoreChkFns ...ignoreFnType) (resid ulid.ULID, err error) {
 	if len(ignoreChkFns) == 0 {
 		return resid, errors.New("no ignore chunk function specified")
 	}
@@ -389,7 +415,7 @@ func Repair(logger log.Logger, dir string, id ulid.ULID, source metadata.SourceT
 	entropy := rand.New(rand.NewSource(time.Now().UnixNano()))
 	resid = ulid.MustNew(ulid.Now(), entropy)
 
-	meta, err := metadata.ReadFromDir(bdir)
+	meta, err := ReadMetaFromDir(bdir)
 	if err != nil {
 		return resid, errors.Wrap(err, "read meta file")
 	}
@@ -397,7 +423,7 @@ func Repair(logger log.Logger, dir string, id ulid.ULID, source metadata.SourceT
 		return resid, errors.New("cannot repair downsampled block")
 	}
 
-	b, err := tsdb.OpenBlock(logger, bdir, nil)
+	b, err := tsdb.OpenBlock(util_log.SlogFromGoKit(logger), bdir, nil, nil)
 	if err != nil {
 		return resid, errors.Wrap(err, "open block")
 	}
@@ -423,7 +449,7 @@ func Repair(logger log.Logger, dir string, id ulid.ULID, source metadata.SourceT
 	}
 	defer runutil.CloseWithErrCapture(&err, chunkw, "repair chunk writer")
 
-	indexw, err := index.NewWriter(context.TODO(), filepath.Join(resdir, IndexFilename))
+	indexw, err := index.NewWriter(ctx, filepath.Join(resdir, IndexFilename))
 	if err != nil {
 		return resid, errors.Wrap(err, "open index writer")
 	}
@@ -436,7 +462,7 @@ func Repair(logger log.Logger, dir string, id ulid.ULID, source metadata.SourceT
 	resmeta.Stats = tsdb.BlockStats{} // Reset stats.
 	resmeta.Thanos.Source = source    // Update source.
 
-	if err := rewrite(logger, indexr, chunkr, indexw, chunkw, &resmeta, ignoreChkFns); err != nil {
+	if err := rewrite(ctx, logger, indexr, chunkr, indexw, chunkw, &resmeta, clampChunks, ignoreChkFns); err != nil {
 		return resid, errors.Wrap(err, "rewrite block")
 	}
 	resmeta.Thanos.SegmentFiles = GetSegmentFiles(resdir)
@@ -496,7 +522,7 @@ func IgnoreDuplicateOutsideChunk(_, _ int64, last, curr *chunks.Meta) (bool, err
 
 // sanitizeChunkSequence ensures order of the input chunks and drops any duplicates.
 // It errors if the sequence contains non-dedupable overlaps.
-func sanitizeChunkSequence(chks []chunks.Meta, mint, maxt int64, ignoreChkFns []ignoreFnType) ([]chunks.Meta, error) {
+func sanitizeChunkSequence(chks []chunks.Meta, mint, maxt int64, clampChunks bool, ignoreChkFns []ignoreFnType) ([]chunks.Meta, error) {
 	if len(chks) == 0 {
 		return nil, nil
 	}
@@ -512,7 +538,7 @@ func sanitizeChunkSequence(chks []chunks.Meta, mint, maxt int64, ignoreChkFns []
 OUTER:
 	// This compares the current chunk to the chunk from the last iteration
 	// by pointers.  If we use "i, c := range chks" the variable c is a new
-	// variable who's address doesn't change through the entire loop.
+	// variable whose address doesn't change through the entire loop.
 	// The current element of the chks slice is copied into it. We must take
 	// the address of the indexed slice instead.
 	for i := range chks {
@@ -527,11 +553,74 @@ OUTER:
 			}
 		}
 
-		last = &chks[i]
-		repl = append(repl, chks[i])
+		// Clamp chunk contents to be bounded by the mint and maxt
+		chk := &chks[i]
+		if clampChunks {
+			if clampedChk, err := clampChunk(chk, mint, maxt); err != nil {
+				return nil, errors.Wrap(err, "clamping chunk")
+			} else if clampedChk != nil {
+				chk = clampedChk
+			} else {
+				continue
+			}
+		}
+
+		last = chk
+		repl = append(repl, *chk)
 	}
 
 	return repl, nil
+}
+
+func verifyChunks(cr *chunks.Reader, cm chunks.Meta) error {
+	ch, iter, err := cr.ChunkOrIterable(cm)
+	if err != nil {
+		return errors.Wrapf(err, "failed to read chunk %d", cm.Ref)
+	}
+	if iter != nil {
+		return errors.Errorf("chunk %d: ChunkOrIterable shouldn't return an iterable", cm.Ref)
+	}
+
+	cb := ch.Bytes()
+	if len(cb) == 0 {
+		return errors.Errorf("empty chunk %d", cm.Ref)
+	}
+
+	samples := 0
+	firstSample := true
+	prevTs := int64(-1)
+
+	it := ch.Iterator(nil)
+	for valType := it.Next(); valType != chunkenc.ValNone; valType = it.Next() {
+		samples++
+
+		if valType != chunkenc.ValFloat && valType != chunkenc.ValHistogram && valType != chunkenc.ValFloatHistogram {
+			return errors.Errorf("unsupported value type %v in chunk %d", valType, cm.Ref)
+		}
+
+		ts := it.AtT()
+
+		if firstSample {
+			firstSample = false
+			if ts != cm.MinTime {
+				return errors.Errorf("first sample doesn't match chunk MinTime, chunk: %d, chunk MinTime: %s, sample timestamp: %s", cm.Ref, formatTimestamp(cm.MinTime), formatTimestamp(ts))
+			}
+		} else if ts <= prevTs {
+			return errors.Errorf("out of order sample timestamps, chunk %d, previous timestamp: %s, sample timestamp: %s", cm.Ref, formatTimestamp(prevTs), formatTimestamp(ts))
+		}
+
+		prevTs = ts
+	}
+
+	if e := it.Err(); e != nil {
+		return errors.Wrapf(e, "failed to iterate over chunk samples, chunk %d", cm.Ref)
+	} else if samples == 0 {
+		return errors.Errorf("no samples found in chunk %d", cm.Ref)
+	} else if prevTs != cm.MaxTime {
+		return errors.Errorf("last sample doesn't match chunk MaxTime, chunk: %d, chunk MaxTime: %s, sample timestamp: %s", cm.Ref, formatTimestamp(cm.MaxTime), formatTimestamp(prevTs))
+	}
+
+	return nil
 }
 
 type seriesRepair struct {
@@ -543,25 +632,27 @@ type seriesRepair struct {
 // which index.Reader does not implement.
 type indexReader interface {
 	Symbols() index.StringIter
-	SortedLabelValues(name string, matchers ...*labels.Matcher) ([]string, error)
-	LabelValues(name string, matchers ...*labels.Matcher) ([]string, error)
-	Postings(name string, values ...string) (index.Postings, error)
+	SortedLabelValues(ctx context.Context, name string, matchers ...*labels.Matcher) ([]string, error)
+	LabelValues(ctx context.Context, name string, matchers ...*labels.Matcher) ([]string, error)
+	Postings(ctx context.Context, name string, values ...string) (index.Postings, error)
 	SortedPostings(index.Postings) index.Postings
 	ShardedPostings(p index.Postings, shardIndex, shardCount uint64) index.Postings
 	Series(ref storage.SeriesRef, builder *labels.ScratchBuilder, chks *[]chunks.Meta) error
-	LabelNames(matchers ...*labels.Matcher) ([]string, error)
-	LabelValueFor(id storage.SeriesRef, label string) (string, error)
-	LabelNamesFor(ids ...storage.SeriesRef) ([]string, error)
+	LabelNames(ctx context.Context, matchers ...*labels.Matcher) ([]string, error)
+	LabelValueFor(ctx context.Context, id storage.SeriesRef, label string) (string, error)
+	LabelNamesFor(ctx context.Context, p index.Postings) ([]string, error)
 	Close() error
 }
 
 // rewrite writes all data from the readers back into the writers while cleaning
 // up mis-ordered and duplicated chunks.
 func rewrite(
+	ctx context.Context,
 	logger log.Logger,
 	indexr indexReader, chunkr tsdb.ChunkReader,
 	indexw tsdb.IndexWriter, chunkw tsdb.ChunkWriter,
-	meta *metadata.Meta,
+	meta *Meta,
+	clampChunks bool,
 	ignoreChkFns []ignoreFnType,
 ) error {
 	symbols := indexr.Symbols()
@@ -574,7 +665,8 @@ func rewrite(
 		return errors.Wrap(symbols.Err(), "next symbol")
 	}
 
-	all, err := indexr.Postings(index.AllPostingsKey())
+	n, v := index.AllPostingsKey()
+	all, err := indexr.Postings(ctx, n, v)
 	if err != nil {
 		return errors.Wrap(err, "postings")
 	}
@@ -600,13 +692,17 @@ func rewrite(
 		builder.Sort()
 
 		for i, c := range chks {
-			chks[i].Chunk, err = chunkr.Chunk(c)
+			chunk, iter, err := chunkr.ChunkOrIterable(c)
 			if err != nil {
 				return errors.Wrap(err, "chunk read")
 			}
+			if iter != nil {
+				return errors.New("unexpected chunk iterable returned")
+			}
+			chks[i].Chunk = chunk
 		}
 
-		chks, err := sanitizeChunkSequence(chks, meta.MinTime, meta.MaxTime, ignoreChkFns)
+		chks, err := sanitizeChunkSequence(chks, meta.MinTime, meta.MaxTime, clampChunks, ignoreChkFns)
 		if err != nil {
 			return err
 		}
@@ -627,8 +723,8 @@ func rewrite(
 
 	// Sort the series, if labels are re-ordered then the ordering of series
 	// will be different.
-	sort.Slice(series, func(i, j int) bool {
-		return labels.Compare(series[i].lset, series[j].lset) < 0
+	slices.SortFunc(series, func(i, j seriesRepair) int {
+		return labels.Compare(i.lset, j.lset)
 	})
 
 	lastSet := labels.Labels{}
@@ -661,19 +757,62 @@ func rewrite(
 			meta.Stats.NumSamples += uint64(chk.Chunk.NumSamples())
 		}
 
-		for _, l := range s.lset {
+		s.lset.Range(func(l labels.Label) {
 			valset, ok := values[l.Name]
 			if !ok {
 				valset = stringset{}
 				values[l.Name] = valset
 			}
 			valset.set(l.Value)
-		}
+		})
 		postings.Add(i, s.lset)
 		i++
 		lastSet = s.lset
 	}
 	return nil
+}
+
+// clampChunk returns a chunk that contains only samples within [mint, maxt),
+// else nil if no samples were within that range.
+func clampChunk(input *chunks.Meta, minT, maxT int64) (*chunks.Meta, error) {
+	// Ignore chunks that are empty or all outside
+	if input.Chunk.NumSamples() <= 0 || input.MinTime >= maxT || input.MaxTime < minT {
+		return nil, nil
+	}
+	// Return chunks that are all inside
+	if minT <= input.MinTime && input.MaxTime < maxT {
+		return input, nil
+	}
+
+	newChunk, err := chunkenc.NewEmptyChunk(input.Chunk.Encoding())
+	if err != nil {
+		return nil, err
+	}
+	app, err := newChunk.Appender()
+	if err != nil {
+		return nil, err
+	}
+
+	chunkMinT := int64(math.MaxInt64)
+	chunkMaxT := int64(0)
+	iter := input.Chunk.Iterator(nil)
+	for valType := iter.Next(); valType != chunkenc.ValNone; valType = iter.Next() {
+		// When adding samples, minT is inclusive and maxT is exclusive
+		if t, v := iter.At(); t >= minT && t < maxT {
+			chunkMinT = min(chunkMinT, t)
+			chunkMaxT = max(chunkMaxT, t)
+			app.Append(t, v)
+		}
+	}
+
+	if newChunk.NumSamples() > 0 {
+		return &chunks.Meta{
+			MinTime: chunkMinT,
+			MaxTime: chunkMaxT,
+			Chunk:   newChunk,
+		}, nil
+	}
+	return nil, nil
 }
 
 type stringset map[string]struct{}
@@ -693,4 +832,8 @@ func (ss stringset) slice() []string {
 	}
 	slices.Sort(slice)
 	return slice
+}
+
+func formatTimestamp(ts int64) string {
+	return fmt.Sprintf("%d (%s)", ts, timestamp.Time(ts).UTC().Format(time.RFC3339Nano))
 }

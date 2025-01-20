@@ -48,17 +48,35 @@ In case a member leaves, the [offboarding](#offboarding) procedure is applied.
 
 The current team members are:
 
+- Andy Asp [@andyasp](https://github.com/andyasp) ([Grafana Labs](https://grafana.com/))
 - Arve Knudsen — [@aknuds1](https://github.com/aknuds1) ([Grafana Labs](https://grafana.com/))
 - Bryan Boreham — [@bboreham](https://github.com/bboreham) ([Grafana Labs](https://grafana.com/))
+- Casie Chen — [@chencs](https://github.com/chencs) ([Grafana Labs](https://grafana.com/))
+- Charles Korn — [@charleskorn](https://github.com/charleskorn) ([Grafana Labs](https://grafana.com/))
+- David Grant [@seizethedave](https://github.com/seizethedave) ([Grafana Labs](https://grafana.com/))
+- Dimitar Dimitrov - [@dimitarvdimitrov](https://github.com/dimitarvdimitrov) ([Grafana Labs](https://grafana.com/))
+- Fayzal Ghantiwala [@fayzal-g](https://github.com/fayzal) ([Grafana Labs](https://grafana.com/))
+- Felix Beuke [@flxbk](https://github.com/flxbk) ([Grafana Labs](https://grafana.com/))
+- Franco Posa [@francoposa](https://github.com/francoposa) ([Grafana Labs](https://grafana.com/))
 - George Krajcsovits - [@krajorama](https://github.com/krajorama) ([Grafana Labs](https://grafana.com/))
-- Johanna Ratliff — [@johannaratliff](https://github.com/johannaratliff) ([Grafana Labs](https://grafana.com/))
+- Jeanette Tan [@zenador](https://github.com/zenador) ([Grafana Labs](https://grafana.com/))
+- Jon Kartago Lamida [@lamida](https://github.com/lamida) ([Grafana Labs](https://grafana.com/))
+- Jonathan Halterman [@jhalterman](https://github.com/jhalterman) ([Grafana Labs](https://grafana.com/))
+- Josh Abreu Mesa [@gotjosh](https://github.com/gotjosh) ([Grafana Labs](https://grafana.com/))
+- Joshua Hesketh [@jhesketh](https://github.com/jhesketh) ([Grafana Labs](https://grafana.com/))
+- Justin Lei [@leizor](https://github.com/leizor) ([Grafana Labs](https://grafana.com/))
 - Marco Pracucci — [@pracucci](https://github.com/pracucci) ([Grafana Labs](https://grafana.com/))
 - Mauro Stettler — [@replay](https://github.com/replay) ([Grafana Labs](https://grafana.com/))
+- Miguel Ángel Ortuño [@ortuman](https://github.com/ortuman) ([Grafana Labs](https://grafana.com/))
 - Nick Pillitteri — [@56quarters](https://github.com/56quarters) ([Grafana Labs](https://grafana.com/))
 - Oleg Zaytsev — [@colega](https://github.com/colega) ([Grafana Labs](https://grafana.com/))
 - Patrick Oyarzun - [@Logiraptor](https://github.com/Logiraptor) ([Grafana Labs](https://grafana.com/))
+- Patryk Prus [@pr00se](https://github.com/pr00se) ([Grafana Labs](https://grafana.com/))
 - Peter Štibraný — [@pstibrany](https://github.com/pstibrany) ([Grafana Labs](https://grafana.com/))
-- Tyler Reid — [@treid314](https://github.com/treid314) ([Grafana Labs](https://grafana.com/))
+- Vernon Miller [@aldernero](https://github.com/aldernero) ([Grafana Labs](https://grafana.com/))
+- Vladimir Varankin [@narqo](https://github.com/narqo) ([Grafana Labs](https://grafana.com/))
+- Ying-jeanne Wang [@ying-jeanne](https://github.com/ying-jeanne) ([Grafana Labs](https://grafana.com/))
+- Đurica Yuri Nikolić [@duricanikolic](https://github.com/duricanikolic) ([Grafana Labs](https://grafana.com/))
 
 Previous team members:
 
@@ -71,7 +89,12 @@ Previous team members:
 
 Maintainers lead one or more project(s) or parts thereof and serve as a point of conflict resolution amongst the contributors to this project. Ideally, maintainers are also team members, but exceptions are possible for suitable maintainers that, for whatever reason, are not yet team members.
 
-Changes in maintainership have to be announced on the [developers mailing list][devs]. They are decided by [rough consensus](#consensus) and formalized by changing the [`MAINTAINERS.md`][maintainers] file of the respective repository.
+Changes in maintainership follows this process:
+
+- For Grafana Cloud Hosted Metrics engineers, an engineer is automatically added as maintainer as soon as they join the on-call rotation.
+- For other people, changes in maintainership have to be announced on the [developers mailing list][devs] and they are decided by rough consensus.
+
+Changes in maintainership are formalized by modifying the [`MAINTAINERS.md`][maintainers] file.
 
 Maintainers are granted commit rights to all projects covered by this governance.
 
@@ -145,7 +168,7 @@ If there are multiple alternatives, members may vote for one or more alternative
 
 The new member is
 
-- added to the list of [team members](#team-members). Ideally by sending a PR of their own, at least approving said PR.
+- added to the list of [team members](#team-members) (`GOVERNANCE.md` and `MAINTAINERS.md`). Ideally by sending a PR of their own, at least approving said PR.
 - announced on the [developers mailing list][devs] by an existing team member. Ideally, the new member replies in this thread, acknowledging team membership.
 - added to the projects with commit rights.
 - added to the [team mailing list][team].

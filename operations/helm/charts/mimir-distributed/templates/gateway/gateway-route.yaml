@@ -11,13 +11,13 @@ metadata:
   {{- end }}
   namespace: {{ .Release.Namespace | quote }}
 spec:
-  host: {{ .Values.gateway.route.host }}
+  host: {{ tpl .Values.gateway.route.host  $ | quote }}
   to:
     kind: Service
     name: {{ include "mimir.gateway.service.name" . }}
     weight: 100
   port:
-    targetPort: http-metric
+    targetPort: http-metrics
 {{- with .Values.gateway.route.tls }}
   tls:
     {{- toYaml . | nindent 4 }}

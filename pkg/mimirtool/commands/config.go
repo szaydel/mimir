@@ -8,12 +8,12 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"slices"
 	"strings"
 
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/grafana/dskit/multierror"
 	"github.com/pkg/errors"
-	"golang.org/x/exp/slices"
-	"gopkg.in/alecthomas/kingpin.v2"
 
 	"github.com/grafana/mimir/pkg/mimirtool/config"
 )
@@ -35,7 +35,7 @@ type ConfigCommand struct {
 	gem bool
 }
 
-// Register rule related commands and flags with the kingpin application
+// Register config related commands and flags with the kingpin application.
 func (c *ConfigCommand) Register(app *kingpin.Application, _ EnvVarNames) {
 	configCmd := app.Command("config", "Work with Grafana Mimir configuration.")
 
@@ -107,7 +107,7 @@ func (c *ConfigCommand) output(yamlContents []byte, flags []string, notices conf
 		if path == "" {
 			return defaultWriter, func() {}, nil
 		}
-		outWriter, err := os.OpenFile(path, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0666)
+		outWriter, err := os.OpenFile(path, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0600)
 		if err != nil {
 			return nil, nil, errors.Wrap(err, "could not open "+path)
 		}

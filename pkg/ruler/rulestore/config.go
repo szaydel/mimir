@@ -7,29 +7,65 @@ package rulestore
 
 import (
 	"flag"
+	"fmt"
 	"reflect"
+	"strings"
 
-	"github.com/go-kit/log"
 	"github.com/google/go-cmp/cmp"
+	"github.com/grafana/dskit/cache"
 	"github.com/grafana/dskit/flagext"
 
-	"github.com/grafana/mimir/pkg/ruler/rulestore/local"
 	"github.com/grafana/mimir/pkg/storage/bucket"
 )
+
+const (
+	BackendLocal = "local"
+)
+
+var supportedCacheBackends = []string{cache.BackendMemcached, cache.BackendRedis}
 
 // Config configures a rule store.
 type Config struct {
 	bucket.Config `yaml:",inline"`
-	Local         local.Config `yaml:"local"`
+	Local         LocalStoreConfig `yaml:"local"`
+
+	// RulerCache holds the configuration used for the ruler storage cache.
+	RulerCache RulerCacheConfig `yaml:"cache"`
+}
+
+// RulerCacheConfig is configuration for the cache used by ruler storage as well as
+// additional ruler storage specific configuration.
+//
+// NOTE: This is temporary while caching of rule groups is being tested. This will be removed
+// in the future and cache.BackendConfig will be moved back to the Config struct above.
+type RulerCacheConfig struct {
+	// RuleGroupEnabled enables caching of rule group contents
+	RuleGroupEnabled bool `yaml:"rule_group_enabled" category:"experimental"`
+
+	// Cache holds the configuration used for the ruler storage cache.
+	Cache cache.BackendConfig `yaml:",inline"`
 }
 
 // RegisterFlags registers the backend storage config.
-func (cfg *Config) RegisterFlags(f *flag.FlagSet, logger log.Logger) {
+func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	prefix := "ruler-storage."
 
-	cfg.StorageBackendConfig.ExtraBackends = []string{local.Name}
+	cfg.StorageBackendConfig.ExtraBackends = []string{BackendLocal}
 	cfg.Local.RegisterFlagsWithPrefix(prefix, f)
-	cfg.RegisterFlagsWithPrefixAndDefaultDirectory(prefix, "ruler", f, logger)
+	cfg.RegisterFlagsWithPrefixAndDefaultDirectory(prefix, "ruler", f)
+
+	f.BoolVar(&cfg.RulerCache.RuleGroupEnabled, prefix+"cache.rule-group-enabled", false, "Enabling caching of rule group contents if a cache backend is configured.")
+	f.StringVar(&cfg.RulerCache.Cache.Backend, prefix+"cache.backend", "", fmt.Sprintf("Backend for ruler storage cache, if not empty. The cache is supported for any storage backend except %q. Supported values: %s.", BackendLocal, strings.Join(supportedCacheBackends, ", ")))
+	cfg.RulerCache.Cache.Memcached.RegisterFlagsWithPrefix(prefix+"cache.memcached.", f)
+	cfg.RulerCache.Cache.Redis.RegisterFlagsWithPrefix(prefix+"cache.redis.", f)
+}
+
+func (cfg *Config) Validate() error {
+	if err := cfg.Config.Validate(); err != nil {
+		return err
+	}
+
+	return cfg.RulerCache.Cache.Validate()
 }
 
 // IsDefaults returns true if the storage options have not been set.
@@ -39,6 +75,15 @@ func (cfg *Config) IsDefaults() bool {
 
 	// Note: cmp.Equal will panic if it encounters anything it cannot handle.
 	return cmp.Equal(*cfg, defaults, cmp.FilterPath(filterNonYaml, cmp.Ignore()), cmp.Comparer(equalSecrets))
+}
+
+type LocalStoreConfig struct {
+	Directory string `yaml:"directory"`
+}
+
+// RegisterFlagsWithPrefix registers flags with the input prefix.
+func (cfg *LocalStoreConfig) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
+	f.StringVar(&cfg.Directory, prefix+"local.directory", "", "Directory to scan for rules")
 }
 
 // Return true if the path contains a struct field with tag `yaml:"-"`.

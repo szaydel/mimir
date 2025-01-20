@@ -503,13 +503,29 @@ func TestShardSummer(t *testing.T) {
 			out:                    `sum(` + concatShards(3, `sum(rate(metric{__query_shard__="x_of_y"}[1m]))`) + `) > (sum(` + concatShards(3, `sum(rate(metric{__query_shard__="x_of_y"}[1m]))`) + `) / sum(` + concatShards(3, `count(rate(metric{__query_shard__="x_of_y"}[1m]))`) + `))`,
 			expectedShardedQueries: 9,
 		},
+		{
+			in:                     `group by (a, b) (metric)`,
+			out:                    `group by (a, b) (` + concatShards(3, `group by (a, b) (metric{__query_shard__="x_of_y"})`) + `)`,
+			expectedShardedQueries: 3,
+		},
+		{
+			in:                     `count by (a) (group by (a, b) (metric))`,
+			out:                    `count by (a) (group by (a, b) (` + concatShards(3, `group by (a, b) (metric{__query_shard__="x_of_y"})`) + `))`,
+			expectedShardedQueries: 3,
+		},
+		{
+			in:                     `count(group without () ({namespace="foo"}))`,
+			out:                    `count(group without() (` + concatShards(3, `group without() ({namespace="foo",__query_shard__="x_of_y"})`) + `))`,
+			expectedShardedQueries: 3,
+		},
 	} {
 		tt := tt
 
 		t.Run(tt.in, func(t *testing.T) {
 			stats := NewMapperStats()
-			mapper, err := NewSharding(context.Background(), 3, log.NewNopLogger(), stats)
+			summer, err := NewQueryShardSummer(context.Background(), 3, VectorSquasher, log.NewNopLogger(), stats)
 			require.NoError(t, err)
+			mapper := NewSharding(summer)
 			expr, err := parser.ParseExpr(tt.in)
 			require.NoError(t, err)
 			out, err := parser.ParseExpr(tt.out)
@@ -524,24 +540,32 @@ func TestShardSummer(t *testing.T) {
 }
 
 func concatShards(shards int, queryTemplate string) string {
-	queries := make([]string, shards)
+	queries := make([]EmbeddedQuery, shards)
 	for shard := range queries {
-		queries[shard] = strings.ReplaceAll(queryTemplate, "x_of_y", sharding.FormatShardIDLabelValue(uint64(shard), uint64(shards)))
+		queryStr := strings.ReplaceAll(queryTemplate, "x_of_y", sharding.FormatShardIDLabelValue(uint64(shard), uint64(shards)))
+		queries[shard] = NewEmbeddedQuery(queryStr, nil)
 	}
-	return concat(queries...)
+	return concatInner(queries...)
 }
 
-func concat(queries ...string) string {
-	exprs := make([]parser.Expr, 0, len(queries))
-	for _, q := range queries {
-		n, err := parser.ParseExpr(q)
+func concat(queryStrs ...string) string {
+	queries := make([]EmbeddedQuery, len(queryStrs))
+	for i, query := range queryStrs {
+		queries[i] = NewEmbeddedQuery(query, nil)
+	}
+	return concatInner(queries...)
+}
+
+func concatInner(rawQueries ...EmbeddedQuery) string {
+	queries := make([]EmbeddedQuery, len(rawQueries))
+	for i, q := range rawQueries {
+		n, err := parser.ParseExpr(q.Expr)
 		if err != nil {
 			panic(err)
 		}
-		exprs = append(exprs, n)
-
+		queries[i] = NewEmbeddedQuery(n.String(), q.Params)
 	}
-	mapped, err := vectorSquasher(exprs...)
+	mapped, err := VectorSquasher(queries...)
 	if err != nil {
 		panic(err)
 	}
@@ -557,12 +581,12 @@ func TestShardSummerWithEncoding(t *testing.T) {
 		{
 			shards:   3,
 			input:    `sum(rate(bar1{baz="blip"}[1m]))`,
-			expected: `sum(__embedded_queries__{__queries__="{\"Concat\":[\"sum(rate(bar1{__query_shard__=\\\"1_of_3\\\",baz=\\\"blip\\\"}[1m]))\",\"sum(rate(bar1{__query_shard__=\\\"2_of_3\\\",baz=\\\"blip\\\"}[1m]))\",\"sum(rate(bar1{__query_shard__=\\\"3_of_3\\\",baz=\\\"blip\\\"}[1m]))\"]}"})`,
+			expected: `sum(__embedded_queries__{__queries__="{\"Concat\":[{\"Expr\":\"sum(rate(bar1{__query_shard__=\\\"1_of_3\\\",baz=\\\"blip\\\"}[1m]))\"},{\"Expr\":\"sum(rate(bar1{__query_shard__=\\\"2_of_3\\\",baz=\\\"blip\\\"}[1m]))\"},{\"Expr\":\"sum(rate(bar1{__query_shard__=\\\"3_of_3\\\",baz=\\\"blip\\\"}[1m]))\"}]}"})`,
 		},
 	} {
 		t.Run(fmt.Sprintf("[%d]", i), func(t *testing.T) {
 			stats := NewMapperStats()
-			summer, err := newShardSummer(context.Background(), c.shards, vectorSquasher, log.NewNopLogger(), stats)
+			summer, err := NewQueryShardSummer(context.Background(), c.shards, VectorSquasher, log.NewNopLogger(), stats)
 			require.Nil(t, err)
 			expr, err := parser.ParseExpr(c.input)
 			require.Nil(t, err)

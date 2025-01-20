@@ -10,6 +10,8 @@ Doing so can be a helpful way of asking for assistance or to develop an idea.
 
 When you open a PR as a draft, add a short description of what you’re still working on, what you are seeking assistance with, or both.
 
+There is an automated GitHub action which closes PRs after 180 days of inactivity to keep the PR list clean. 30 days before closing, the GitHub action will add `stale` label to the PR. If you need more time, please remove the `stale` label.
+
 Before a piece of work is finished:
 
 - Organize it into one or more commits, and include a commit message for each that describes all of the changes that you made in that commit. It is more helpful to explain _why_ more than _what_, which are available via `git diff`.
@@ -106,7 +108,7 @@ Please see the dedicated "[Design patterns and Code conventions](design-patterns
 ## Documentation
 
 The Grafana Mimir documentation and the Helm chart _documentation_ for Mimir and GEM are compiled and published to [https://grafana.com/docs/mimir/latest/](https://grafana.com/docs/mimir/latest/) and [https://grafana.com/docs/helm-charts/mimir-distributed/latest/](https://grafana.com/docs/helm-charts/mimir-distributed/latest/). Run `make docs` to build and serve the documentation locally.
-For more detail on style and organisation of the documentation, refer to the dedicated page "[How to write documenentation](how-to-write-documentation.md)".
+For more detail on style and organisation of the documentation, refer to the dedicated page "[How to write documentation](how-to-write-documentation.md)".
 
 Note: if you attempt to view pages on GitHub, it's likely that you might find broken links or pages. That is expected and should not be addressed unless it is causing issues with the site that occur as part of the build.
 
@@ -116,9 +118,9 @@ We document the common user-visible errors so it is easy for the user to search 
 
 To add a new error:
 
-- Under `pkg/util/globalerror/errors.go`, create a new unique ID string as a constant. After your changes make it into a public release, do not change this string.
+- Under `pkg/util/globalerror/user.go`, create a new unique ID string as a constant. After your changes make it into a public release, do not change this string.
 - When returning the error, use one of the functions in `globalerror` to generate the message. If you return the same error from multiple places, create a new function to return that error so that its message string is defined in only one place. Then, add a simple test for that function to compare its actual output with the expected message which is defined as a hard-coded string.
-- Update the runbook in `docs/sources/mimir/operators-guide/mimir-runbooks/_index.md` with details about why the error happens, and if possible how to address it.
+- Update the runbook in `docs/sources/mimir/manage/mimir-runbooks/_index.md` with details about why the error happens, and if possible how to address it.
 
 ## Changelog
 

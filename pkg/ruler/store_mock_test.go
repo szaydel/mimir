@@ -10,16 +10,20 @@ import (
 	"encoding/base64"
 	"fmt"
 	"sync"
+	"testing"
 	"time"
+
+	"github.com/go-kit/log"
+	"github.com/grafana/dskit/cache"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/require"
+	"github.com/thanos-io/objstore"
 
 	"github.com/grafana/mimir/pkg/ruler/rulespb"
 	"github.com/grafana/mimir/pkg/ruler/rulestore"
+	"github.com/grafana/mimir/pkg/ruler/rulestore/bucketclient"
+	"github.com/grafana/mimir/pkg/storage/tsdb/bucketcache"
 )
-
-type mockRuleStore struct {
-	rules map[string]rulespb.RuleGroupList
-	mtx   sync.Mutex
-}
 
 var (
 	delim       = "/"
@@ -30,7 +34,7 @@ var (
 				Name:      "group1",
 				Namespace: "namespace1",
 				User:      "user1",
-				Rules:     []*rulespb.RuleDesc{mockRecordingRuleDesc("UP_RULE", "up"), mockAlertingRuleDesc("UP_ALERT", "up < 1")},
+				Rules:     []*rulespb.RuleDesc{createRecordingRule("UP_RULE", "up"), createAlertingRule("UP_ALERT", "up < 1")},
 				Interval:  interval,
 			},
 		},
@@ -39,12 +43,31 @@ var (
 				Name:      "group1",
 				Namespace: "namespace1",
 				User:      "user2",
-				Rules:     []*rulespb.RuleDesc{mockRecordingRuleDesc("UP_RULE", "up")},
+				Rules:     []*rulespb.RuleDesc{createRecordingRule("UP_RULE", "up")},
 				Interval:  interval,
 			},
 		},
 	}
 )
+
+func newInMemoryRuleStore(t *testing.T) (*cache.InstrumentedMockCache, *bucketclient.BucketRuleStore) {
+	bkt := objstore.NewInMemBucket()
+	mockCache := cache.NewInstrumentedMockCache()
+	cfg := bucketcache.NewCachingBucketConfig()
+	cfg.CacheIter("iter", mockCache, isNotTenantsDir, time.Minute, &bucketcache.JSONIterCodec{})
+	cfg.CacheGet("rules", mockCache, isRuleGroup, 1024^2, time.Minute, time.Minute, time.Minute)
+
+	cachingBkt, err := bucketcache.NewCachingBucket("rules", bkt, cfg, log.NewNopLogger(), prometheus.NewPedanticRegistry())
+	require.NoError(t, err)
+
+	return mockCache, bucketclient.NewBucketRuleStore(cachingBkt, nil, log.NewNopLogger())
+}
+
+type mockRuleStore struct {
+	rules        map[string]rulespb.RuleGroupList
+	missingRules rulespb.RuleGroupList
+	mtx          sync.Mutex
+}
 
 func newMockRuleStore(rules map[string]rulespb.RuleGroupList) *mockRuleStore {
 	return &mockRuleStore{
@@ -52,7 +75,15 @@ func newMockRuleStore(rules map[string]rulespb.RuleGroupList) *mockRuleStore {
 	}
 }
 
-func (m *mockRuleStore) ListAllUsers(_ context.Context) ([]string, error) {
+// setMissingRuleGroups configures the list of rule groups what will be returned as missing
+// from LoadRuleGroups().
+func (m *mockRuleStore) setMissingRuleGroups(missing rulespb.RuleGroupList) {
+	m.mtx.Lock()
+	m.missingRules = missing
+	m.mtx.Unlock()
+}
+
+func (m *mockRuleStore) ListAllUsers(_ context.Context, _ ...rulestore.Option) ([]string, error) {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
@@ -63,7 +94,7 @@ func (m *mockRuleStore) ListAllUsers(_ context.Context) ([]string, error) {
 	return result, nil
 }
 
-func (m *mockRuleStore) ListRuleGroupsForUserAndNamespace(_ context.Context, userID, namespace string) (rulespb.RuleGroupList, error) {
+func (m *mockRuleStore) ListRuleGroupsForUserAndNamespace(_ context.Context, userID, namespace string, _ ...rulestore.Option) (rulespb.RuleGroupList, error) {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
@@ -84,7 +115,7 @@ func (m *mockRuleStore) ListRuleGroupsForUserAndNamespace(_ context.Context, use
 	return result, nil
 }
 
-func (m *mockRuleStore) LoadRuleGroups(ctx context.Context, groupsToLoad map[string]rulespb.RuleGroupList) error {
+func (m *mockRuleStore) LoadRuleGroups(_ context.Context, groupsToLoad map[string]rulespb.RuleGroupList) (rulespb.RuleGroupList, error) {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
@@ -103,12 +134,12 @@ func (m *mockRuleStore) LoadRuleGroups(ctx context.Context, groupsToLoad map[str
 			key := user + delim + base64.URLEncoding.EncodeToString([]byte(namespace)) + delim + base64.URLEncoding.EncodeToString([]byte(name))
 			mgr, ok := gm[key]
 			if !ok {
-				return fmt.Errorf("failed to get rule group user %s", gr.GetUser())
+				return nil, fmt.Errorf("failed to get rule group user %s", gr.GetUser())
 			}
 			*gr = *mgr
 		}
 	}
-	return nil
+	return m.missingRules, nil
 }
 
 func (m *mockRuleStore) GetRuleGroup(_ context.Context, userID string, namespace string, group string) (*rulespb.RuleGroupDesc, error) {
@@ -133,7 +164,7 @@ func (m *mockRuleStore) GetRuleGroup(_ context.Context, userID string, namespace
 	return nil, rulestore.ErrGroupNotFound
 }
 
-func (m *mockRuleStore) SetRuleGroup(ctx context.Context, userID string, namespace string, group *rulespb.RuleGroupDesc) error {
+func (m *mockRuleStore) SetRuleGroup(_ context.Context, userID string, namespace string, group *rulespb.RuleGroupDesc) error {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
@@ -158,7 +189,7 @@ func (m *mockRuleStore) SetRuleGroup(ctx context.Context, userID string, namespa
 	return nil
 }
 
-func (m *mockRuleStore) DeleteRuleGroup(ctx context.Context, userID string, namespace string, group string) error {
+func (m *mockRuleStore) DeleteRuleGroup(_ context.Context, userID string, namespace string, group string) error {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
@@ -182,7 +213,7 @@ func (m *mockRuleStore) DeleteRuleGroup(ctx context.Context, userID string, name
 	return nil
 }
 
-func (m *mockRuleStore) DeleteNamespace(ctx context.Context, userID, namespace string) error {
+func (m *mockRuleStore) DeleteNamespace(_ context.Context, userID, namespace string) error {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 

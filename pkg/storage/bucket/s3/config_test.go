@@ -6,13 +6,16 @@
 package s3
 
 import (
+	"bytes"
 	"encoding/base64"
 	"net/http"
 	"testing"
 
+	s3_service "github.com/aws/aws-sdk-go/service/s3"
 	"github.com/grafana/dskit/flagext"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 )
 
 func TestSSEConfig_Validate(t *testing.T) {
@@ -76,8 +79,25 @@ func TestConfig_Validate(t *testing.T) {
 					BucketName:       "mimir-block",
 					SSE:              *sseCfg,
 					SignatureVersion: SignatureVersionV4,
+					StorageClass:     s3_service.StorageClassStandard,
 				}
 				return cfg
+			},
+		},
+		"should fail if invalid storage class is set": {
+			setup: func() *Config {
+				return &Config{
+					SignatureVersion: SignatureVersionV2,
+					StorageClass:     "foo",
+				}
+			},
+			expected: errUnsupportedStorageClass,
+		},
+		"should pass if valid storage signature version is set": {
+			setup: func() *Config {
+				return &Config{
+					SignatureVersion: SignatureVersionV4, StorageClass: s3_service.StorageClassStandard,
+				}
 			},
 		},
 		"should fail on invalid endpoint prefix": {
@@ -86,9 +106,47 @@ func TestConfig_Validate(t *testing.T) {
 					Endpoint:         "mimir-blocks.s3.eu-central-1.amazonaws.com",
 					BucketName:       "mimir-blocks",
 					SignatureVersion: SignatureVersionV4,
+					StorageClass:     s3_service.StorageClassStandard,
 				}
 			},
 			expected: errInvalidEndpointPrefix,
+		},
+		"should pass if native_aws_auth_enabled is set": {
+			setup: func() *Config {
+				return &Config{
+					SignatureVersion:     SignatureVersionV4,
+					NativeAWSAuthEnabled: true,
+				}
+			},
+		},
+		"should pass with using sts endpoint": {
+			setup: func() *Config {
+				sseCfg := &SSEConfig{}
+				flagext.DefaultValues(sseCfg)
+				cfg := &Config{
+					BucketName:       "mimir-block",
+					SSE:              *sseCfg,
+					SignatureVersion: SignatureVersionV4,
+					StorageClass:     s3_service.StorageClassStandard,
+					STSEndpoint:      "https://sts.eu-central-1.amazonaws.com",
+				}
+				return cfg
+			},
+		},
+		"should not pass with using sts endpoint as its using an invalid url": {
+			setup: func() *Config {
+				sseCfg := &SSEConfig{}
+				flagext.DefaultValues(sseCfg)
+				cfg := &Config{
+					BucketName:       "mimir-block",
+					SSE:              *sseCfg,
+					SignatureVersion: SignatureVersionV4,
+					StorageClass:     s3_service.StorageClassStandard,
+					STSEndpoint:      "sts.eu-central-1.amazonaws.com",
+				}
+				return cfg
+			},
+			expected: errInvalidSTSEndpoint,
 		},
 	}
 
@@ -153,4 +211,34 @@ func TestParseKMSEncryptionContext(t *testing.T) {
 	actual, err = parseKMSEncryptionContext(`{"department": "10103.0"}`)
 	assert.NoError(t, err)
 	assert.Equal(t, expected, actual)
+}
+
+func TestConfigParsesCredentialsInlineWithSessionToken(t *testing.T) {
+	var cfg = Config{}
+	yamlCfg := `
+access_key_id: access key id
+secret_access_key: secret access key
+session_token: session token
+`
+	err := yaml.Unmarshal([]byte(yamlCfg), &cfg)
+	require.NoError(t, err)
+
+	require.Equal(t, cfg.AccessKeyID, "access key id")
+	require.Equal(t, cfg.SecretAccessKey.String(), "secret access key")
+	require.Equal(t, cfg.SessionToken.String(), "session token")
+}
+
+func TestConfigRedactsCredentials(t *testing.T) {
+	cfg := Config{
+		AccessKeyID:     "access key id",
+		SecretAccessKey: flagext.SecretWithValue("secret access key"),
+		SessionToken:    flagext.SecretWithValue("session token"),
+	}
+
+	output, err := yaml.Marshal(cfg)
+	require.NoError(t, err)
+
+	require.True(t, bytes.Contains(output, []byte("access key id")))
+	require.False(t, bytes.Contains(output, []byte("secret access id")))
+	require.False(t, bytes.Contains(output, []byte("session token")))
 }

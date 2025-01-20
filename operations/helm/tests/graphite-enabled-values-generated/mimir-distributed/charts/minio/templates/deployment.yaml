@@ -4,10 +4,9 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: graphite-enabled-values-minio
-  namespace: "citestns"
   labels:
     app: minio
-    chart: minio-5.0.4
+    chart: minio-5.4.0
     release: graphite-enabled-values
     heritage: Helm
 spec:
@@ -28,19 +27,20 @@ spec:
         app: minio
         release: graphite-enabled-values
       annotations:
-        checksum/secrets: 0dcb9b9731a22a70c3c45ef50545088b50f8e43ba7c9e72dd081ffbbe8700155
-        checksum/config: 2ecfb40abbd8d0fd666fbb4e67bddc374a39dc9d4005198c327d4efc4e271638
+        checksum/secrets: 76f557adc3f31b4d2c8f7f79e520c7ed20479ea01f4d9a2662c67b9a3b141166
+        checksum/config: 583632031ac23c3af4304637a928e9c953e5c5e00451ba528f6d8d9898222663
     spec:
       securityContext:
-        runAsUser: 1000
-        runAsGroup: 1000
+        
         fsGroup: 1000
         fsGroupChangePolicy: OnRootMismatch
-
+        runAsGroup: 1000
+        runAsUser: 1000
+      
       serviceAccountName: minio-sa
       containers:
         - name: minio
-          image: "quay.io/minio/minio:RELEASE.2022-12-12T19-27-27Z"
+          image: "quay.io/minio/minio:RELEASE.2024-12-18T13-15-44Z"
           imagePullPolicy: IfNotPresent
           command:
             - "/bin/sh"
@@ -73,7 +73,9 @@ spec:
           resources:
             requests:
               cpu: 100m
-              memory: 128Mi      
+              memory: 128Mi
+          securityContext: 
+            readOnlyRootFilesystem: false      
       volumes:
         - name: export
           persistentVolumeClaim:

@@ -24,6 +24,7 @@ spec:
         app.kubernetes.io/instance: test-enterprise-k8s-1.25-values
         app.kubernetes.io/managed-by: Helm
         app.kubernetes.io/component: tokengen
+      annotations:
       namespace: "citestns"
     spec:
       serviceAccountName: test-enterprise-k8s-1.25-values-mimir
@@ -50,8 +51,6 @@ spec:
               mountPath: /license
             - name: active-queries
               mountPath: /active-query-tracker
-          env:
-          envFrom:
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

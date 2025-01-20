@@ -11,11 +11,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-kit/log"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/common/promslog"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/util/annotations"
 	"github.com/stretchr/testify/require"
 
 	"github.com/grafana/mimir/pkg/mimirpb"
@@ -93,7 +94,7 @@ func runPromQLAndGetJSONResult(t *testing.T, query string, ts mimirpb.TimeSeries
 	tq := &testQueryable{ts: newTimeSeriesSeriesSet([]mimirpb.TimeSeries{ts})}
 
 	engine := promql.NewEngine(promql.EngineOpts{
-		Logger:     log.NewNopLogger(),
+		Logger:     promslog.NewNopLogger(),
 		Timeout:    10 * time.Second,
 		MaxSamples: 1e6,
 	})
@@ -101,10 +102,11 @@ func runPromQLAndGetJSONResult(t *testing.T, query string, ts mimirpb.TimeSeries
 	start := model.Time(ts.Samples[0].TimestampMs).Time()
 	end := model.Time(ts.Samples[len(ts.Samples)-1].TimestampMs).Time()
 
-	q, err := engine.NewRangeQuery(tq, nil, query, start, end, step)
+	ctx := context.Background()
+	q, err := engine.NewRangeQuery(ctx, tq, nil, query, start, end, step)
 	require.NoError(t, err)
 
-	res := q.Exec(context.Background())
+	res := q.Exec(ctx)
 	require.NoError(t, err)
 
 	out, err := json.Marshal(res)
@@ -117,7 +119,7 @@ type testQueryable struct {
 	ts storage.SeriesSet
 }
 
-func (t *testQueryable) Querier(_ context.Context, _, _ int64) (storage.Querier, error) {
+func (t *testQueryable) Querier(_, _ int64) (storage.Querier, error) {
 	return testQuerier{ts: t.ts}, nil
 }
 
@@ -125,15 +127,15 @@ type testQuerier struct {
 	ts storage.SeriesSet
 }
 
-func (m testQuerier) Select(_ bool, _ *storage.SelectHints, _ ...*labels.Matcher) storage.SeriesSet {
+func (m testQuerier) Select(context.Context, bool, *storage.SelectHints, ...*labels.Matcher) storage.SeriesSet {
 	return m.ts
 }
 
-func (m testQuerier) LabelValues(name string, matchers ...*labels.Matcher) ([]string, storage.Warnings, error) {
+func (m testQuerier) LabelValues(context.Context, string, *storage.LabelHints, ...*labels.Matcher) ([]string, annotations.Annotations, error) {
 	return nil, nil, nil
 }
 
-func (m testQuerier) LabelNames(matchers ...*labels.Matcher) ([]string, storage.Warnings, error) {
+func (m testQuerier) LabelNames(context.Context, *storage.LabelHints, ...*labels.Matcher) ([]string, annotations.Annotations, error) {
 	return nil, nil, nil
 }
 

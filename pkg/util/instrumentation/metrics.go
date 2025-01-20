@@ -9,25 +9,27 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"time"
 
+	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/gorilla/mux"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-
-	util_log "github.com/grafana/mimir/pkg/util/log"
 )
 
 type MetricsServer struct {
 	port     int
 	registry *prometheus.Registry
+	logger   log.Logger
 	srv      *http.Server
 }
 
 // NewMetricsServer returns a server exposing Prometheus metrics.
-func NewMetricsServer(port int, registry *prometheus.Registry) *MetricsServer {
+func NewMetricsServer(port int, registry *prometheus.Registry, logger log.Logger) *MetricsServer {
 	return &MetricsServer{
 		port:     port,
+		logger:   logger,
 		registry: registry,
 	}
 }
@@ -44,12 +46,14 @@ func (s *MetricsServer) Start() error {
 	router.Handle("/metrics", promhttp.HandlerFor(s.registry, promhttp.HandlerOpts{}))
 
 	s.srv = &http.Server{
-		Handler: router,
+		Handler:      router,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
 	}
 
 	go func() {
 		if err := s.srv.Serve(listener); err != nil {
-			level.Error(util_log.Logger).Log("msg", "metrics server terminated", "err", err)
+			level.Error(s.logger).Log("msg", "metrics server terminated", "err", err)
 		}
 	}()
 

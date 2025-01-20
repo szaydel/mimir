@@ -6,7 +6,9 @@
 package batch
 
 import (
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/prometheus/prometheus/util/zeropool"
 
 	"github.com/grafana/mimir/pkg/storage/chunk"
 )
@@ -15,14 +17,21 @@ type nonOverlappingIterator struct {
 	curr   int
 	chunks []GenericChunk
 	iter   chunkIterator
+	// id is used to detect when the iterator has changed when merging
+	id int
 }
 
-// newNonOverlappingIterator returns a single iterator over an slice of sorted,
+// newNonOverlappingIterator returns a single iterator over a slice of sorted,
 // non-overlapping iterators.
-func newNonOverlappingIterator(chunks []GenericChunk) *nonOverlappingIterator {
-	it := &nonOverlappingIterator{
-		chunks: chunks,
+func newNonOverlappingIterator(it *nonOverlappingIterator, id int, chunks []GenericChunk, hPool *zeropool.Pool[*histogram.Histogram], fhPool *zeropool.Pool[*histogram.FloatHistogram]) *nonOverlappingIterator {
+	if it == nil {
+		it = &nonOverlappingIterator{}
 	}
+	it.id = id
+	it.chunks = chunks
+	it.curr = 0
+	it.iter.hPool = hPool
+	it.iter.fhPool = fhPool
 	it.iter.reset(it.chunks[0])
 	return it
 }

@@ -6,6 +6,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -14,60 +15,93 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
 
-	"cloud.google.com/go/storage"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/concurrency"
 	"github.com/grafana/dskit/flagext"
+	"github.com/grafana/dskit/tenant"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"google.golang.org/api/iterator"
 
 	"github.com/grafana/mimir/pkg/storage/tsdb/block"
-	"github.com/grafana/mimir/pkg/storage/tsdb/bucketindex"
-	"github.com/grafana/mimir/pkg/storage/tsdb/metadata"
-)
-
-const (
-	delim = "/" // Used by Mimir to delimit tenants and blocks, and objects within blocks.
+	"github.com/grafana/mimir/pkg/util/objtools"
 )
 
 type config struct {
-	sourceBucket      string
-	destBucket        string
-	minBlockDuration  time.Duration
-	minTime           flagext.Time
-	maxTime           flagext.Time
-	tenantConcurrency int
-	blocksConcurrency int
-	copyPeriod        time.Duration
-	enabledUsers      flagext.StringSliceCSV
-	disabledUsers     flagext.StringSliceCSV
-	dryRun            bool
-
-	httpListen string
+	copyConfig                      objtools.CopyBucketConfig
+	minBlockDuration                time.Duration
+	minTime                         flagext.Time
+	maxTime                         flagext.Time
+	tenantConcurrency               int
+	blockConcurrency                int
+	copyPeriod                      time.Duration
+	enabledUsers                    flagext.StringSliceCSV
+	disabledUsers                   flagext.StringSliceCSV
+	userMapping                     flagext.StringSliceCSV
+	dryRun                          bool
+	skipNoCompactBlockDurationCheck bool
+	httpListen                      string
 }
 
-func (c *config) RegisterFlags(f *flag.FlagSet) {
-	f.StringVar(&c.sourceBucket, "source-bucket", "", "Source GCS bucket with blocks.")
-	f.StringVar(&c.destBucket, "destination-bucket", "", "Destination GCS bucket with blocks.")
+func (c *config) registerFlags(f *flag.FlagSet) {
+	c.copyConfig.RegisterFlags(f)
 	f.DurationVar(&c.minBlockDuration, "min-block-duration", 0, "If non-zero, ignore blocks that cover block range smaller than this.")
 	f.Var(&c.minTime, "min-time", fmt.Sprintf("If set, only blocks with MinTime >= this value are copied. The supported time format is %q.", time.RFC3339))
 	f.Var(&c.maxTime, "max-time", fmt.Sprintf("If set, only blocks with MaxTime <= this value are copied. The supported time format is %q.", time.RFC3339))
 	f.IntVar(&c.tenantConcurrency, "tenant-concurrency", 5, "How many tenants to process at once.")
-	f.IntVar(&c.blocksConcurrency, "block-concurrency", 5, "How many blocks to copy at once per tenant.")
+	f.IntVar(&c.blockConcurrency, "block-concurrency", 5, "How many blocks to copy at once per tenant.")
 	f.DurationVar(&c.copyPeriod, "copy-period", 0, "How often to repeat the copy. If set to 0, copy is done once, and the program stops. Otherwise, the program keeps running and copying blocks until it is terminated.")
 	f.Var(&c.enabledUsers, "enabled-users", "If not empty, only blocks for these users are copied.")
 	f.Var(&c.disabledUsers, "disabled-users", "If not empty, blocks for these users are not copied.")
+	f.Var(&c.userMapping, "user-mapping", "A comma-separated list of (source user):(destination user). If a user is not mapped then its destination user is assumed to be identical.")
+	f.BoolVar(&c.dryRun, "dry-run", false, "Don't perform any copy; only log what would happen.")
+	f.BoolVar(&c.skipNoCompactBlockDurationCheck, "skip-no-compact-block-duration-check", false, "If set, blocks marked as no-compact are not checked against min-block-duration.")
 	f.StringVar(&c.httpListen, "http-listen-address", ":8080", "HTTP listen address.")
-	f.BoolVar(&c.dryRun, "dry-run", false, "Don't perform copy; only log what would happen.")
+}
+
+func (c *config) validate() error {
+	if err := c.copyConfig.Validate(); err != nil {
+		return err
+	}
+	if c.tenantConcurrency < 1 {
+		return fmt.Errorf("-tenant-concurrency must be positive")
+	}
+	if c.blockConcurrency < 1 {
+		return fmt.Errorf("-block-concurrency must be positive")
+	}
+	if c.copyPeriod < 0 {
+		return fmt.Errorf("-copy-period must be non-negative")
+	}
+	return nil
+}
+
+func (c *config) parseUserMapping() (map[string]string, error) {
+	m := make(map[string]string, len(c.userMapping))
+	for _, mapping := range c.userMapping {
+		splitMapping := strings.Split(mapping, ":")
+		if len(splitMapping) != 2 || slices.Contains(splitMapping, "") {
+			return nil, fmt.Errorf("invalid user mapping: %s", mapping)
+		}
+		for _, id := range splitMapping {
+			if err := tenant.ValidTenantID(id); err != nil {
+				return nil, err
+			}
+		}
+		source := splitMapping[0]
+		if _, ok := m[source]; ok {
+			return nil, fmt.Errorf("multiple user mappings for source user: %s", source)
+		}
+		m[source] = splitMapping[1]
+	}
+	return m, nil
 }
 
 type metrics struct {
@@ -99,18 +133,31 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 }
 
 func main() {
-	cfg := config{}
-	cfg.RegisterFlags(flag.CommandLine)
+	// Clean up all flags registered via init() methods of 3rd-party libraries.
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
-	flag.Parse()
+	cfg := config{}
+	cfg.registerFlags(flag.CommandLine)
+
+	// Parse CLI arguments.
+	if err := flagext.ParseFlagsWithoutArguments(flag.CommandLine); err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+
+	if err := cfg.validate(); err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+
+	userMapping, err := cfg.parseUserMapping()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
+	}
 
 	logger := log.NewLogfmtLogger(os.Stdout)
 	logger = log.With(logger, "ts", log.DefaultTimestampUTC)
-
-	if cfg.sourceBucket == "" || cfg.destBucket == "" || cfg.sourceBucket == cfg.destBucket {
-		level.Error(logger).Log("msg", "no source or destination bucket, or buckets are the same")
-		os.Exit(1)
-	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -120,14 +167,18 @@ func main() {
 	go func() {
 		level.Info(logger).Log("msg", "HTTP server listening on "+cfg.httpListen)
 		http.Handle("/metrics", promhttp.Handler())
-		err := http.ListenAndServe(cfg.httpListen, nil)
-		if err != nil {
+		server := &http.Server{
+			Addr:         cfg.httpListen,
+			ReadTimeout:  10 * time.Second,
+			WriteTimeout: 10 * time.Second,
+		}
+		if err := server.ListenAndServe(); err != nil {
 			level.Error(logger).Log("msg", "failed to start HTTP server")
 			os.Exit(1)
 		}
 	}()
 
-	success := runCopy(ctx, cfg, logger, m)
+	success := runCopy(ctx, cfg, userMapping, logger, m)
 	if cfg.copyPeriod <= 0 {
 		if success {
 			os.Exit(0)
@@ -141,14 +192,14 @@ func main() {
 	for ctx.Err() == nil {
 		select {
 		case <-t.C:
-			_ = runCopy(ctx, cfg, logger, m)
+			_ = runCopy(ctx, cfg, userMapping, logger, m)
 		case <-ctx.Done():
 		}
 	}
 }
 
-func runCopy(ctx context.Context, cfg config, logger log.Logger, m *metrics) bool {
-	err := copyBlocks(ctx, cfg, logger, m)
+func runCopy(ctx context.Context, cfg config, userMapping map[string]string, logger log.Logger, m *metrics) bool {
+	err := copyBlocks(ctx, cfg, userMapping, logger, m)
 	if err != nil {
 		m.copyCyclesFailed.Inc()
 		level.Error(logger).Log("msg", "failed to copy blocks", "err", err, "dryRun", cfg.dryRun)
@@ -160,10 +211,19 @@ func runCopy(ctx context.Context, cfg config, logger log.Logger, m *metrics) boo
 	return true
 }
 
-func copyBlocks(ctx context.Context, cfg config, logger log.Logger, m *metrics) error {
+func copyBlocks(ctx context.Context, cfg config, userMapping map[string]string, logger log.Logger, m *metrics) error {
+	sourceBucket, destBucket, copyFunc, err := cfg.copyConfig.ToBuckets(ctx)
+	if err != nil {
+		return err
+	}
+
+	tenants, err := listTenants(ctx, sourceBucket)
+	if err != nil {
+		return errors.Wrapf(err, "failed to list tenants")
+	}
+
 	enabledUsers := map[string]struct{}{}
 	disabledUsers := map[string]struct{}{}
-
 	for _, u := range cfg.enabledUsers {
 		enabledUsers[u] = struct{}{}
 	}
@@ -171,36 +231,28 @@ func copyBlocks(ctx context.Context, cfg config, logger log.Logger, m *metrics) 
 		disabledUsers[u] = struct{}{}
 	}
 
-	client, err := storage.NewClient(ctx)
-	if err != nil {
-		return errors.Wrapf(err, "failed to create client")
-	}
-
-	sourceBucket := client.Bucket(cfg.sourceBucket)
-	destBucket := client.Bucket(cfg.destBucket)
-
-	tenants, err := listTenants(ctx, sourceBucket)
-	if err != nil {
-		return errors.Wrapf(err, "failed to list tenants")
-	}
-
-	return concurrency.ForEachUser(ctx, tenants, cfg.tenantConcurrency, func(ctx context.Context, tenantID string) error {
-		if !isAllowedUser(enabledUsers, disabledUsers, tenantID) {
+	return concurrency.ForEachUser(ctx, tenants, cfg.tenantConcurrency, func(ctx context.Context, sourceTenantID string) error {
+		if !isAllowedUser(enabledUsers, disabledUsers, sourceTenantID) {
 			return nil
 		}
 
-		logger := log.With(logger, "tenantID", tenantID)
-
-		blocks, err := listBlocksForTenant(ctx, sourceBucket, tenantID)
-		if err != nil {
-			level.Error(logger).Log("msg", "failed to list blocks for tenant", "err", err)
-			return errors.Wrapf(err, "failed to list blocks for tenant %v", tenantID)
+		destinationTenantID, ok := userMapping[sourceTenantID]
+		if !ok {
+			destinationTenantID = sourceTenantID
 		}
 
-		markers, err := listBlockMarkersForTenant(ctx, sourceBucket, tenantID, cfg.destBucket)
+		logger := log.With(logger, "sourceTenantID", sourceTenantID, "destinationTenantID", destinationTenantID)
+
+		blocks, err := listBlocksForTenant(ctx, sourceBucket, sourceTenantID)
+		if err != nil {
+			level.Error(logger).Log("msg", "failed to list blocks for tenant", "err", err)
+			return errors.Wrapf(err, "failed to list blocks for tenant %v", sourceTenantID)
+		}
+
+		markers, err := listBlockMarkersForTenant(ctx, sourceBucket, sourceTenantID, destBucket.Name())
 		if err != nil {
 			level.Error(logger).Log("msg", "failed to list blocks markers for tenant", "err", err)
-			return errors.Wrapf(err, "failed to list block markers for tenant %v", tenantID)
+			return errors.Wrapf(err, "failed to list block markers for tenant %v", sourceTenantID)
 		}
 
 		var blockIDs []string
@@ -209,7 +261,7 @@ func copyBlocks(ctx context.Context, cfg config, logger log.Logger, m *metrics) 
 		}
 
 		// We use ForEachUser here to keep processing other blocks, if the block fails. We pass block IDs as "users".
-		return concurrency.ForEachUser(ctx, blockIDs, cfg.blocksConcurrency, func(ctx context.Context, blockIDStr string) error {
+		return concurrency.ForEachUser(ctx, blockIDs, cfg.blockConcurrency, func(ctx context.Context, blockIDStr string) error {
 			blockID, err := ulid.Parse(blockIDStr)
 			if err != nil {
 				return err
@@ -230,7 +282,7 @@ func copyBlocks(ctx context.Context, cfg config, logger log.Logger, m *metrics) 
 				return nil
 			}
 
-			blockMeta, err := loadMetaJSONFile(ctx, sourceBucket, tenantID, blockID)
+			blockMeta, err := loadMetaJSONFile(ctx, sourceBucket, sourceTenantID, blockID)
 			if err != nil {
 				level.Error(logger).Log("msg", "skipping block, failed to read meta.json file", "err", err)
 				return err
@@ -258,7 +310,8 @@ func copyBlocks(ctx context.Context, cfg config, logger log.Logger, m *metrics) 
 				return nil
 			}
 
-			if cfg.minBlockDuration > 0 {
+			skipDurationCheck := cfg.skipNoCompactBlockDurationCheck && markers[blockID].noCompact
+			if !skipDurationCheck && cfg.minBlockDuration > 0 {
 				blockDuration := time.Millisecond * time.Duration(blockMeta.MaxTime-blockMeta.MinTime)
 				if blockDuration < cfg.minBlockDuration {
 					level.Debug(logger).Log("msg", "skipping block, block duration is less than the configured minimum duration", "block_duration", blockDuration, "configured_min_duration", cfg.minBlockDuration)
@@ -273,7 +326,7 @@ func copyBlocks(ctx context.Context, cfg config, logger log.Logger, m *metrics) 
 
 			level.Info(logger).Log("msg", "copying block")
 
-			err = copySingleBlock(ctx, tenantID, blockID, markers[blockID], sourceBucket, destBucket)
+			err = copySingleBlock(ctx, sourceTenantID, destinationTenantID, blockID, markers[blockID], sourceBucket, copyFunc)
 			if err != nil {
 				m.blocksCopyFailed.Inc()
 				level.Error(logger).Log("msg", "failed to copy block", "err", err)
@@ -283,7 +336,9 @@ func copyBlocks(ctx context.Context, cfg config, logger log.Logger, m *metrics) 
 			m.blocksCopied.Inc()
 			level.Info(logger).Log("msg", "block copied successfully")
 
-			err = uploadCopiedMarkerFile(ctx, sourceBucket, tenantID, blockID, cfg.destBucket)
+			// Note that only the blockID and destination bucket are considered in the copy marker.
+			// If multiple tenants in the same destination bucket are copied to from the same source tenant the markers will currently clash.
+			err = uploadCopiedMarkerFile(ctx, sourceBucket, sourceTenantID, blockID, destBucket.Name())
 			if err != nil {
 				level.Error(logger).Log("msg", "failed to upload copied-marker file for block", "block", blockID.String(), "err", err)
 				return err
@@ -310,39 +365,43 @@ func isAllowedUser(enabled map[string]struct{}, disabled map[string]struct{}, te
 }
 
 // This method copies files within single TSDB block to a destination bucket.
-func copySingleBlock(ctx context.Context, tenantID string, blockID ulid.ULID, markers blockMarkers, srcBkt, destBkt *storage.BucketHandle) error {
-	paths, err := listPrefix(ctx, srcBkt, tenantID+delim+blockID.String(), true)
+func copySingleBlock(ctx context.Context, sourceTenantID, destinationTenantID string, blockID ulid.ULID, markers blockMarkers, srcBkt objtools.Bucket, copyFunc objtools.CopyFunc) error {
+	result, err := srcBkt.List(ctx, objtools.ListOptions{
+		Prefix:    sourceTenantID + objtools.Delim + blockID.String(),
+		Recursive: true,
+	})
 	if err != nil {
-		return errors.Wrapf(err, "copySingleBlock: failed to list block files for %v/%v", tenantID, blockID.String())
+		return errors.Wrapf(err, "copySingleBlock: failed to list block files for %v/%v", sourceTenantID, blockID.String())
 	}
+	paths := result.ToNames()
 
 	// Reorder paths, move meta.json at the end. We want to upload meta.json as last file, because it signals to Mimir that
 	// block upload has finished.
-	for ix := 0; ix < len(paths); ix++ {
-		if paths[ix] == block.MetaFilename && ix < len(paths)-1 {
-			paths = append(paths[:ix], paths[ix+1:]...)
-			paths = append(paths, block.MetaFilename)
-		} else {
-			ix++
+	length := len(paths)
+	for i := length - 1; i >= 0; i-- {
+		if strings.HasSuffix(paths[i], block.MetaFilename) {
+			paths[i], paths[length-1] = paths[length-1], paths[i]
+			break
 		}
-	}
-
-	// Generate the full paths.
-	for idx, p := range paths {
-		paths[idx] = tenantID + delim + blockID.String() + delim + p
 	}
 
 	// Copy global markers too (skipping deletion mark because deleted blocks are not copied by this tool).
 	if markers.noCompact {
-		paths = append(paths, tenantID+delim+bucketindex.NoCompactMarkFilepath(blockID))
+		paths = append(paths, sourceTenantID+objtools.Delim+block.NoCompactMarkFilepath(blockID))
 	}
 
-	for _, fullPath := range paths {
-		srcObj := srcBkt.Object(fullPath)
-		destObj := destBkt.Object(fullPath)
+	isCrossTenant := sourceTenantID != destinationTenantID
 
-		copier := destObj.CopierFrom(srcObj)
-		_, err := copier.Run(ctx)
+	for _, fullPath := range paths {
+		options := objtools.CopyOptions{}
+		if isCrossTenant {
+			after, found := strings.CutPrefix(fullPath, sourceTenantID)
+			if !found {
+				return fmt.Errorf("unexpected object path that does not begin with sourceTenantID: path=%s, sourceTenantID=%s", fullPath, sourceTenantID)
+			}
+			options.DestinationObjectName = destinationTenantID + after
+		}
+		err := copyFunc(ctx, fullPath, options)
 		if err != nil {
 			return errors.Wrapf(err, "copySingleBlock: failed to copy %v", fullPath)
 		}
@@ -351,56 +410,53 @@ func copySingleBlock(ctx context.Context, tenantID string, blockID ulid.ULID, ma
 	return nil
 }
 
-func uploadCopiedMarkerFile(ctx context.Context, bkt *storage.BucketHandle, tenantID string, blockID ulid.ULID, targetBucketName string) error {
-	obj := bkt.Object(tenantID + delim + CopiedToBucketMarkFilename(blockID, targetBucketName))
-
-	w := obj.NewWriter(ctx)
-
-	return errors.Wrap(w.Close(), "uploadCopiedMarkerFile")
+func uploadCopiedMarkerFile(ctx context.Context, bkt objtools.Bucket, tenantID string, blockID ulid.ULID, targetBucketName string) error {
+	objectName := tenantID + objtools.Delim + CopiedToBucketMarkFilename(blockID, targetBucketName)
+	err := bkt.Upload(ctx, objectName, bytes.NewReader([]byte{}), 0)
+	return errors.Wrap(err, "uploadCopiedMarkerFile")
 }
 
-func loadMetaJSONFile(ctx context.Context, bkt *storage.BucketHandle, tenantID string, blockID ulid.ULID) (metadata.Meta, error) {
-	obj := bkt.Object(tenantID + delim + blockID.String() + delim + block.MetaFilename)
-	r, err := obj.NewReader(ctx)
+func loadMetaJSONFile(ctx context.Context, bkt objtools.Bucket, tenantID string, blockID ulid.ULID) (block.Meta, error) {
+	objectName := tenantID + objtools.Delim + blockID.String() + objtools.Delim + block.MetaFilename
+	r, err := bkt.Get(ctx, objectName, objtools.GetOptions{})
 	if err != nil {
-		return metadata.Meta{}, errors.Wrapf(err, "failed to read %v", obj.ObjectName())
+		return block.Meta{}, errors.Wrapf(err, "failed to read %v", objectName)
 	}
 
-	var m metadata.Meta
+	var m block.Meta
 
 	dec := json.NewDecoder(r)
 	err = dec.Decode(&m)
 	closeErr := r.Close() // do this before any return.
 
 	if err != nil {
-		return metadata.Meta{}, errors.Wrapf(err, "read %v", obj.ObjectName())
+		return block.Meta{}, errors.Wrapf(err, "read %v", objectName)
 	}
 	if closeErr != nil {
-		return metadata.Meta{}, errors.Wrapf(err, "close reader for %v", obj.ObjectName())
+		return block.Meta{}, errors.Wrapf(err, "close reader for %v", objectName)
 	}
 
 	return m, nil
 }
 
-func listTenants(ctx context.Context, bkt *storage.BucketHandle) ([]string, error) {
-	users, err := listPrefix(ctx, bkt, "", false)
+func listTenants(ctx context.Context, bkt objtools.Bucket) ([]string, error) {
+	result, err := bkt.List(ctx, objtools.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
 
-	trimDelimSuffix(users)
-
-	return users, nil
+	return result.ToNames(), nil
 }
 
-func listBlocksForTenant(ctx context.Context, bkt *storage.BucketHandle, tenantID string) ([]ulid.ULID, error) {
-	items, err := listPrefix(ctx, bkt, tenantID, false)
+func listBlocksForTenant(ctx context.Context, bkt objtools.Bucket, tenantID string) ([]ulid.ULID, error) {
+	result, err := bkt.List(ctx, objtools.ListOptions{
+		Prefix: tenantID,
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	trimDelimSuffix(items)
-
+	items := result.ToNames()
 	blocks := make([]ulid.ULID, 0, len(items))
 
 	for _, b := range items {
@@ -419,8 +475,16 @@ type blockMarkers struct {
 	noCompact bool
 }
 
-func listBlockMarkersForTenant(ctx context.Context, bkt *storage.BucketHandle, tenantID string, destinationBucket string) (map[ulid.ULID]blockMarkers, error) {
-	markers, err := listPrefix(ctx, bkt, tenantID+delim+bucketindex.MarkersPathname, false)
+func listBlockMarkersForTenant(ctx context.Context, bkt objtools.Bucket, tenantID string, destinationBucket string) (map[ulid.ULID]blockMarkers, error) {
+	prefix := tenantID + objtools.Delim + block.MarkersPathname
+	listing, err := bkt.List(ctx, objtools.ListOptions{
+		Prefix:    prefix,
+		Recursive: false,
+	})
+	if err != nil {
+		return nil, err
+	}
+	markers, err := listing.ToNamesWithoutPrefix(prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -428,13 +492,13 @@ func listBlockMarkersForTenant(ctx context.Context, bkt *storage.BucketHandle, t
 	result := map[ulid.ULID]blockMarkers{}
 
 	for _, m := range markers {
-		if id, ok := bucketindex.IsBlockDeletionMarkFilename(m); ok {
+		if id, ok := block.IsDeletionMarkFilename(m); ok {
 			bm := result[id]
 			bm.deletion = true
 			result[id] = bm
 		}
 
-		if id, ok := bucketindex.IsNoCompactMarkFilename(m); ok {
+		if id, ok := block.IsNoCompactMarkFilename(m); ok {
 			bm := result[id]
 			bm.noCompact = true
 			result[id] = bm
@@ -450,64 +514,13 @@ func listBlockMarkersForTenant(ctx context.Context, bkt *storage.BucketHandle, t
 	return result, nil
 }
 
-func trimDelimSuffix(items []string) {
-	for ix := range items {
-		items[ix] = strings.TrimSuffix(items[ix], delim)
-	}
-}
-
-func listPrefix(ctx context.Context, bkt *storage.BucketHandle, prefix string, recursive bool) ([]string, error) {
-	if len(prefix) > 0 && prefix[len(prefix)-1:] != delim {
-		prefix = prefix + delim
-	}
-
-	q := &storage.Query{
-		Prefix: prefix,
-	}
-	if !recursive {
-		q.Delimiter = delim
-	}
-
-	var result []string
-
-	it := bkt.Objects(ctx, q)
-	for {
-		obj, err := it.Next()
-
-		if errors.Is(err, iterator.Done) {
-			break
-		}
-
-		if err != nil {
-			return nil, errors.Wrapf(err, "listPrefix: error listing %v", prefix)
-		}
-
-		path := ""
-		if obj.Prefix != "" { // synthetic directory, only returned when recursive=false
-			path = obj.Prefix
-		} else {
-			path = obj.Name
-		}
-
-		if strings.HasPrefix(path, prefix) {
-			path = strings.TrimPrefix(path, prefix)
-		} else {
-			return nil, errors.Errorf("listPrefix: path has invalid prefix: %v, expected prefix: %v", path, prefix)
-		}
-
-		result = append(result, path)
-	}
-
-	return result, nil
-}
-
 const CopiedMarkFilename = "copied"
 
 // CopiedToBucketMarkFilename returns the path of marker file signalling that block was copied to given destination bucket.
 // Returned path is relative to the tenant's bucket location.
 func CopiedToBucketMarkFilename(blockID ulid.ULID, targetBucket string) string {
 	// eg markers/01EZED0X3YZMNJ3NHGMJJKMHCR-copied-target-bucket
-	return fmt.Sprintf("%s/%s-%s-%s", bucketindex.MarkersPathname, blockID.String(), CopiedMarkFilename, targetBucket)
+	return fmt.Sprintf("%s/%s-%s-%s", block.MarkersPathname, blockID.String(), CopiedMarkFilename, targetBucket)
 }
 
 // IsCopiedToBucketMarkFilename returns whether the input filename matches the expected pattern

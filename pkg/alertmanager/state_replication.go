@@ -11,8 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/promauto"
-
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/services"
@@ -20,6 +18,7 @@ import (
 	"github.com/prometheus/alertmanager/cluster"
 	"github.com/prometheus/alertmanager/cluster/clusterpb"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/grafana/mimir/pkg/alertmanager/alertspb"
 	"github.com/grafana/mimir/pkg/alertmanager/alertstore"
@@ -211,7 +210,7 @@ func (s *state) starting(ctx context.Context) error {
 		s.fetchReplicaStateTotal.Inc()
 		fullStates, err := s.replicator.ReadFullStateForUser(readCtx, s.userID)
 		if err == nil {
-			if err = s.mergeFullStates(fullStates); err == nil {
+			if err = s.MergeFullStates(fullStates); err == nil {
 				level.Info(s.logger).Log("msg", "state settled; proceeding")
 				s.initialSyncCompleted.WithLabelValues(syncFromReplica).Inc()
 				return nil
@@ -241,7 +240,7 @@ func (s *state) starting(ctx context.Context) error {
 		return nil
 	}
 	if err == nil {
-		if err = s.mergeFullStates([]*clusterpb.FullState{fullState.State}); err == nil {
+		if err = s.MergeFullStates([]*clusterpb.FullState{fullState.State}); err == nil {
 			level.Info(s.logger).Log("msg", "state read from storage; proceeding")
 			s.initialSyncCompleted.WithLabelValues(syncFromStorage).Inc()
 			return nil
@@ -263,8 +262,8 @@ func (s *state) Ready() bool {
 	return s.Service.State() == services.Running
 }
 
-// mergeFullStates attempts to merge all full states received from peers during settling.
-func (s *state) mergeFullStates(fs []*clusterpb.FullState) error {
+// MergeFullStates attempts to merge all full states received from peers during settling.
+func (s *state) MergeFullStates(fs []*clusterpb.FullState) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 

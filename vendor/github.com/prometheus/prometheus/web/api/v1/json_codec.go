@@ -19,23 +19,27 @@ import (
 	jsoniter "github.com/json-iterator/go"
 
 	"github.com/prometheus/prometheus/model/exemplar"
-	"github.com/prometheus/prometheus/model/histogram"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/util/jsonutil"
 )
 
 func init() {
-	jsoniter.RegisterTypeEncoderFunc("promql.Series", marshalSeriesJSON, marshalSeriesJSONIsEmpty)
-	jsoniter.RegisterTypeEncoderFunc("promql.Sample", marshalSampleJSON, marshalSampleJSONIsEmpty)
-	jsoniter.RegisterTypeEncoderFunc("promql.Point", marshalPointJSON, marshalPointJSONIsEmpty)
-	jsoniter.RegisterTypeEncoderFunc("exemplar.Exemplar", marshalExemplarJSON, marshalExemplarJSONEmpty)
+	jsoniter.RegisterTypeEncoderFunc("promql.Vector", unsafeMarshalVectorJSON, neverEmpty)
+	jsoniter.RegisterTypeEncoderFunc("promql.Matrix", unsafeMarshalMatrixJSON, neverEmpty)
+	jsoniter.RegisterTypeEncoderFunc("promql.Series", unsafeMarshalSeriesJSON, neverEmpty)
+	jsoniter.RegisterTypeEncoderFunc("promql.Sample", unsafeMarshalSampleJSON, neverEmpty)
+	jsoniter.RegisterTypeEncoderFunc("promql.FPoint", unsafeMarshalFPointJSON, neverEmpty)
+	jsoniter.RegisterTypeEncoderFunc("promql.HPoint", unsafeMarshalHPointJSON, neverEmpty)
+	jsoniter.RegisterTypeEncoderFunc("exemplar.Exemplar", marshalExemplarJSON, neverEmpty)
+	jsoniter.RegisterTypeEncoderFunc("labels.Labels", unsafeMarshalLabelsJSON, labelsIsEmpty)
 }
 
 // JSONCodec is a Codec that encodes API responses as JSON.
 type JSONCodec struct{}
 
-func (j JSONCodec) ContentType() string {
-	return "application/json"
+func (j JSONCodec) ContentType() MIMEType {
+	return MIMEType{Type: "application", SubType: "json"}
 }
 
 func (j JSONCodec) CanEncode(_ *Response) bool {
@@ -60,62 +64,47 @@ func (j JSONCodec) Encode(resp *Response) ([]byte, error) {
 //	      < more values>
 //	   ],
 //	   "histograms": [
-//	      [ 1435781451.781, { < histogram, see below > } ],
+//	      [ 1435781451.781, { < histogram, see jsonutil.MarshalHistogram > } ],
 //	      < more histograms >
 //	   ],
 //	},
-func marshalSeriesJSON(ptr unsafe.Pointer, stream *jsoniter.Stream) {
+func unsafeMarshalSeriesJSON(ptr unsafe.Pointer, stream *jsoniter.Stream) {
 	s := *((*promql.Series)(ptr))
+	marshalSeriesJSON(s, stream)
+}
+
+func marshalSeriesJSON(s promql.Series, stream *jsoniter.Stream) {
 	stream.WriteObjectStart()
 	stream.WriteObjectField(`metric`)
-	m, err := s.Metric.MarshalJSON()
-	if err != nil {
-		stream.Error = err
-		return
-	}
-	stream.SetBuffer(append(stream.Buffer(), m...))
+	marshalLabelsJSON(s.Metric, stream)
 
-	// We make two passes through the series here: In the first marshaling
-	// all value points, in the second marshaling all histogram
-	// points. That's probably cheaper than just one pass in which we copy
-	// out histogram Points into a newly allocated slice for separate
-	// marshaling. (Could be benchmarked, though.)
-	var foundValue, foundHistogram bool
-	for _, p := range s.Points {
-		if p.H == nil {
-			stream.WriteMore()
-			if !foundValue {
-				stream.WriteObjectField(`values`)
-				stream.WriteArrayStart()
-			}
-			foundValue = true
-			marshalPointJSON(unsafe.Pointer(&p), stream)
-		} else {
-			foundHistogram = true
+	for i, p := range s.Floats {
+		stream.WriteMore()
+		if i == 0 {
+			stream.WriteObjectField(`values`)
+			stream.WriteArrayStart()
 		}
+		marshalFPointJSON(p, stream)
 	}
-	if foundValue {
+	if len(s.Floats) > 0 {
 		stream.WriteArrayEnd()
 	}
-	if foundHistogram {
-		firstHistogram := true
-		for _, p := range s.Points {
-			if p.H != nil {
-				stream.WriteMore()
-				if firstHistogram {
-					stream.WriteObjectField(`histograms`)
-					stream.WriteArrayStart()
-				}
-				firstHistogram = false
-				marshalPointJSON(unsafe.Pointer(&p), stream)
-			}
+	for i, p := range s.Histograms {
+		stream.WriteMore()
+		if i == 0 {
+			stream.WriteObjectField(`histograms`)
+			stream.WriteArrayStart()
 		}
+		marshalHPointJSON(p, stream)
+	}
+	if len(s.Histograms) > 0 {
 		stream.WriteArrayEnd()
 	}
 	stream.WriteObjectEnd()
 }
 
-func marshalSeriesJSONIsEmpty(ptr unsafe.Pointer) bool {
+// In the Prometheus API we render an empty object as `[]` or similar.
+func neverEmpty(unsafe.Pointer) bool {
 	return false
 }
 
@@ -127,7 +116,7 @@ func marshalSeriesJSONIsEmpty(ptr unsafe.Pointer) bool {
 //	      "job" : "prometheus",
 //	      "instance" : "localhost:9090"
 //	   },
-//	   "value": [ 1435781451.781, "1" ]
+//	   "value": [ 1435781451.781, "1.234" ]
 //	},
 //
 // For histogram samples, it writes something like this:
@@ -138,120 +127,61 @@ func marshalSeriesJSONIsEmpty(ptr unsafe.Pointer) bool {
 //	      "job" : "prometheus",
 //	      "instance" : "localhost:9090"
 //	   },
-//	   "histogram": [ 1435781451.781, { < histogram, see below > } ]
+//	   "histogram": [ 1435781451.781, { < histogram, see jsonutil.MarshalHistogram > } ]
 //	},
-func marshalSampleJSON(ptr unsafe.Pointer, stream *jsoniter.Stream) {
+func unsafeMarshalSampleJSON(ptr unsafe.Pointer, stream *jsoniter.Stream) {
 	s := *((*promql.Sample)(ptr))
+	marshalSampleJSON(s, stream)
+}
+
+func marshalSampleJSON(s promql.Sample, stream *jsoniter.Stream) {
 	stream.WriteObjectStart()
 	stream.WriteObjectField(`metric`)
-	m, err := s.Metric.MarshalJSON()
-	if err != nil {
-		stream.Error = err
-		return
-	}
-	stream.SetBuffer(append(stream.Buffer(), m...))
+	marshalLabelsJSON(s.Metric, stream)
 	stream.WriteMore()
-	if s.Point.H == nil {
+	if s.H == nil {
 		stream.WriteObjectField(`value`)
 	} else {
 		stream.WriteObjectField(`histogram`)
 	}
-	marshalPointJSON(unsafe.Pointer(&s.Point), stream)
+	stream.WriteArrayStart()
+	jsonutil.MarshalTimestamp(s.T, stream)
+	stream.WriteMore()
+	if s.H == nil {
+		jsonutil.MarshalFloat(s.F, stream)
+	} else {
+		jsonutil.MarshalHistogram(s.H, stream)
+	}
+	stream.WriteArrayEnd()
 	stream.WriteObjectEnd()
 }
 
-func marshalSampleJSONIsEmpty(ptr unsafe.Pointer) bool {
-	return false
+// marshalFPointJSON writes `[ts, "1.234"]`.
+func unsafeMarshalFPointJSON(ptr unsafe.Pointer, stream *jsoniter.Stream) {
+	p := *((*promql.FPoint)(ptr))
+	marshalFPointJSON(p, stream)
 }
 
-// marshalPointJSON writes `[ts, "val"]`.
-func marshalPointJSON(ptr unsafe.Pointer, stream *jsoniter.Stream) {
-	p := *((*promql.Point)(ptr))
+func marshalFPointJSON(p promql.FPoint, stream *jsoniter.Stream) {
 	stream.WriteArrayStart()
 	jsonutil.MarshalTimestamp(p.T, stream)
 	stream.WriteMore()
-	if p.H == nil {
-		jsonutil.MarshalValue(p.V, stream)
-	} else {
-		marshalHistogram(p.H, stream)
-	}
+	jsonutil.MarshalFloat(p.F, stream)
 	stream.WriteArrayEnd()
 }
 
-func marshalPointJSONIsEmpty(ptr unsafe.Pointer) bool {
-	return false
+// marshalHPointJSON writes `[ts, { < histogram, see jsonutil.MarshalHistogram > } ]`.
+func unsafeMarshalHPointJSON(ptr unsafe.Pointer, stream *jsoniter.Stream) {
+	p := *((*promql.HPoint)(ptr))
+	marshalHPointJSON(p, stream)
 }
 
-// marshalHistogramJSON writes something like:
-//
-//	{
-//	    "count": "42",
-//	    "sum": "34593.34",
-//	    "buckets": [
-//	      [ 3, "-0.25", "0.25", "3"],
-//	      [ 0, "0.25", "0.5", "12"],
-//	      [ 0, "0.5", "1", "21"],
-//	      [ 0, "2", "4", "6"]
-//	    ]
-//	}
-//
-// The 1st element in each bucket array determines if the boundaries are
-// inclusive (AKA closed) or exclusive (AKA open):
-//
-//	0: lower exclusive, upper inclusive
-//	1: lower inclusive, upper exclusive
-//	2: both exclusive
-//	3: both inclusive
-//
-// The 2nd and 3rd elements are the lower and upper boundary. The 4th element is
-// the bucket count.
-func marshalHistogram(h *histogram.FloatHistogram, stream *jsoniter.Stream) {
-	stream.WriteObjectStart()
-	stream.WriteObjectField(`count`)
-	jsonutil.MarshalValue(h.Count, stream)
+func marshalHPointJSON(p promql.HPoint, stream *jsoniter.Stream) {
+	stream.WriteArrayStart()
+	jsonutil.MarshalTimestamp(p.T, stream)
 	stream.WriteMore()
-	stream.WriteObjectField(`sum`)
-	jsonutil.MarshalValue(h.Sum, stream)
-
-	bucketFound := false
-	it := h.AllBucketIterator()
-	for it.Next() {
-		bucket := it.At()
-		if bucket.Count == 0 {
-			continue // No need to expose empty buckets in JSON.
-		}
-		stream.WriteMore()
-		if !bucketFound {
-			stream.WriteObjectField(`buckets`)
-			stream.WriteArrayStart()
-		}
-		bucketFound = true
-		boundaries := 2 // Exclusive on both sides AKA open interval.
-		if bucket.LowerInclusive {
-			if bucket.UpperInclusive {
-				boundaries = 3 // Inclusive on both sides AKA closed interval.
-			} else {
-				boundaries = 1 // Inclusive only on lower end AKA right open.
-			}
-		} else {
-			if bucket.UpperInclusive {
-				boundaries = 0 // Inclusive only on upper end AKA left open.
-			}
-		}
-		stream.WriteArrayStart()
-		stream.WriteInt(boundaries)
-		stream.WriteMore()
-		jsonutil.MarshalValue(bucket.Lower, stream)
-		stream.WriteMore()
-		jsonutil.MarshalValue(bucket.Upper, stream)
-		stream.WriteMore()
-		jsonutil.MarshalValue(bucket.Count, stream)
-		stream.WriteArrayEnd()
-	}
-	if bucketFound {
-		stream.WriteArrayEnd()
-	}
-	stream.WriteObjectEnd()
+	jsonutil.MarshalHistogram(p.H, stream)
+	stream.WriteArrayEnd()
 }
 
 // marshalExemplarJSON writes.
@@ -267,17 +197,12 @@ func marshalExemplarJSON(ptr unsafe.Pointer, stream *jsoniter.Stream) {
 
 	// "labels" key.
 	stream.WriteObjectField(`labels`)
-	lbls, err := p.Labels.MarshalJSON()
-	if err != nil {
-		stream.Error = err
-		return
-	}
-	stream.SetBuffer(append(stream.Buffer(), lbls...))
+	marshalLabelsJSON(p.Labels, stream)
 
 	// "value" key.
 	stream.WriteMore()
 	stream.WriteObjectField(`value`)
-	jsonutil.MarshalValue(p.Value, stream)
+	jsonutil.MarshalFloat(p.Value, stream)
 
 	// "timestamp" key.
 	stream.WriteMore()
@@ -287,6 +212,53 @@ func marshalExemplarJSON(ptr unsafe.Pointer, stream *jsoniter.Stream) {
 	stream.WriteObjectEnd()
 }
 
-func marshalExemplarJSONEmpty(ptr unsafe.Pointer) bool {
-	return false
+func unsafeMarshalLabelsJSON(ptr unsafe.Pointer, stream *jsoniter.Stream) {
+	labelsPtr := (*labels.Labels)(ptr)
+	marshalLabelsJSON(*labelsPtr, stream)
+}
+
+func marshalLabelsJSON(lbls labels.Labels, stream *jsoniter.Stream) {
+	stream.WriteObjectStart()
+	i := 0
+	lbls.Range(func(v labels.Label) {
+		if i != 0 {
+			stream.WriteMore()
+		}
+		i++
+		stream.WriteString(v.Name)
+		stream.WriteRaw(`:`)
+		stream.WriteString(v.Value)
+	})
+	stream.WriteObjectEnd()
+}
+
+func labelsIsEmpty(ptr unsafe.Pointer) bool {
+	labelsPtr := (*labels.Labels)(ptr)
+	return labelsPtr.IsEmpty()
+}
+
+// Marshal a Vector as `[sample,sample,...]` - empty Vector is `[]`.
+func unsafeMarshalVectorJSON(ptr unsafe.Pointer, stream *jsoniter.Stream) {
+	v := *((*promql.Vector)(ptr))
+	stream.WriteArrayStart()
+	for i, s := range v {
+		marshalSampleJSON(s, stream)
+		if i != len(v)-1 {
+			stream.WriteMore()
+		}
+	}
+	stream.WriteArrayEnd()
+}
+
+// Marshal a Matrix as `[series,series,...]` - empty Matrix is `[]`.
+func unsafeMarshalMatrixJSON(ptr unsafe.Pointer, stream *jsoniter.Stream) {
+	m := *((*promql.Matrix)(ptr))
+	stream.WriteArrayStart()
+	for i, s := range m {
+		marshalSeriesJSON(s, stream)
+		if i != len(m)-1 {
+			stream.WriteMore()
+		}
+	}
+	stream.WriteArrayEnd()
 }

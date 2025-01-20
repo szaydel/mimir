@@ -15,6 +15,7 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/promql/parser/posrange"
 	"github.com/stretchr/testify/require"
 )
 
@@ -32,8 +33,8 @@ func TestCloneExpr(t *testing.T) {
 			},
 			&parser.BinaryExpr{
 				Op:  parser.ADD,
-				LHS: &parser.NumberLiteral{Val: 1, PosRange: parser.PositionRange{Start: 0, End: 1}},
-				RHS: &parser.NumberLiteral{Val: 1, PosRange: parser.PositionRange{Start: 4, End: 5}},
+				LHS: &parser.NumberLiteral{Val: 1, PosRange: posrange.PositionRange{Start: 0, End: 1}},
+				RHS: &parser.NumberLiteral{Val: 1, PosRange: posrange.PositionRange{Start: 4, End: 5}},
 			},
 		},
 		{
@@ -56,13 +57,13 @@ func TestCloneExpr(t *testing.T) {
 					LabelMatchers: []*labels.Matcher{
 						mustLabelMatcher(labels.MatchEqual, string(model.MetricNameLabel), "some_metric"),
 					},
-					PosRange: parser.PositionRange{
+					PosRange: posrange.PositionRange{
 						Start: 19,
 						End:   30,
 					},
 				},
 				Grouping: []string{"foo"},
-				PosRange: parser.PositionRange{
+				PosRange: posrange.PositionRange{
 					Start: 0,
 					End:   31,
 				},
@@ -95,6 +96,10 @@ sum(rate(http_requests_total{cluster="us-central1"}[1m]))
 sum(rate(http_requests_total{cluster="ops-tools1"}[1m]))
 )`,
 			expected: `sum(sum(rate(http_requests_total{cluster="us-central1"}[1m])) / sum(rate(http_requests_total{cluster="ops-tools1"}[1m])))`,
+		},
+		{
+			input:    `sum({__name__="",a="x"})`,
+			expected: `sum({__name__="",a="x"})`,
 		},
 	}
 
@@ -133,8 +138,10 @@ func TestSharding_BinaryExpressionsDontTakeExponentialTime(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	mapper, err := NewSharding(ctx, 2, log.NewNopLogger(), NewMapperStats())
+
+	summer, err := NewQueryShardSummer(ctx, 2, VectorSquasher, log.NewNopLogger(), NewMapperStats())
 	require.NoError(t, err)
+	mapper := NewSharding(summer)
 
 	_, err = mapper.Map(expr)
 	require.NoError(t, err)

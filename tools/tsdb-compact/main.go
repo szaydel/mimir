@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -12,11 +13,16 @@ import (
 	"syscall"
 
 	golog "github.com/go-kit/log"
-
+	"github.com/grafana/dskit/flagext"
 	"github.com/prometheus/prometheus/tsdb"
+
+	util_log "github.com/grafana/mimir/pkg/util/log"
 )
 
 func main() {
+	// Clean up all flags registered via init() methods of 3rd-party libraries.
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+
 	var (
 		outputDir     string
 		shardCount    int
@@ -29,13 +35,18 @@ func main() {
 	flag.IntVar(&shardCount, "shard-count", 1, "Number of shards for splitting")
 	flag.Int64Var(&segmentSizeMB, "segment-file-size", 512, "Size of segment file")
 
-	flag.Parse()
+	// Parse CLI arguments.
+	args, err := flagext.ParseFlagsAndArguments(flag.CommandLine)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
+	}
 
 	logger := golog.NewLogfmtLogger(os.Stderr)
 
 	var blockDirs []string
 	var blocks []*tsdb.Block
-	for _, d := range flag.Args() {
+	for _, d := range args {
 		s, err := os.Stat(d)
 		if err != nil {
 			panic(err)
@@ -46,7 +57,7 @@ func main() {
 
 		blockDirs = append(blockDirs, d)
 
-		b, err := tsdb.OpenBlock(logger, d, nil)
+		b, err := tsdb.OpenBlock(util_log.SlogFromGoKit(logger), d, nil, nil)
 		if err != nil {
 			log.Fatalln("failed to open block:", d, err)
 		}
@@ -77,7 +88,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	c, err := tsdb.NewLeveledCompactorWithChunkSize(ctx, nil, logger, []int64{0}, nil, segmentSizeMB*1024*1024, nil, true)
+	c, err := tsdb.NewLeveledCompactorWithChunkSize(ctx, nil, util_log.SlogFromGoKit(logger), []int64{0}, nil, segmentSizeMB*1024*1024, nil)
 	if err != nil {
 		log.Fatalln("creating compator", err)
 	}

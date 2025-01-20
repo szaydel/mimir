@@ -5,6 +5,7 @@
   local deployment = $.apps.v1.deployment,
 
   query_scheduler_args+::
+    $._config.commonConfig +
     $._config.usageStatsConfig +
     $._config.grpcConfig +
     $._config.querySchedulerRingLifecyclerConfig
@@ -20,29 +21,37 @@
 
   query_scheduler_ports:: $.util.defaultPorts,
 
-  newQuerySchedulerContainer(name, args)::
+  newQuerySchedulerContainer(name, args, envmap={})::
     container.new(name, $._images.query_scheduler) +
     container.withPorts($.query_scheduler_ports) +
     container.withArgsMixin($.util.mapToFlags(args)) +
+    (if std.length(envmap) > 0 then container.withEnvMap(std.prune(envmap)) else {}) +
     $.jaeger_mixin +
     $.util.readinessProbe +
     $.util.resourcesRequests('2', '1Gi') +
     $.util.resourcesLimits(null, '2Gi'),
 
-  query_scheduler_container::
-    self.newQuerySchedulerContainer('query-scheduler', $.query_scheduler_args),
+  query_scheduler_env_map:: {},
 
-  newQuerySchedulerDeployment(name, container)::
+  query_scheduler_node_affinity_matchers:: [],
+
+  query_scheduler_container::
+    self.newQuerySchedulerContainer('query-scheduler', $.query_scheduler_args, $.query_scheduler_env_map),
+
+  newQuerySchedulerDeployment(name, container, nodeAffinityMatchers=[])::
     deployment.new(name, 2, [container]) +
+    $.newMimirNodeAffinityMatchers(nodeAffinityMatchers) +
     $.mimirVolumeMounts +
     (if !std.isObject($._config.node_selector) then {} else deployment.mixin.spec.template.spec.withNodeSelectorMixin($._config.node_selector)) +
     $.util.antiAffinity +
     // Do not run more query-schedulers than expected.
-    deployment.mixin.spec.strategy.rollingUpdate.withMaxSurge(0) +
-    deployment.mixin.spec.strategy.rollingUpdate.withMaxUnavailable(1),
+    deployment.mixin.spec.strategy.rollingUpdate.withMaxSurge(1) +
+    deployment.mixin.spec.strategy.rollingUpdate.withMaxUnavailable(0) +
+    // Set a termination grace period greater than query timeout.
+    deployment.mixin.spec.template.spec.withTerminationGracePeriodSeconds(180),
 
   query_scheduler_deployment: if !$._config.is_microservices_deployment_mode || !$._config.query_scheduler_enabled then {} else
-    self.newQuerySchedulerDeployment('query-scheduler', $.query_scheduler_container),
+    self.newQuerySchedulerDeployment('query-scheduler', $.query_scheduler_container, $.query_scheduler_node_affinity_matchers),
 
   query_scheduler_service: if !$._config.is_microservices_deployment_mode || !$._config.query_scheduler_enabled then {} else
     $.util.serviceFor($.query_scheduler_deployment, $._config.service_ignored_labels),
@@ -56,10 +65,13 @@
   query_scheduler_discovery_service: if !$._config.is_microservices_deployment_mode || !$._config.query_scheduler_enabled then {} else
     self.newQuerySchedulerDiscoveryService('query-scheduler', $.query_scheduler_deployment),
 
+  query_scheduler_pdb: if !$._config.is_microservices_deployment_mode || !$._config.query_scheduler_enabled then null else
+    $.newMimirPdb('query-scheduler'),
+
   // Reconfigure querier and query-frontend to use scheduler.
 
   local querySchedulerAddress(name) =
-    '%s.%s.svc.cluster.local:9095' % [discoveryServiceName(name), $._config.namespace],
+    '%s.%s.svc.%s:9095' % [discoveryServiceName(name), $._config.namespace, $._config.cluster_domain],
 
   querierUseQuerySchedulerArgs(name):: {
     'querier.frontend-address': null,

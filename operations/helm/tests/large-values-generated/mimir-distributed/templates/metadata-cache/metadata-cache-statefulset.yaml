@@ -36,26 +36,18 @@ spec:
     spec:
       serviceAccountName: large-values-mimir
       securityContext:
-        fsGroup: 11211
-        runAsGroup: 11211
+        fsGroup: 10001
+        runAsGroup: 10001
         runAsNonRoot: true
-        runAsUser: 11211
+        runAsUser: 10001
         seccompProfile:
           type: RuntimeDefault
-      initContainers:
-        []
-      nodeSelector:
-        {}
-      affinity:
-        {}
-      topologySpreadConstraints:
-        
-      tolerations:
-        []
-      terminationGracePeriodSeconds: 60
+      
+      terminationGracePeriodSeconds: 30
+      volumes:
       containers:
         - name: memcached
-          image: memcached:1.6.17-alpine
+          image: memcached:1.6.34-alpine
           imagePullPolicy: IfNotPresent
           resources:
             limits:
@@ -68,22 +60,20 @@ spec:
               name: client
           args:
             - -m 512
-            - -o
-            - modern
+            - --extended=modern
             - -I 1m
             - -c 16384
             - -v
             - -u 11211
-          env:
-          envFrom:
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
               drop:
               - ALL
             readOnlyRootFilesystem: true
+          volumeMounts:
         - name: exporter
-          image: prom/memcached-exporter:v0.6.0
+          image: prom/memcached-exporter:v0.15.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 9150

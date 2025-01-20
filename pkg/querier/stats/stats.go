@@ -10,7 +10,7 @@ import (
 	"sync/atomic" //lint:ignore faillint we can't use go.uber.org/atomic with a protobuf struct without wrapping it.
 	"time"
 
-	"github.com/weaveworks/common/httpgrpc"
+	"github.com/grafana/dskit/httpgrpc"
 )
 
 type contextKey int
@@ -171,6 +171,54 @@ func (s *Stats) LoadEstimatedSeriesCount() uint64 {
 	return atomic.LoadUint64(&s.EstimatedSeriesCount)
 }
 
+func (s *Stats) AddQueueTime(t time.Duration) {
+	if s == nil {
+		return
+	}
+
+	atomic.AddInt64((*int64)(&s.QueueTime), int64(t))
+}
+
+func (s *Stats) LoadQueueTime() time.Duration {
+	if s == nil {
+		return 0
+	}
+
+	return time.Duration(atomic.LoadInt64((*int64)(&s.QueueTime)))
+}
+
+func (s *Stats) AddEncodeTime(t time.Duration) {
+	if s == nil {
+		return
+	}
+
+	atomic.AddInt64((*int64)(&s.EncodeTime), int64(t))
+}
+
+func (s *Stats) LoadEncodeTime() time.Duration {
+	if s == nil {
+		return 0
+	}
+
+	return time.Duration(atomic.LoadInt64((*int64)(&s.EncodeTime)))
+}
+
+func (s *Stats) AddSamplesProcessed(c uint64) {
+	if s == nil {
+		return
+	}
+
+	atomic.AddUint64(&s.SamplesProcessed, c)
+}
+
+func (s *Stats) LoadSamplesProcessed() uint64 {
+	if s == nil {
+		return 0
+	}
+
+	return atomic.LoadUint64(&s.SamplesProcessed)
+}
+
 // Merge the provided Stats into this one.
 func (s *Stats) Merge(other *Stats) {
 	if s == nil || other == nil {
@@ -185,6 +233,20 @@ func (s *Stats) Merge(other *Stats) {
 	s.AddSplitQueries(other.LoadSplitQueries())
 	s.AddFetchedIndexBytes(other.LoadFetchedIndexBytes())
 	s.AddEstimatedSeriesCount(other.LoadEstimatedSeriesCount())
+	s.AddQueueTime(other.LoadQueueTime())
+	s.AddEncodeTime(other.LoadEncodeTime())
+	s.AddSamplesProcessed(other.LoadSamplesProcessed())
+}
+
+// Copy returns a copy of the stats. Use this rather than regular struct assignment
+// to make sure atomic modifications are observed.
+func (s *Stats) Copy() *Stats {
+	if s == nil {
+		return nil
+	}
+	c := &Stats{}
+	c.Merge(s)
+	return c
 }
 
 func ShouldTrackHTTPGRPCResponse(r *httpgrpc.HTTPResponse) bool {

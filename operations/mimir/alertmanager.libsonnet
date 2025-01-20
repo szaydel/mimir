@@ -10,6 +10,7 @@
   local hasFallbackConfig = std.length($._config.alertmanager.fallback_config) > 0,
 
   alertmanager_args::
+    $._config.commonConfig +
     $._config.usageStatsConfig +
     $._config.grpcConfig +
     $._config.storageConfig +
@@ -22,6 +23,11 @@
       'alertmanager.sharding-ring.store': $._config.alertmanager.ring_store,
       'alertmanager.sharding-ring.consul.hostname': $._config.alertmanager.ring_hostname,
       'alertmanager.sharding-ring.replication-factor': $._config.alertmanager.ring_replication_factor,
+
+      // Prometheus HTTP client used to send alerts has a hard-coded idle
+      // timeout of 5 minutes, therefore the server timeout for Alertmanager
+      // needs to be higher to avoid connections being closed abruptly.
+      'server.http-idle-timeout': '6m',
     } +
     $.mimirRuntimeConfigFile +
     (if hasFallbackConfig then {
@@ -42,15 +48,23 @@
       pvc.new() +
       pvc.mixin.metadata.withName('alertmanager-data') +
       pvc.mixin.spec.withAccessModes('ReadWriteOnce') +
-      pvc.mixin.spec.resources.withRequests({ storage: '100Gi' })
+      pvc.mixin.spec.resources.withRequests({ storage: $._config.alertmanager_data_disk_size }) +
+      if $._config.alertmanager_data_disk_class != null then
+        pvc.mixin.spec.withStorageClassName($._config.alertmanager_data_disk_class)
+      else {}
     else {},
 
   alertmanager_ports:: $.util.defaultPorts,
+
+  alertmanager_env_map:: {},
+
+  alertmanager_node_affinity_matchers:: [],
 
   alertmanager_container::
     if $._config.alertmanager_enabled then
       container.new('alertmanager', $._images.alertmanager) +
       container.withPorts($.alertmanager_ports) +
+      (if std.length($.alertmanager_env_map) > 0 then container.withEnvMap(std.prune($.alertmanager_env_map)) else {}) +
       container.withEnvMixin([container.envType.fromFieldPath('POD_IP', 'status.podIP')]) +
       container.withArgsMixin(
         $.util.mapToFlags($.alertmanager_args)
@@ -70,6 +84,7 @@
   alertmanager_statefulset:
     if $._config.is_microservices_deployment_mode && $._config.alertmanager_enabled then
       $.newMimirStatefulSet('alertmanager', $._config.alertmanager.replicas, $.alertmanager_container, $.alertmanager_pvc, podManagementPolicy=null) +
+      $.newMimirNodeAffinityMatchers($.alertmanager_node_affinity_matchers) +
       statefulSet.mixin.spec.template.spec.withTerminationGracePeriodSeconds(900) +
       $.mimirVolumeMounts +
       statefulSet.mixin.spec.template.spec.withVolumesMixin(

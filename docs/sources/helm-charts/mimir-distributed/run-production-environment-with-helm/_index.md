@@ -10,7 +10,7 @@ weight: 40
 
 # Run Grafana Mimir in production using the Helm chart
 
-In addition to the guide [Get started with Grafana Mimir using the Helm chart]({{< relref "../get-started-helm-charts/" >}}),
+In addition to the guide [Get started with Grafana Mimir using the Helm chart]({{< relref "../get-started-helm-charts" >}}),
 which covers setting up Grafana Mimir on a local Kubernetes cluster or
 within a low-risk development environment, you can prepare Grafana Mimir
 for production.
@@ -42,6 +42,13 @@ Meet all the follow prerequisites:
   or OpenStack Swift. Alternatively, to deploy MinIO yourself, see [MinIO High
   Performance Object Storage](https://min.io/docs/minio/kubernetes/upstream/index.html).
 
+- {{% admonition type="note" %}}
+  Like Amazon S3, the chosen object storage implementation must not create directories.
+  Grafana Mimir doesn't have any notion of object storage directories, and so will leave
+  empty directories behind when removing blocks. For example, if you use Azure Blob Storage, you must disable
+  [hierarchical namespace](https://learn.microsoft.com/en-us/azure/storage/blobs/data-lake-storage-namespace).
+  {{% /admonition %}}
+
 ## Plan capacity
 
 The `mimir-distributed` Helm chart comes with two sizing plans:
@@ -55,7 +62,7 @@ usage patterns. Therefore, use the sizing plans as starting
 point for sizing your Grafana Mimir cluster, rather than as strict guidelines.
 To get a better idea of how to plan capacity, refer to the YAML comments at
 the beginning of `small.yaml` and `large.yaml` files, which relate to read and write workloads.
-See also [Planning Grafana Mimir capacity](/docs/mimir/v2.5.x/operators-guide/run-production-environment/planning-capacity/).
+See also [Planning Grafana Mimir capacity](https://grafana.com/docs/mimir/<MIMIR_VERSION>/manage/run-production-environment/planning-capacity/).
 
 To use a sizing plan, copy it from the [mimir](https://github.com/grafana/mimir/blob/main/operations/helm/charts/mimir-distributed)
 GitHub repository, and pass it as a values file to the `helm` command. Note that sizing plans may change with new
@@ -84,8 +91,8 @@ number_of_nodes >= max(number_of_ingesters_pods, number_of_store_gateway_pods)
 ```
 
 For more information about the failure modes of either the ingester or store-gateway
-component, refer to [Ingesters failure and data loss](/docs/mimir/v2.5.x/operators-guide/architecture/components/ingester/#ingesters-failure-and-data-loss/)
-or [Store-gateway: Blocks sharding and replication](/docs/mimir/v2.5.x/operators-guide/architecture/components/store-gateway/#blocks-sharding-and-replication/).
+component, refer to [Ingesters failure and data loss](https://grafana.com/docs/mimir/<MIMIR_VERSION>/references/architecture/components/ingester/#ingesters-failure-and-data-loss)
+or [Store-gateway: Blocks sharding and replication](https://grafana.com/docs/mimir/<MIMIR_VERSION>/references/architecture/components/store-gateway/#blocks-sharding-and-replication).
 
 ## Decide whether you need geographical redundancy, fast rolling updates, or both.
 
@@ -98,7 +105,7 @@ configure the Helm chart to deploy Grafana Mimir with zone-aware replication.
 
 ### New installations
 
-Grafana Mimir supports [replication across availability zones](/docs/mimir/v2.5.x/operators-guide/configure/configure-zone-aware-replication/)
+Grafana Mimir supports [replication across availability zones](https://grafana.com/docs/mimir/<MIMIR_VERSION>/configure/configure-zone-aware-replication/)
 within your Kubernetes cluster.
 This further increases fault tolerance of the Mimir cluster. Even if you
 do not currently have multiple zones across your Kubernetes cluster, you
@@ -153,7 +160,7 @@ zone-aware replication.
 ## Configure Mimir to use object storage
 
 For the different object storage types that Mimir supports, and examples,
-see [Configure Grafana Mimir object storage backend](/docs/mimir/v2.5.x/operators-guide/configure/configure-object-storage-backend).
+see [Configure Grafana Mimir object storage backend](https://grafana.com/docs/mimir/<MIMIR_VERSION>/configure/configure-object-storage-backend/).
 
 1. Add the following YAML to your values file, if you are not using the sizing
    plans that are mentioned in [Plan capacity](#plan-capacity):
@@ -218,12 +225,19 @@ To enable the PodSecurityPolicy admission controller for your Kubernetes
 cluster, refer to
 [How do I turn on an admission controller?](https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#how-do-i-turn-on-an-admission-controller).
 
+For OpenShift-specific instructions see [Deploy on OpenShift](#deploy-on-openshift).
+
+The `mimir-distributed` Helm chart also deploys most of the containers
+with a read-only root filesystem (`readOnlyRootFilesystem: true`).
+The exceptions are the optional MinIO and Grafana Agent (deprecated) containers.
+The PodSecurityPolicy resource enforces this setting.
+
 ## Monitor the health of your Grafana Mimir cluster
 
 To monitor the health of your Grafana Mimir cluster, which is also known as
 _metamonitoring_, you can use ready-made Grafana dashboards, and Prometheus
 alerting and recording rules.
-For more information, see [Installing Grafana Mimir dashboards and alerts](/docs/mimir/v2.5.x/operators-guide/monitor-grafana-mimir/installing-dashboards-and-alerts/).
+For more information, see [Installing Grafana Mimir dashboards and alerts](https://grafana.com/docs/mimir/<MIMIR_VERSION>/manage/monitor-grafana-mimir/installing-dashboards-and-alerts/).
 
 The `mimir-distributed` Helm chart makes it easy for you to collect metrics and
 logs from Mimir. It assigns the correct labels for you so that the dashboards
@@ -231,12 +245,14 @@ and alerts simply work. The chart uses the Grafana Agent to ship metrics to
 a Prometheus-compatible server and logs to a Loki or GEL (Grafana Enterprise
 Metrics) server.
 
+{{< docs/shared source="alloy" lookup="agent-deprecation.md" version="next" >}}
+
 1. Download the Grafana Agent Operator Custom Resource Definitions (CRDs) from
-   https://github.com/grafana/agent/tree/main/production/operator/crds
+   https://github.com/grafana/agent/tree/main/operations/agent-static-operator/crds
 2. Install the CRDs on your cluster:
 
    ```bash
-   kubectl apply -f production/operator/crds/
+   kubectl apply -f operations/agent-static-operator/crds/
    ```
 
 3. Add the following YAML snippet to your
@@ -264,20 +280,61 @@ Metrics) server.
              X-Scope-OrgID: metamonitoring
    ```
 
-   For details about how to set up the credentials, see [Collecting
-   metrics and logs from Grafana Mimir](/docs/mimir/v2.5.x/operators-guide/monitor-grafana-mimir/collecting-metrics-and-logs/).
+   For details about how to set up the credentials, see [Collecting metrics and logs from Grafana Mimir](https://grafana.com/docs/mimir/<MIMIR_VERSION>/manage/monitor-grafana-mimir/collecting-metrics-and-logs/).
 
 Your Grafana Mimir cluster can now ingest metrics in production.
 
 ## Configure clients to write metrics to Mimir
 
-To configure each client to remote-write metrics to Mimir, refer to [Configure Prometheus to write to Grafana Mimir]({{< relref "../get-started-helm-charts/#configure-prometheus-to-write-to-grafana-mimir">}})
-and [Configure Grafana Agent to write to Grafana Mimir]({{< relref "../get-started-helm-charts/#configure-grafana-agent-to-write-to-grafana-mimir">}}).
+To configure each client to remote-write metrics to Mimir, refer to [Configure Prometheus to write to Grafana Mimir](https://grafana.com/docs/helm-charts/mimir-distributed/<MIMIR_HELM_VERSION>/get-started-helm-charts/gs-external-access/#configure-prometheus-to-write-to-grafana-mimir)
+and [Configure Grafana Alloy to write to Grafana Mimir](https://grafana.com/docs/helm-charts/mimir-distributed/latest/get-started-helm-charts/#configure-grafana-alloy-to-write-to-grafana-mimir).
 
-## Set up redundant Prometheus or Grafana Agent instances for high availability
+## Set up redundant Prometheus or Grafana Alloy instances for high availability
 
 If you need redundancy on the write path before it reaches Mimir, then you
-can set up redundant instances of Prometheus or Grafana Agent to
+can set up redundant instances of Prometheus or Grafana Alloy to
 write metrics to Mimir.
 
-For more information, see [Configure high-availability deduplication with Consul](/docs/mimir/v2.5.x/operators-guide/configure/configure-helm-ha-deduplication-consul/).
+For more information, see [Configure high-availability deduplication with Consul]({{< relref "./configure-helm-ha-deduplication-consul" >}}).
+
+## Deploy on OpenShift
+
+To deploy the `mimir-distributed` Helm chart on OpenShift you need to change some of the default values.
+Add the following YAML snippet to your values file.
+This will create a dedicated SecurityContextConstraints (SCC) resource for the `mimir-distributed` chart.
+
+```yaml
+rbac:
+  create: true
+  type: scc
+  podSecurityContext:
+    fsGroup: null
+    runAsGroup: null
+    runAsUser: null
+rollout_operator:
+  podSecurityContext:
+    fsGroup: null
+    runAsGroup: null
+    runAsUser: null
+```
+
+Alternatively, to deploy using the default SCC in your OpenShift cluster, add the following YAML snippet to your values file:
+
+```yaml
+rbac:
+  create: false
+  type: scc
+  podSecurityContext:
+    fsGroup: null
+    runAsGroup: null
+    runAsUser: null
+rollout_operator:
+  podSecurityContext:
+    fsGroup: null
+    runAsGroup: null
+    runAsUser: null
+```
+
+{{< admonition type="caution" >}}
+In Helm versions 3.13 and earlier, you might experience a known issue overriding default values when using the `mimir-distributed` Helm chart as a dependency. To view examples and possible workarounds, refer to [this issue on GitHub](https://github.com/grafana/mimir/issues/8059). If your specific situation isn't addressed, open an [issue in the Mimir repository](https://github.com/grafana/mimir/issues).
+{{< /admonition >}}

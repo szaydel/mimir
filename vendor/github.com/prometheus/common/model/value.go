@@ -21,14 +21,12 @@ import (
 	"strings"
 )
 
-var (
-	// ZeroSample is the pseudo zero-value of Sample used to signal a
-	// non-existing sample. It is a Sample with timestamp Earliest, value 0.0,
-	// and metric nil. Note that the natural zero value of Sample has a timestamp
-	// of 0, which is possible to appear in a real Sample and thus not suitable
-	// to signal a non-existing Sample.
-	ZeroSample = Sample{Timestamp: Earliest}
-)
+// ZeroSample is the pseudo zero-value of Sample used to signal a
+// non-existing sample. It is a Sample with timestamp Earliest, value 0.0,
+// and metric nil. Note that the natural zero value of Sample has a timestamp
+// of 0, which is possible to appear in a real Sample and thus not suitable
+// to signal a non-existing Sample.
+var ZeroSample = Sample{Timestamp: Earliest}
 
 // Sample is a sample pair associated with a metric. A single sample must either
 // define Value or Histogram but not both. Histogram == nil implies the Value
@@ -100,37 +98,19 @@ func (s Sample) MarshalJSON() ([]byte, error) {
 	return json.Marshal(&v)
 }
 
-type sampleHistogramPairPtr struct {
-	Timestamp Time
-	Histogram *SampleHistogram
-}
-
-func (s *sampleHistogramPairPtr) UnmarshalJSON(buf []byte) error {
-	tmp := []interface{}{&s.Timestamp, &s.Histogram}
-	wantLen := len(tmp)
-	if err := json.Unmarshal(buf, &tmp); err != nil {
-		return err
-	}
-	if gotLen := len(tmp); gotLen != wantLen {
-		return fmt.Errorf("wrong number of fields: %d != %d", gotLen, wantLen)
-	}
-	return nil
-}
-
 // UnmarshalJSON implements json.Unmarshaler.
-// TODO: simplify and remove the need for both sampleHistogramPairPtr and SampleHistogramPair
 func (s *Sample) UnmarshalJSON(b []byte) error {
 	v := struct {
-		Metric    Metric                 `json:"metric"`
-		Value     SamplePair             `json:"value"`
-		Histogram sampleHistogramPairPtr `json:"histogram"`
+		Metric    Metric              `json:"metric"`
+		Value     SamplePair          `json:"value"`
+		Histogram SampleHistogramPair `json:"histogram"`
 	}{
 		Metric: s.Metric,
 		Value: SamplePair{
 			Timestamp: s.Timestamp,
 			Value:     s.Value,
 		},
-		Histogram: sampleHistogramPairPtr{
+		Histogram: SampleHistogramPair{
 			Timestamp: s.Timestamp,
 			Histogram: s.Histogram,
 		},
@@ -292,7 +272,7 @@ func (s *Scalar) UnmarshalJSON(b []byte) error {
 
 	value, err := strconv.ParseFloat(f, 64)
 	if err != nil {
-		return fmt.Errorf("error parsing sample value: %s", err)
+		return fmt.Errorf("error parsing sample value: %w", err)
 	}
 	s.Value = SampleValue(value)
 	return nil

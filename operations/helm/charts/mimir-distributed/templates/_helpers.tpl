@@ -50,27 +50,65 @@ Create chart name and version as used by the chart label.
 {{- end -}}
 
 {{/*
-Calculate image name based on whether enterprise features are requested
+Build mimir image reference based on whether enterprise features are requested. The component local values always take precedence.
+Params:
+  ctx = . context
+  component = component name
 */}}
 {{- define "mimir.imageReference" -}}
-{{- if .Values.enterprise.enabled -}}{{ .Values.enterprise.image.repository }}:{{ .Values.enterprise.image.tag }}{{- else -}}{{ .Values.image.repository }}:{{ .Values.image.tag }}{{- end -}}
+{{- $componentSection := include "mimir.componentSectionFromName" . | fromYaml -}}
+{{- $image := $componentSection.image | default dict -}}
+{{- if .ctx.Values.enterprise.enabled -}}
+  {{- $image = mustMerge $image .ctx.Values.enterprise.image -}}
+{{- else -}}
+  {{- $image = mustMerge $image .ctx.Values.image -}}
+{{- end -}}
+{{ $image.repository }}:{{ $image.tag }}
 {{- end -}}
 
 {{/*
-For compatiblity and to support upgrade from enterprise-metrics chart calculate minio bucket name
+For compatibility and to support upgrade from enterprise-metrics chart calculate minio bucket name
 */}}
 {{- define "mimir.minioBucketPrefix" -}}
 {{- if .Values.enterprise.legacyLabels -}}enterprise-metrics{{- else -}}mimir{{- end -}}
 {{- end -}}
 
 {{/*
-Create the name of the service account
+Create the name of the general service account
 */}}
 {{- define "mimir.serviceAccountName" -}}
 {{- if .Values.serviceAccount.create -}}
     {{ default (include "mimir.fullname" .) .Values.serviceAccount.name }}
 {{- else -}}
     {{ default "default" .Values.serviceAccount.name }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Create the name of the ruler service account
+*/}}
+{{- define "mimir.ruler.serviceAccountName" -}}
+{{- if and .Values.ruler.serviceAccount.create (eq .Values.ruler.serviceAccount.name "") -}}
+{{- $sa := default (include "mimir.fullname" .) .Values.serviceAccount.name }}
+{{- printf "%s-ruler" $sa }}
+{{- else if and .Values.ruler.serviceAccount.create (not (eq .Values.ruler.serviceAccount.name "")) -}}
+{{- .Values.ruler.serviceAccount.name -}}
+{{- else -}}
+{{- include "mimir.serviceAccountName" . -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Create the name of the alertmanager service account
+*/}}
+{{- define "mimir.alertmanager.serviceAccountName" -}}
+{{- if and .Values.alertmanager.serviceAccount.create (eq .Values.alertmanager.serviceAccount.name "") -}}
+{{- $sa := default (include "mimir.fullname" .) .Values.serviceAccount.name }}
+{{- printf "%s-alertmanager" $sa }}
+{{- else if and .Values.alertmanager.serviceAccount.create (not (eq .Values.alertmanager.serviceAccount.name "")) -}}
+{{- .Values.alertmanager.serviceAccount.name -}}
+{{- else -}}
+{{- include "mimir.serviceAccountName" . -}}
 {{- end -}}
 {{- end -}}
 
@@ -93,14 +131,14 @@ Create the app name for clients. Defaults to the same logic as "mimir.fullname",
 {{- end -}}
 
 {{/*
-Calculate the config from structured and unstructred text input
+Calculate the config from structured and unstructured text input
 */}}
 {{- define "mimir.calculatedConfig" -}}
 {{ tpl (mergeOverwrite (include "mimir.unstructuredConfig" . | fromYaml) .Values.mimir.structuredConfig | toYaml) . }}
 {{- end -}}
 
 {{/*
-Calculate the config from the unstructred text input
+Calculate the config from the unstructured text input
 */}}
 {{- define "mimir.unstructuredConfig" -}}
 {{ include (print $.Template.BasePath "/_config-render.tpl") . }}
@@ -159,6 +197,10 @@ dns+{{ template "mimir.fullname" . }}-metadata-cache.{{ .Release.Namespace }}.sv
 
 {{- define "mimir.resultsCacheAddress" -}}
 dns+{{ template "mimir.fullname" . }}-results-cache.{{ .Release.Namespace }}.svc:{{ (index .Values "results-cache").port }}
+{{- end -}}
+
+{{- define "mimir.adminCacheAddress" -}}
+dns+{{ template "mimir.fullname" . }}-admin-cache.{{ .Release.Namespace }}.svc:{{ (index .Values "admin-cache").port }}
 {{- end -}}
 
 {{/*
@@ -237,6 +279,9 @@ Params:
   rolloutZoneName = rollout zone name (optional)
 */}}
 {{- define "mimir.podLabels" -}}
+{{ with .ctx.Values.global.podLabels -}}
+{{ toYaml . }}
+{{ end }}
 {{- if .ctx.Values.enterprise.legacyLabels }}
 {{- if .component -}}
 app: {{ include "mimir.name" .ctx }}-{{ .component }}
@@ -286,7 +331,7 @@ Params:
 */}}
 {{- define "mimir.podAnnotations" -}}
 {{- if .ctx.Values.useExternalConfig }}
-checksum/config: {{ .ctx.Values.externalConfigVersion }}
+checksum/config: {{ .ctx.Values.externalConfigVersion | quote }}
 {{- else -}}
 checksum/config: {{ include (print .ctx.Template.BasePath "/mimir-config.yaml") .ctx | sha256sum }}
 {{- end }}
@@ -294,6 +339,9 @@ checksum/config: {{ include (print .ctx.Template.BasePath "/mimir-config.yaml") 
 {{ toYaml . }}
 {{- end }}
 {{- if .component }}
+{{- if .ctx.Values.vaultAgent.enabled }}
+{{- include "mimir.vaultAgent.annotations" (dict "ctx" .ctx "component" .component) }}
+{{- end }}
 {{- $componentSection := include "mimir.componentSectionFromName" . | fromYaml }}
 {{- with ($componentSection).podAnnotations }}
 {{ toYaml . }}
@@ -355,6 +403,18 @@ Prometheus http prefix
 {{- end -}}
 
 {{/*
+KEDA Autoscaling Prometheus address
+*/}}
+{{- define "mimir.kedaPrometheusAddress" -}}
+{{- if not .ctx.Values.kedaAutoscaling.prometheusAddress -}}
+{{ include "mimir.metaMonitoring.metrics.remoteReadUrl" . }}
+{{- else -}}
+{{ .ctx.Values.kedaAutoscaling.prometheusAddress }}
+{{- end -}}
+{{- end -}}
+
+
+{{/*
 Cluster name that shows up in dashboard metrics
 */}}
 {{- define "mimir.clusterName" -}}
@@ -388,19 +448,22 @@ Examples:
 {{- define "mimir.componentSectionFromName" -}}
 {{- $componentsMap := dict
   "admin-api" "admin_api"
+  "admin-cache" "admin-cache"
   "alertmanager" "alertmanager"
   "chunks-cache" "chunks-cache"
   "compactor" "compactor"
   "continuous-test" "continuous_test"
   "distributor" "distributor"
+  "federation-frontend" "federation_frontend"
   "gateway" "gateway"
   "gr-aggr-cache" "gr-aggr-cache"
   "gr-metricname-cache" "gr-metricname-cache"
   "graphite-querier" "graphite.querier"
-  "graphite-web" "graphite.web"
   "graphite-write-proxy" "graphite.write_proxy"
   "index-cache" "index-cache"
   "ingester" "ingester"
+  "memcached" "memcached"
+  "meta-monitoring" "metaMonitoring.grafanaAgent"
   "metadata-cache" "metadata-cache"
   "nginx" "nginx"
   "overrides-exporter" "overrides_exporter"
@@ -409,6 +472,9 @@ Examples:
   "query-scheduler" "query_scheduler"
   "results-cache" "results-cache"
   "ruler" "ruler"
+  "ruler-querier" "ruler_querier"
+  "ruler-query-frontend" "ruler_query_frontend"
+  "ruler-query-scheduler" "ruler_query_scheduler"
   "smoke-test" "smoke_test"
   "store-gateway" "store_gateway"
   "tokengen" "tokengenJob"
@@ -424,6 +490,38 @@ Examples:
 {{- end -}}
 
 {{/*
+Return the Vault Agent pod annotations if enabled and required by the component
+mimir.vaultAgent.annotations takes 2 arguments
+  .ctx = the root context of the chart
+  .component = the name of the component
+*/}}
+{{- define "mimir.vaultAgent.annotations" -}}
+{{- $vaultEnabledComponents := dict
+  "admin-api" true
+  "alertmanager" true
+  "compactor" true
+  "distributor" true
+  "gateway" true
+  "ingester" true
+  "overrides-exporter" true
+  "querier" true
+  "query-frontend" true
+  "query-scheduler" true
+  "ruler" true
+  "store-gateway" true
+-}}
+{{- if hasKey $vaultEnabledComponents .component }}
+vault.hashicorp.com/agent-inject: 'true'
+vault.hashicorp.com/role: '{{ .ctx.Values.vaultAgent.roleName }}'
+vault.hashicorp.com/agent-inject-secret-client.crt: '{{ .ctx.Values.vaultAgent.clientCertPath }}'
+vault.hashicorp.com/agent-inject-secret-client.key: '{{ .ctx.Values.vaultAgent.clientKeyPath }}'
+vault.hashicorp.com/agent-inject-secret-server.crt: '{{ .ctx.Values.vaultAgent.serverCertPath }}'
+vault.hashicorp.com/agent-inject-secret-server.key: '{{ .ctx.Values.vaultAgent.serverKeyPath }}'
+vault.hashicorp.com/agent-inject-secret-root.crt: '{{ .ctx.Values.vaultAgent.caCertPath }}'
+{{- end}}
+{{- end -}}
+
+{{/*
 Get the no_auth_tenant from the configuration
 */}}
 {{- define "mimir.noAuthTenant" -}}
@@ -431,10 +529,16 @@ Get the no_auth_tenant from the configuration
 {{- end -}}
 
 {{/*
-Return if we should create a PodSecurityPoliPodSecurityPolicycy. Takes into account user values and supported kubernetes versions.
+Return if we should create a PodSecurityPolicy. Takes into account user values and supported kubernetes versions.
 */}}
 {{- define "mimir.rbac.usePodSecurityPolicy" -}}
-{{- and (semverCompare "< 1.25-0" (include "mimir.kubeVersion" .)) (and .Values.rbac.create (eq .Values.rbac.type "psp")) -}}
+{{- and
+      (
+        or (semverCompare "< 1.24-0" (include "mimir.kubeVersion" .))
+           (and (semverCompare "< 1.25-0" (include "mimir.kubeVersion" .)) .Values.rbac.forcePSPOnKubernetes124)
+      )
+      (and .Values.rbac.create (eq .Values.rbac.type "psp"))
+-}}
 {{- end -}}
 
 {{/*
@@ -448,6 +552,10 @@ Return if we should create a SecurityContextConstraints. Takes into account user
 {{ include "mimir.gatewayUrl" . }}/api/v1/push
 {{- end -}}
 
+{{- define "mimir.remoteReadUrl.inCluster" -}}
+{{ include "mimir.gatewayUrl" . }}{{ include "mimir.prometheusHttpPrefix" . }}
+{{- end -}}
+
 {{/*
 Creates dict for zone-aware replication configuration
 Params:
@@ -458,18 +566,19 @@ Return value:
     zoneName: {
       affinity: <affinity>,
       nodeSelector: <nodeSelector>,
-      replicas: <N>
+      replicas: <N>,
+      storageClass: <S>
     },
     ...
   }
 During migration there is a special case where an extra "zone" is generated with zonaName == "" empty string.
-The empty string evaulates to false in boolean expressions so it is treated as the default (non zone-aware) zone,
+The empty string evaluates to false in boolean expressions so it is treated as the default (non zone-aware) zone,
 which allows us to keep generating everything for the default zone.
 */}}
 {{- define "mimir.zoneAwareReplicationMap" -}}
 {{- $zonesMap := (dict) -}}
 {{- $componentSection := include "mimir.componentSectionFromName" . | fromYaml -}}
-{{- $defaultZone := (dict "affinity" $componentSection.affinity "nodeSelector" $componentSection.nodeSelector "replicas" $componentSection.replicas) -}}
+{{- $defaultZone := (dict "affinity" $componentSection.affinity "nodeSelector" $componentSection.nodeSelector "replicas" $componentSection.replicas "storageClass" $componentSection.storageClass) -}}
 
 {{- if $componentSection.zoneAwareReplication.enabled -}}
 {{- $numberOfZones := len $componentSection.zoneAwareReplication.zones -}}
@@ -488,6 +597,7 @@ which allows us to keep generating everything for the default zone.
   "affinity" (($rolloutZone.extraAffinity | default (dict)) | mergeOverwrite (include "mimir.zoneAntiAffinity" (dict "component" $.component "rolloutZoneName" $rolloutZone.name "topologyKey" $componentSection.zoneAwareReplication.topologyKey ) | fromYaml ) )
   "nodeSelector" ($rolloutZone.nodeSelector | default (dict) )
   "replicas" $replicaPerZone
+  "storageClass" $rolloutZone.storageClass
   ) -}}
 {{- end -}}
 {{- if $componentSection.zoneAwareReplication.migration.enabled -}}
@@ -521,10 +631,10 @@ podAntiAffinity:
             operator: In
             values:
               - {{ .component }}
-          - key: app.kubernetes.io/component
+          - key: zone
             operator: NotIn
             values:
-              - {{ .component }}-{{ .rolloutZoneName }}
+              - {{ .rolloutZoneName }}
       topologyKey: {{ .topologyKey | quote }}
 {{- else -}}
 {}
@@ -551,4 +661,68 @@ Params:
 
 {{- define "mimir.var_dump" -}}
 {{- . | mustToPrettyJson | printf "\nThe JSON output of the dumped var is: \n%s" | fail }}
+{{- end -}}
+
+
+{{/*
+siToBytes is used to convert Kubernetes byte units to bytes.
+Works for a sub set of SI suffixes: m, k, M, G, T, and their power-of-two equivalents: Ki, Mi, Gi, Ti.
+
+mimir.siToBytes takes 1 argument
+  .value = the input value with SI unit
+*/}}
+{{- define "mimir.siToBytes" -}}
+    {{- if (hasSuffix "Ki" .value) -}}
+        {{- trimSuffix "Ki" .value | float64 | mulf 1024 | ceil | int64 -}}
+    {{- else if (hasSuffix "Mi" .value) -}}
+        {{- trimSuffix "Mi" .value | float64 | mulf 1048576 | ceil | int64 -}}
+    {{- else if (hasSuffix "Gi" .value) -}}
+        {{- trimSuffix "Gi" .value | float64 | mulf 1073741824 | ceil | int64 -}}
+    {{- else if (hasSuffix "Ti" .value) -}}
+        {{- trimSuffix "Ti" .value | float64 | mulf 1099511627776 | ceil | int64 -}}
+    {{- else if (hasSuffix "k" .value) -}}
+        {{- trimSuffix "k" .value | float64 | mulf 1000 | ceil | int64 -}}
+    {{- else if (hasSuffix "M" .value) -}}
+        {{- trimSuffix "M" .value | float64 | mulf 1000000 | ceil | int64 -}}
+    {{- else if (hasSuffix "G" .value) -}}
+        {{- trimSuffix "G" .value | float64 | mulf 1000000000 | ceil | int64 -}}
+    {{- else if (hasSuffix "T" .value) -}}
+        {{- trimSuffix "T" .value | float64 | mulf 1000000000000 | ceil | int64 -}}
+    {{- else if (hasSuffix "m" .value) -}}
+        {{- trimSuffix "m" .value | float64 | mulf 0.001 | ceil | int64 -}}
+    {{- else -}}
+        {{- .value }}
+    {{- end -}}
+{{- end -}}
+
+{{/*
+parseCPU is used to convert Kubernetes CPU units to the corresponding float value of CPU cores.
+The returned value is a string representation. If you need to do any math on it, please parse the string first.
+
+mimir.parseCPU takes 1 argument
+  .value = the Kubernetes CPU request value
+*/}}
+{{- define "mimir.parseCPU" -}}
+    {{- $value_string := .value | toString -}}
+    {{- if (hasSuffix "m" $value_string) -}}
+        {{ trimSuffix "m" $value_string | float64 | mulf 0.001 -}}
+    {{- else -}}
+        {{- $value_string }}
+    {{- end -}}
+{{- end -}}
+
+{{/*
+cpuToMilliCPU is used to convert Kubernetes CPU units to MilliCPU.
+The returned value is a string representation. If you need to do any math on it, please parse the string first.
+
+mimir.cpuToMilliCPU takes 1 argument
+  .value = the Kubernetes CPU request value
+*/}}
+{{- define "mimir.cpuToMilliCPU" -}}
+    {{- $value_string := .value | toString -}}
+    {{- if (hasSuffix "m" $value_string) -}}
+        {{ trimSuffix "m" $value_string -}}
+    {{- else -}}
+        {{- $value_string | float64 | mulf 1000 | toString }}
+    {{- end -}}
 {{- end -}}

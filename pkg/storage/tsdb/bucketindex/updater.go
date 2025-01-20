@@ -14,6 +14,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/concurrency"
 	"github.com/grafana/dskit/runutil"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
@@ -21,8 +22,6 @@ import (
 
 	"github.com/grafana/mimir/pkg/storage/bucket"
 	"github.com/grafana/mimir/pkg/storage/tsdb/block"
-	"github.com/grafana/mimir/pkg/storage/tsdb/metadata"
-	util_log "github.com/grafana/mimir/pkg/util/log"
 )
 
 var (
@@ -34,14 +33,16 @@ var (
 
 // Updater is responsible to generate an update in-memory bucket index.
 type Updater struct {
-	bkt    objstore.InstrumentedBucket
-	logger log.Logger
+	bkt                           objstore.InstrumentedBucket
+	logger                        log.Logger
+	getDeletionMarkersConcurrency int
 }
 
-func NewUpdater(bkt objstore.Bucket, userID string, cfgProvider bucket.TenantConfigProvider, logger log.Logger) *Updater {
+func NewUpdater(bkt objstore.Bucket, userID string, cfgProvider bucket.TenantConfigProvider, getDeletionMarkersConcurrency int, logger log.Logger) *Updater {
 	return &Updater{
-		bkt:    bucket.NewUserBucketClient(userID, bkt, cfgProvider),
-		logger: util_log.WithUserID(userID, logger),
+		bkt:                           bucket.NewUserBucketClient(userID, bkt, cfgProvider),
+		getDeletionMarkersConcurrency: getDeletionMarkersConcurrency,
+		logger:                        logger,
 	}
 }
 
@@ -57,12 +58,27 @@ func (w *Updater) UpdateIndex(ctx context.Context, old *Index) (*Index, map[ulid
 		oldBlockDeletionMarks = old.BlockDeletionMarks
 	}
 
-	blocks, partials, err := w.updateBlocks(ctx, oldBlocks)
+	// It's important to list and update deletion marks *before* we list the blocks in the bucket in
+	// order to avoid a race condition in case there are 2 processes updating the bucket index at the same time.
+	//
+	// Updating markers before the blocks guarantees that, if another process is deleting a block while
+	// we do the markers or blocks listing and updating, we end up in one of the following situations (which are
+	// all legit):
+	// 1. Both the block and deletion mark don't exist anymore
+	// 2. The marker exists but the block doesn't because it has been deleted between listing markers
+	//    and listing blocks
+	// 3. Both the block and the deletion mark still exist
+	//
+	// But it can't happen that we end up in a situation where the deletion mark doesn't exist and
+	// the block still exists, which is what we want to avoid, otherwise we may update the bucket
+	// index with a block that has been deleted, it is still referenced in the list of blocks in the
+	// index, but its deletion mark is not referenced anymore in the index.
+	blockDeletionMarks, err := w.updateBlockDeletionMarks(ctx, oldBlockDeletionMarks)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	blockDeletionMarks, err := w.updateBlockDeletionMarks(ctx, oldBlockDeletionMarks)
+	blocks, partials, err := w.updateBlocks(ctx, oldBlocks)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -98,6 +114,8 @@ func (w *Updater) updateBlocks(ctx context.Context, old []*Block) (blocks []*Blo
 		}
 	}
 
+	level.Info(w.logger).Log("msg", "listed all blocks in storage", "newly_discovered", len(discovered), "existing", len(old))
+
 	// Remaining blocks are new ones and we have to fetch the meta.json for each of them, in order
 	// to find out if their upload has been completed (meta.json is uploaded last) and get the block
 	// information to store in the bucket index.
@@ -120,11 +138,17 @@ func (w *Updater) updateBlocks(ctx context.Context, old []*Block) (blocks []*Blo
 		}
 		return nil, nil, err
 	}
+	level.Info(w.logger).Log("msg", "fetched blocks metas for newly discovered blocks", "total_blocks", len(blocks), "partial_errors", len(partials))
 
 	return blocks, partials, nil
 }
 
 func (w *Updater) updateBlockIndexEntry(ctx context.Context, id ulid.ULID) (*Block, error) {
+	// Set a generous timeout for fetching the meta.json and getting the attributes of the same file.
+	// This protects against operations that can take unbounded time.
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+
 	metaFile := path.Join(id.String(), block.MetaFilename)
 
 	// Get the block's meta.json file.
@@ -143,12 +167,12 @@ func (w *Updater) updateBlockIndexEntry(ctx context.Context, id ulid.ULID) (*Blo
 	}
 
 	// Unmarshal it.
-	m := metadata.Meta{}
+	m := block.Meta{}
 	if err := json.Unmarshal(metaContent, &m); err != nil {
 		return nil, errors.Wrapf(ErrBlockMetaCorrupted, "unmarshal block meta file %s: %v", metaFile, err)
 	}
 
-	if m.Version != metadata.TSDBVersion1 {
+	if m.Version != block.TSDBVersion1 {
 		return nil, errors.Errorf("unexpected block meta version: %s version: %d", metaFile, m.Version)
 	}
 
@@ -170,18 +194,14 @@ func (w *Updater) updateBlockIndexEntry(ctx context.Context, id ulid.ULID) (*Blo
 
 func (w *Updater) updateBlockDeletionMarks(ctx context.Context, old []*BlockDeletionMark) ([]*BlockDeletionMark, error) {
 	out := make([]*BlockDeletionMark, 0, len(old))
-	discovered := map[ulid.ULID]struct{}{}
 
 	// Find all markers in the storage.
-	err := w.bkt.Iter(ctx, MarkersPathname+"/", func(name string) error {
-		if blockID, ok := IsBlockDeletionMarkFilename(path.Base(name)); ok {
-			discovered[blockID] = struct{}{}
-		}
-		return nil
-	})
+	discovered, err := block.ListBlockDeletionMarks(ctx, w.bkt)
 	if err != nil {
-		return nil, errors.Wrap(err, "list block deletion marks")
+		return nil, err
 	}
+
+	level.Info(w.logger).Log("msg", "listed deletion markers", "count", len(discovered))
 
 	// Since deletion marks are immutable, all markers already existing in the index can just be copied.
 	for _, m := range old {
@@ -192,35 +212,46 @@ func (w *Updater) updateBlockDeletionMarks(ctx context.Context, old []*BlockDele
 	}
 
 	// Remaining markers are new ones and we have to fetch them.
+	discoveredSlice := make([]ulid.ULID, 0, len(discovered))
 	for id := range discovered {
+		discoveredSlice = append(discoveredSlice, id)
+	}
+
+	updatedMarks, err := concurrency.ForEachJobMergeResults(ctx, discoveredSlice, w.getDeletionMarkersConcurrency, func(ctx context.Context, id ulid.ULID) ([]*BlockDeletionMark, error) {
 		m, err := w.updateBlockDeletionMarkIndexEntry(ctx, id)
 		if errors.Is(err, ErrBlockDeletionMarkNotFound) {
 			// This could happen if the block is permanently deleted between the "list objects" and now.
 			level.Warn(w.logger).Log("msg", "skipped missing block deletion mark when updating bucket index", "block", id.String())
-			continue
+			return nil, nil
 		}
 		if errors.Is(err, ErrBlockDeletionMarkCorrupted) {
 			level.Error(w.logger).Log("msg", "skipped corrupted block deletion mark when updating bucket index", "block", id.String(), "err", err)
-			continue
+			return nil, nil
 		}
 		if err != nil {
 			return nil, err
 		}
 
-		out = append(out, m)
+		return BlockDeletionMarks{m}, nil
+	})
+	if err != nil {
+		return nil, err
 	}
+	out = append(out, updatedMarks...)
+
+	level.Info(w.logger).Log("msg", "updated deletion markers for recently marked blocks", "count", len(discovered), "total_deletion_markers", len(out))
 
 	return out, nil
 }
 
 func (w *Updater) updateBlockDeletionMarkIndexEntry(ctx context.Context, id ulid.ULID) (*BlockDeletionMark, error) {
-	m := metadata.DeletionMark{}
+	m := block.DeletionMark{}
 
-	if err := metadata.ReadMarker(ctx, w.logger, w.bkt, id.String(), &m); err != nil {
-		if errors.Is(err, metadata.ErrorMarkerNotFound) {
+	if err := block.ReadMarker(ctx, w.logger, w.bkt, id.String(), &m); err != nil {
+		if errors.Is(err, block.ErrorMarkerNotFound) {
 			return nil, errors.Wrap(ErrBlockDeletionMarkNotFound, err.Error())
 		}
-		if errors.Is(err, metadata.ErrorUnmarshalMarker) {
+		if errors.Is(err, block.ErrorUnmarshalMarker) {
 			return nil, errors.Wrap(ErrBlockDeletionMarkCorrupted, err.Error())
 		}
 		return nil, err

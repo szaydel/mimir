@@ -46,7 +46,7 @@ var ErrInvalidState = errors.New("invalid state")
 // query currently allows filtering by and/or receiver group key.
 // It is configured via QueryParameter functions.
 //
-// TODO(fabxc): Future versions could allow querying a certain receiver
+// TODO(fabxc): Future versions could allow querying a certain receiver,
 // group or a given time interval.
 type query struct {
 	recv     *pb.Receiver
@@ -101,6 +101,8 @@ type metrics struct {
 	queryErrorsTotal        prometheus.Counter
 	queryDuration           prometheus.Histogram
 	propagatedMessagesTotal prometheus.Counter
+	maintenanceTotal        prometheus.Counter
+	maintenanceErrorsTotal  prometheus.Counter
 }
 
 func newMetrics(r prometheus.Registerer) *metrics {
@@ -120,6 +122,14 @@ func newMetrics(r prometheus.Registerer) *metrics {
 		Name: "alertmanager_nflog_snapshot_size_bytes",
 		Help: "Size of the last notification log snapshot in bytes.",
 	})
+	m.maintenanceTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "alertmanager_nflog_maintenance_total",
+		Help: "How many maintenances were executed for the notification log.",
+	})
+	m.maintenanceErrorsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "alertmanager_nflog_maintenance_errors_total",
+		Help: "How many maintenances were executed for the notification log that failed.",
+	})
 	m.queriesTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "alertmanager_nflog_queries_total",
 		Help: "Number of notification log queries were received.",
@@ -129,8 +139,12 @@ func newMetrics(r prometheus.Registerer) *metrics {
 		Help: "Number notification log received queries that failed.",
 	})
 	m.queryDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name: "alertmanager_nflog_query_duration_seconds",
-		Help: "Duration of notification log query evaluation.",
+		Name:                            "alertmanager_nflog_query_duration_seconds",
+		Help:                            "Duration of notification log query evaluation.",
+		Buckets:                         prometheus.DefBuckets,
+		NativeHistogramBucketFactor:     1.1,
+		NativeHistogramMaxBucketNumber:  100,
+		NativeHistogramMinResetDuration: 1 * time.Hour,
 	})
 	m.propagatedMessagesTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "alertmanager_nflog_gossip_messages_propagated_total",
@@ -146,6 +160,8 @@ func newMetrics(r prometheus.Registerer) *metrics {
 			m.queryErrorsTotal,
 			m.queryDuration,
 			m.propagatedMessagesTotal,
+			m.maintenanceTotal,
+			m.maintenanceErrorsTotal,
 		)
 	}
 	return m
@@ -200,7 +216,7 @@ func decodeState(r io.Reader) (state, error) {
 			st[stateKey(string(e.Entry.GroupKey), e.Entry.Receiver)] = &e
 			continue
 		}
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		return nil, err
@@ -317,12 +333,17 @@ func (l *Log) Maintenance(interval time.Duration, snapf string, stopc <-chan str
 	}
 
 	runMaintenance := func(do func() (int64, error)) error {
+		l.metrics.maintenanceTotal.Inc()
 		start := l.now().UTC()
 		level.Debug(l.logger).Log("msg", "Running maintenance")
 		size, err := do()
-		level.Debug(l.logger).Log("msg", "Maintenance done", "duration", l.now().Sub(start), "size", size)
 		l.metrics.snapshotSize.Set(float64(size))
-		return err
+		if err != nil {
+			l.metrics.maintenanceErrorsTotal.Inc()
+			return err
+		}
+		level.Debug(l.logger).Log("msg", "Maintenance done", "duration", l.now().Sub(start), "size", size)
+		return nil
 	}
 
 Loop:

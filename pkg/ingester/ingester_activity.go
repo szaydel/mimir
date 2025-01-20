@@ -10,12 +10,11 @@ import (
 	"strconv"
 
 	"github.com/grafana/dskit/tenant"
-	"github.com/weaveworks/common/tracing"
+	"github.com/grafana/dskit/tracing"
 
 	"github.com/grafana/mimir/pkg/ingester/client"
 	"github.com/grafana/mimir/pkg/mimirpb"
 	"github.com/grafana/mimir/pkg/util/activitytracker"
-	"github.com/grafana/mimir/pkg/util/push"
 )
 
 // ActivityTrackerWrapper is a wrapper around Ingester that adds queries to activity tracker.
@@ -34,11 +33,6 @@ func NewIngesterActivityTracker(ing *Ingester, tracker *activitytracker.Activity
 func (i *ActivityTrackerWrapper) Push(ctx context.Context, request *mimirpb.WriteRequest) (*mimirpb.WriteResponse, error) {
 	// No tracking in Push
 	return i.ing.Push(ctx, request)
-}
-
-func (i *ActivityTrackerWrapper) PushWithCleanup(ctx context.Context, r *push.Request) (*mimirpb.WriteResponse, error) {
-	// No tracking in PushWithCleanup
-	return i.ing.PushWithCleanup(ctx, r)
 }
 
 func (i *ActivityTrackerWrapper) QueryStream(request *client.QueryRequest, server client.Ingester_QueryStreamServer) error {
@@ -131,6 +125,15 @@ func (i *ActivityTrackerWrapper) LabelValuesCardinality(request *client.LabelVal
 	return i.ing.LabelValuesCardinality(request, server)
 }
 
+func (i *ActivityTrackerWrapper) ActiveSeries(request *client.ActiveSeriesRequest, server client.Ingester_ActiveSeriesServer) error {
+	ix := i.tracker.Insert(func() string {
+		return requestActivity(server.Context(), "Ingester/ActiveSeries", request)
+	})
+	defer i.tracker.Delete(ix)
+
+	return i.ing.ActiveSeries(request, server)
+}
+
 func (i *ActivityTrackerWrapper) FlushHandler(w http.ResponseWriter, r *http.Request) {
 	ix := i.tracker.Insert(func() string {
 		return requestActivity(r.Context(), "Ingester/FlushHandler", nil)
@@ -138,6 +141,42 @@ func (i *ActivityTrackerWrapper) FlushHandler(w http.ResponseWriter, r *http.Req
 	defer i.tracker.Delete(ix)
 
 	i.ing.FlushHandler(w, r)
+}
+
+func (i *ActivityTrackerWrapper) PrepareShutdownHandler(w http.ResponseWriter, r *http.Request) {
+	ix := i.tracker.Insert(func() string {
+		return requestActivity(r.Context(), "Ingester/PrepareShutdownHandler", nil)
+	})
+	defer i.tracker.Delete(ix)
+
+	i.ing.PrepareShutdownHandler(w, r)
+}
+
+func (i *ActivityTrackerWrapper) PreparePartitionDownscaleHandler(w http.ResponseWriter, r *http.Request) {
+	ix := i.tracker.Insert(func() string {
+		return requestActivity(r.Context(), "Ingester/PreparePartitionDownscaleHandler", nil)
+	})
+	defer i.tracker.Delete(ix)
+
+	i.ing.PreparePartitionDownscaleHandler(w, r)
+}
+
+func (i *ActivityTrackerWrapper) PrepareInstanceRingDownscaleHandler(w http.ResponseWriter, r *http.Request) {
+	ix := i.tracker.Insert(func() string {
+		return requestActivity(r.Context(), "Ingester/PrepareInstanceRingDownscaleHandler", nil)
+	})
+	defer i.tracker.Delete(ix)
+
+	i.ing.PrepareInstanceRingDownscaleHandler(w, r)
+}
+
+func (i *ActivityTrackerWrapper) PrepareUnregisterHandler(w http.ResponseWriter, r *http.Request) {
+	ix := i.tracker.Insert(func() string {
+		return requestActivity(r.Context(), "Ingester/PrepareUnregisterHandler", nil)
+	})
+	defer i.tracker.Delete(ix)
+
+	i.ing.PrepareUnregisterHandler(w, r)
 }
 
 func (i *ActivityTrackerWrapper) ShutdownHandler(w http.ResponseWriter, r *http.Request) {
@@ -156,6 +195,24 @@ func (i *ActivityTrackerWrapper) UserRegistryHandler(writer http.ResponseWriter,
 	defer i.tracker.Delete(ix)
 
 	i.ing.UserRegistryHandler(writer, request)
+}
+
+func (i *ActivityTrackerWrapper) TenantsHandler(w http.ResponseWriter, r *http.Request) {
+	ix := i.tracker.Insert(func() string {
+		return requestActivity(r.Context(), "Ingester/TenantsHandler", nil)
+	})
+	defer i.tracker.Delete(ix)
+
+	i.ing.TenantsHandler(w, r)
+}
+
+func (i *ActivityTrackerWrapper) TenantTSDBHandler(w http.ResponseWriter, r *http.Request) {
+	ix := i.tracker.Insert(func() string {
+		return requestActivity(r.Context(), "Ingester/TenantTSDBHandler", nil)
+	})
+	defer i.tracker.Delete(ix)
+
+	i.ing.TenantTSDBHandler(w, r)
 }
 
 func requestActivity(ctx context.Context, name string, req interface{}) string {
@@ -216,7 +273,12 @@ func queryRequestToString(sb *bytes.Buffer, req *client.QueryRequest) {
 		labelMatcherToString(sb, m)
 		sb.WriteString(",")
 	}
-	sb.WriteString("},}")
+	sb.WriteString("},")
+
+	b = b[:0]
+	sb.WriteString("StreamingChunksBatchSize:")
+	sb.Write(strconv.AppendUint(b, req.StreamingChunksBatchSize, 10))
+	sb.WriteString(",}")
 }
 
 func labelMatcherToString(sb *bytes.Buffer, m *client.LabelMatcher) {

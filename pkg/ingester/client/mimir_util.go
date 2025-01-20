@@ -33,6 +33,12 @@ func SendLabelValuesCardinalityResponse(s Ingester_LabelValuesCardinalityServer,
 	})
 }
 
+func SendActiveSeriesResponse(s Ingester_ActiveSeriesServer, response *ActiveSeriesResponse) error {
+	return sendWithContextErrChecking(s.Context(), func() error {
+		return s.Send(response)
+	})
+}
+
 func sendWithContextErrChecking(ctx context.Context, send func() error) error {
 	// If the context has been canceled or its deadline exceeded, we should return it
 	// instead of the cryptic error the Send() will return.
@@ -51,4 +57,32 @@ func sendWithContextErrChecking(ctx context.Context, send func() error) error {
 	}
 
 	return nil
+}
+
+// AccumulateChunks builds a slice of chunks, eliminating duplicates.
+// This is O(N^2) but most of the time N is small.
+// AccumulateChunks may return or modify either of the passed in slices.
+func AccumulateChunks(a, b []Chunk) []Chunk {
+	// If a is empty, we can just return b.
+	// The loop below effectively does the same thing for the opposite scenario (if b is empty, we'll just return a unmodified).
+	if len(a) == 0 {
+		return b
+	}
+
+	ret := a
+	for j := range b {
+		if !containsChunk(a, b[j]) {
+			ret = append(ret, b[j])
+		}
+	}
+	return ret
+}
+
+func containsChunk(a []Chunk, b Chunk) bool {
+	for i := range a {
+		if a[i].Equal(b) {
+			return true
+		}
+	}
+	return false
 }

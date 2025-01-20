@@ -61,7 +61,7 @@
 
     memberlistConfig:: {
       'memberlist.bind-port': gossipRingPort,
-      'memberlist.join': 'dns+gossip-ring.%s.svc.cluster.local:%d' % [$._config.namespace, gossipRingPort],
+      'memberlist.join': 'dns+gossip-ring.%s.svc.%s:%d' % [$._config.namespace, $._config.cluster_domain, gossipRingPort],
     } + (
       if $._config.memberlist_cluster_label == '' then {} else {
         'memberlist.cluster-label': $._config.memberlist_cluster_label,
@@ -111,6 +111,21 @@
     if !$._config.memberlist_ring_enabled then {} else gossipLabel
   ),
 
+  distributor_zone_a_deployment: overrideSuperIfExists(
+    'distributor_zone_a_deployment',
+    if !$._config.memberlist_ring_enabled then {} else gossipLabel
+  ),
+
+  distributor_zone_b_deployment: overrideSuperIfExists(
+    'distributor_zone_b_deployment',
+    if !$._config.memberlist_ring_enabled then {} else gossipLabel
+  ),
+
+  distributor_zone_c_deployment: overrideSuperIfExists(
+    'distributor_zone_c_deployment',
+    if !$._config.memberlist_ring_enabled then {} else gossipLabel
+  ),
+
   ingester_statefulset: overrideSuperIfExists(
     'ingester_statefulset',
     if !$._config.memberlist_ring_enabled then {} else gossipLabel
@@ -128,6 +143,21 @@
 
   ingester_zone_c_statefulset: overrideSuperIfExists(
     'ingester_zone_c_statefulset',
+    if !$._config.memberlist_ring_enabled then {} else gossipLabel
+  ),
+
+  ingester_partition_zone_a_statefulset: overrideSuperIfExists(
+    'ingester_partition_zone_a_statefulset',
+    if !$._config.memberlist_ring_enabled then {} else gossipLabel
+  ),
+
+  ingester_partition_zone_b_statefulset: overrideSuperIfExists(
+    'ingester_partition_zone_b_statefulset',
+    if !$._config.memberlist_ring_enabled then {} else gossipLabel
+  ),
+
+  ingester_partition_zone_c_statefulset: overrideSuperIfExists(
+    'ingester_partition_zone_c_statefulset',
     if !$._config.memberlist_ring_enabled then {} else gossipLabel
   ),
 
@@ -195,7 +225,8 @@
 
       local ports = [
         servicePort.newNamed('gossip-ring', gossipRingPort, gossipRingPort) +
-        servicePort.withProtocol('TCP'),
+        servicePort.withProtocol('TCP') +
+        servicePort.withAppProtocol('tcp'),
       ];
       service.new(
         'gossip-ring',  // name

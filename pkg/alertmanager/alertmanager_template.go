@@ -4,10 +4,14 @@ package alertmanager
 
 import (
 	"encoding/json"
+	"fmt"
 	tmplhtml "html/template"
 	"net/url"
+	"path"
+	"strings"
 	tmpltext "text/template"
 
+	"github.com/prometheus/alertmanager/asset"
 	"github.com/prometheus/alertmanager/template"
 )
 
@@ -57,15 +61,66 @@ func grafanaExploreURL(grafanaURL, datasource, from, to, expr string) (string, e
 	return grafanaURL + "/explore?left=" + url.QueryEscape(string(res)), err
 }
 
-// withCustomFunctions returns template.Option which adds additional template functions
+// queryFromGeneratorURL returns a PromQL expression parsed out from a GeneratorURL in Prometheus alert
+func queryFromGeneratorURL(generatorURL string) (string, error) {
+	u, err := url.Parse(generatorURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse generator URL: %w", err)
+	}
+	// See https://github.com/prometheus/prometheus/blob/259bb5c69263635887541964d1bfd7acc46682c6/util/strutil/strconv.go#L28
+	queryParam, ok := u.Query()["g0.expr"]
+	if !ok || len(queryParam) < 1 {
+		return "", fmt.Errorf("query not found in the generator URL")
+	}
+	query, err := url.QueryUnescape(queryParam[0])
+	if err != nil {
+		return "", fmt.Errorf("failed to URL decode the query: %w", err)
+	}
+	return query, nil
+}
+
+// WithCustomFunctions returns template.Option which adds additional template functions
 // to the default ones.
-func withCustomFunctions(userID string) template.Option {
+func WithCustomFunctions(userID string) template.Option {
 	funcs := tmpltext.FuncMap{
-		"tenantID":          func() string { return userID },
-		"grafanaExploreURL": grafanaExploreURL,
+		"tenantID":              func() string { return userID },
+		"grafanaExploreURL":     grafanaExploreURL,
+		"queryFromGeneratorURL": queryFromGeneratorURL,
 	}
 	return func(text *tmpltext.Template, html *tmplhtml.Template) {
 		text.Funcs(funcs)
 		html.Funcs(funcs)
 	}
+}
+
+// loadTemplates produces a template.Template from several in-memory template files.
+// It is adapted from FromGlobs in prometheus/alertmanager: https://github.com/prometheus/alertmanager/blob/9de8ef36755298a68b6ab20244d4369d38bdea99/template/template.go#L67-L95
+func loadTemplates(tmpls []string, options ...template.Option) (*template.Template, error) {
+	t, err := template.New(options...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Prometheus keeps its default templates in a virtual filesystem.
+	// Ensure these are included - this does not actually hit the disk.
+	defaultTemplates := []string{"default.tmpl", "email.tmpl"}
+
+	for _, file := range defaultTemplates {
+		f, err := asset.Assets.Open(path.Join("/templates", file))
+		if err != nil {
+			return nil, err
+		}
+		if err := t.Parse(f); err != nil {
+			f.Close()
+			return nil, err
+		}
+		f.Close()
+	}
+
+	for _, tp := range tmpls {
+		if err := t.Parse(strings.NewReader(tp)); err != nil {
+			return nil, err
+		}
+	}
+	return t, nil
 }

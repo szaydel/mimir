@@ -27,40 +27,35 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/prometheus/common/promslog"
 	"github.com/prometheus/prometheus/model/labels"
-	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
-	"github.com/prometheus/prometheus/tsdb/chunkenc"
-	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/providers/filesystem"
-	"golang.org/x/exp/slices"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/thanos-io/objstore"
-
 	"github.com/grafana/mimir/pkg/storage/tsdb/block"
-	"github.com/grafana/mimir/pkg/storage/tsdb/bucketindex"
-	"github.com/grafana/mimir/pkg/storage/tsdb/metadata"
+	util_log "github.com/grafana/mimir/pkg/util/log"
 )
 
 func TestSyncer_GarbageCollect_e2e(t *testing.T) {
 	foreachStore(t, func(t *testing.T, bkt objstore.Bucket) {
 		// Use bucket with global markers to make sure that our custom filters work correctly.
-		bkt = bucketindex.BucketWithGlobalMarkers(bkt)
+		bkt = block.BucketWithGlobalMarkers(bkt)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
 
 		// Generate 10 source block metas and construct higher level blocks
 		// that are higher compactions of them.
-		var metas []*metadata.Meta
+		var metas []*block.Meta
 		var ids []ulid.ULID
 
 		for i := 0; i < 10; i++ {
-			var m metadata.Meta
+			var m block.Meta
 
 			m.Version = 1
 			m.ULID = ulid.MustNew(uint64(i), nil)
@@ -73,21 +68,21 @@ func TestSyncer_GarbageCollect_e2e(t *testing.T) {
 			metas = append(metas, &m)
 		}
 
-		var m1 metadata.Meta
+		var m1 block.Meta
 		m1.Version = 1
 		m1.ULID = ulid.MustNew(100, nil)
 		m1.Compaction.Level = 2
 		m1.Compaction.Sources = ids[:4]
 		m1.Thanos.Downsample.Resolution = 0
 
-		var m2 metadata.Meta
+		var m2 block.Meta
 		m2.Version = 1
 		m2.ULID = ulid.MustNew(200, nil)
 		m2.Compaction.Level = 2
 		m2.Compaction.Sources = ids[4:8] // last two source IDs is not part of a level 2 block.
 		m2.Thanos.Downsample.Resolution = 0
 
-		var m3 metadata.Meta
+		var m3 block.Meta
 		m3.Version = 1
 		m3.ULID = ulid.MustNew(300, nil)
 		m3.Compaction.Level = 3
@@ -96,7 +91,7 @@ func TestSyncer_GarbageCollect_e2e(t *testing.T) {
 		m3.MinTime = 0
 		m3.MaxTime = 2 * time.Hour.Milliseconds()
 
-		var m4 metadata.Meta
+		var m4 block.Meta
 		m4.Version = 1
 		m4.ULID = ulid.MustNew(400, nil)
 		m4.Compaction.Level = 2
@@ -105,7 +100,7 @@ func TestSyncer_GarbageCollect_e2e(t *testing.T) {
 		m4.MinTime = 0
 		m4.MaxTime = 2 * time.Hour.Milliseconds()
 
-		var m5 metadata.Meta
+		var m5 block.Meta
 		m5.Version = 1
 		m5.ULID = ulid.MustNew(500, nil)
 		m5.Compaction.Level = 2
@@ -119,18 +114,17 @@ func TestSyncer_GarbageCollect_e2e(t *testing.T) {
 			fmt.Println("create", m.ULID)
 			var buf bytes.Buffer
 			require.NoError(t, json.NewEncoder(&buf).Encode(&m))
-			require.NoError(t, bkt.Upload(ctx, path.Join(m.ULID.String(), metadata.MetaFilename), &buf))
+			require.NoError(t, bkt.Upload(ctx, path.Join(m.ULID.String(), block.MetaFilename), &buf))
 		}
 
 		duplicateBlocksFilter := NewShardAwareDeduplicateFilter()
 		metaFetcher, err := block.NewMetaFetcher(nil, 32, objstore.WithNoopInstr(bkt), "", nil, []block.MetadataFilter{
 			duplicateBlocksFilter,
-		})
+		}, nil)
 		require.NoError(t, err)
 
 		blocksMarkedForDeletion := promauto.With(nil).NewCounter(prometheus.CounterOpts{})
-		ignoreDeletionMarkFilter := NewExcludeMarkedForDeletionFilter(nil)
-		sy, err := NewMetaSyncer(nil, nil, bkt, metaFetcher, duplicateBlocksFilter, ignoreDeletionMarkFilter, blocksMarkedForDeletion)
+		sy, err := newMetaSyncer(nil, nil, bkt, metaFetcher, duplicateBlocksFilter, blocksMarkedForDeletion)
 		require.NoError(t, err)
 
 		// Do one initial synchronization with the bucket.
@@ -143,7 +137,7 @@ func TestSyncer_GarbageCollect_e2e(t *testing.T) {
 			if !ok {
 				return nil
 			}
-			deletionMarkFile := path.Join(id.String(), metadata.DeletionMarkFilename)
+			deletionMarkFile := path.Join(id.String(), block.DeletionMarkFilename)
 
 			exists, err := bkt.Exists(ctx, deletionMarkFile)
 			if err != nil {
@@ -183,7 +177,7 @@ func TestSyncer_GarbageCollect_e2e(t *testing.T) {
 func TestGroupCompactE2E(t *testing.T) {
 	foreachStore(t, func(t *testing.T, bkt objstore.Bucket) {
 		// Use bucket with global markers to make sure that our custom filters work correctly.
-		bkt = bucketindex.BucketWithGlobalMarkers(bkt)
+		bkt = block.BucketWithGlobalMarkers(bkt)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
@@ -228,34 +222,32 @@ func TestGroupCompactE2E(t *testing.T) {
 
 		reg := prometheus.NewRegistry()
 
-		ignoreDeletionMarkFilter := NewExcludeMarkedForDeletionFilter(objstore.WithNoopInstr(bkt))
 		duplicateBlocksFilter := NewShardAwareDeduplicateFilter()
-		noCompactMarkerFilter := NewNoCompactionMarkFilter(objstore.WithNoopInstr(bkt), true)
+		noCompactMarkerFilter := NewNoCompactionMarkFilter(objstore.WithNoopInstr(bkt))
 		metaFetcher, err := block.NewMetaFetcher(nil, 32, objstore.WithNoopInstr(bkt), "", nil, []block.MetadataFilter{
-			ignoreDeletionMarkFilter,
 			duplicateBlocksFilter,
 			noCompactMarkerFilter,
-		})
+		}, nil)
 		require.NoError(t, err)
 
 		blocksMarkedForDeletion := promauto.With(nil).NewCounter(prometheus.CounterOpts{})
-		sy, err := NewMetaSyncer(nil, nil, bkt, metaFetcher, duplicateBlocksFilter, ignoreDeletionMarkFilter, blocksMarkedForDeletion)
+		sy, err := newMetaSyncer(nil, nil, bkt, metaFetcher, duplicateBlocksFilter, blocksMarkedForDeletion)
 		require.NoError(t, err)
 
-		comp, err := tsdb.NewLeveledCompactor(ctx, reg, logger, []int64{1000, 3000}, nil, nil, true)
+		comp, err := tsdb.NewLeveledCompactor(ctx, reg, util_log.SlogFromGoKit(logger), []int64{1000, 3000}, nil, nil)
 		require.NoError(t, err)
 
 		planner := NewSplitAndMergePlanner([]int64{1000, 3000})
 		grouper := NewSplitAndMergeGrouper("user-1", []int64{1000, 3000}, 0, 0, logger)
 		metrics := NewBucketCompactorMetrics(blocksMarkedForDeletion, prometheus.NewPedanticRegistry())
-		bComp, err := NewBucketCompactor(logger, sy, grouper, planner, comp, dir, bkt, 2, true, ownAllJobs, sortJobsByNewestBlocksFirst, 4, metrics)
+		bComp, err := NewBucketCompactor(logger, sy, grouper, planner, comp, dir, bkt, 2, true, ownAllJobs, sortJobsByNewestBlocksFirst, 0, 4, metrics)
 		require.NoError(t, err)
 
 		// Compaction on empty should not fail.
 		require.NoError(t, bComp.Compact(ctx, 0), 0)
 		assert.Equal(t, 0.0, promtest.ToFloat64(sy.metrics.blocksMarkedForDeletion))
 		assert.Equal(t, 0.0, promtest.ToFloat64(sy.metrics.garbageCollectionFailures))
-		assert.Equal(t, 0.0, promtest.ToFloat64(metrics.blocksMarkedForNoCompact))
+		assert.Equal(t, 0.0, promtest.ToFloat64(metrics.blocksMarkedForNoCompact.WithLabelValues(block.OutOfOrderChunksNoCompactReason)))
 		assert.Equal(t, 0.0, promtest.ToFloat64(metrics.groupCompactions))
 		assert.Equal(t, 0.0, promtest.ToFloat64(metrics.groupCompactionRunsStarted))
 		assert.Equal(t, 0.0, promtest.ToFloat64(metrics.groupCompactionRunsCompleted))
@@ -339,26 +331,16 @@ func TestGroupCompactE2E(t *testing.T) {
 					labels.FromStrings("a", "7"),
 				},
 			},
-		}, []blockgenSpec{
-			{
-				numSamples: 100, mint: 0, maxt: 499, extLset: extLabels, res: 124,
-				series: []labels.Labels{
-					labels.FromStrings("a", "1"),
-					labels.FromStrings("a", "1", "b", "2"),
-					labels.FromStrings("a", "3"),
-					labels.FromStrings("a", "4"),
-				},
-			},
 		})
 
 		require.NoError(t, bComp.Compact(ctx, 0), 0)
 		assert.Equal(t, 5.0, promtest.ToFloat64(sy.metrics.blocksMarkedForDeletion))
-		assert.Equal(t, 1.0, promtest.ToFloat64(metrics.blocksMarkedForNoCompact))
+		assert.Equal(t, 0.0, promtest.ToFloat64(metrics.blocksMarkedForNoCompact.WithLabelValues(block.OutOfOrderChunksNoCompactReason)))
 		assert.Equal(t, 0.0, promtest.ToFloat64(sy.metrics.garbageCollectionFailures))
 		assert.Equal(t, 2.0, promtest.ToFloat64(metrics.groupCompactions))
-		assert.Equal(t, 3.0, promtest.ToFloat64(metrics.groupCompactionRunsStarted))
+		assert.Equal(t, 2.0, promtest.ToFloat64(metrics.groupCompactionRunsStarted))
 		assert.Equal(t, 2.0, promtest.ToFloat64(metrics.groupCompactionRunsCompleted))
-		assert.Equal(t, 1.0, promtest.ToFloat64(metrics.groupCompactionRunsFailed))
+		assert.Equal(t, 0.0, promtest.ToFloat64(metrics.groupCompactionRunsFailed))
 
 		_, err = os.Stat(dir)
 		assert.True(t, os.IsNotExist(err), "dir %s should be remove after compaction.", dir)
@@ -370,9 +352,8 @@ func TestGroupCompactE2E(t *testing.T) {
 			metas[4].ULID: false,
 			metas[5].ULID: false,
 			metas[8].ULID: false,
-			metas[9].ULID: false,
 		}
-		others := map[string]metadata.Meta{}
+		others := map[string]block.Meta{}
 		require.NoError(t, bkt.Iter(ctx, "", func(n string) error {
 			id, ok := block.IsBlockDir(n)
 			if !ok {
@@ -389,7 +370,7 @@ func TestGroupCompactE2E(t *testing.T) {
 				return err
 			}
 
-			others[DefaultGroupKey(meta.Thanos)] = meta
+			others[defaultGroupKey(meta.Thanos.Downsample.Resolution, labels.FromMap(meta.Thanos.Labels))] = meta
 			return nil
 		}))
 
@@ -442,7 +423,7 @@ type blockgenSpec struct {
 	res        int64
 }
 
-func createAndUpload(t testing.TB, bkt objstore.Bucket, blocks []blockgenSpec, blocksWithOutOfOrderChunks []blockgenSpec) (metas []*metadata.Meta) {
+func createAndUpload(t testing.TB, bkt objstore.Bucket, blocks []blockgenSpec) (metas []*block.Meta) {
 	prepareDir := t.TempDir()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -453,20 +434,11 @@ func createAndUpload(t testing.TB, bkt objstore.Bucket, blocks []blockgenSpec, b
 		metas = append(metas, meta)
 		require.NoError(t, block.Upload(ctx, log.NewNopLogger(), bkt, filepath.Join(prepareDir, id.String()), nil))
 	}
-	for _, b := range blocksWithOutOfOrderChunks {
-		id, meta := createBlock(ctx, t, prepareDir, b)
-
-		err := putOutOfOrderIndex(filepath.Join(prepareDir, id.String()), b.mint, b.maxt)
-		require.NoError(t, err)
-
-		metas = append(metas, meta)
-		require.NoError(t, block.Upload(ctx, log.NewNopLogger(), bkt, filepath.Join(prepareDir, id.String()), nil))
-	}
 
 	return metas
 }
 
-func createBlock(ctx context.Context, t testing.TB, prepareDir string, b blockgenSpec) (id ulid.ULID, meta *metadata.Meta) {
+func createBlock(ctx context.Context, t testing.TB, prepareDir string, b blockgenSpec) (id ulid.ULID, meta *block.Meta) {
 	var err error
 	if b.numSamples == 0 {
 		id, err = createEmptyBlock(prepareDir, b.mint, b.maxt, b.extLset, b.res)
@@ -475,28 +447,28 @@ func createBlock(ctx context.Context, t testing.TB, prepareDir string, b blockge
 	}
 	require.NoError(t, err)
 
-	meta, err = metadata.ReadFromDir(filepath.Join(prepareDir, id.String()))
+	meta, err = block.ReadMetaFromDir(filepath.Join(prepareDir, id.String()))
 	require.NoError(t, err)
 	return
 }
 
-// Regression test for #2459 issue.
+// Regression test for Thanos issue #2459.
 func TestGarbageCollectDoesntCreateEmptyBlocksWithDeletionMarksOnly(t *testing.T) {
 	logger := log.NewLogfmtLogger(os.Stderr)
 
 	foreachStore(t, func(t *testing.T, bkt objstore.Bucket) {
 		// Use bucket with global markers to make sure that our custom filters work correctly.
-		bkt = bucketindex.BucketWithGlobalMarkers(bkt)
+		bkt = block.BucketWithGlobalMarkers(bkt)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
 
 		// Generate two blocks, and then another block that covers both of them.
-		var metas []*metadata.Meta
+		var metas []*block.Meta
 		var ids []ulid.ULID
 
 		for i := 0; i < 2; i++ {
-			var m metadata.Meta
+			var m block.Meta
 
 			m.Version = 1
 			m.ULID = ulid.MustNew(uint64(i), nil)
@@ -507,7 +479,7 @@ func TestGarbageCollectDoesntCreateEmptyBlocksWithDeletionMarksOnly(t *testing.T
 			metas = append(metas, &m)
 		}
 
-		var m1 metadata.Meta
+		var m1 block.Meta
 		m1.Version = 1
 		m1.ULID = ulid.MustNew(100, nil)
 		m1.Compaction.Level = 2
@@ -519,20 +491,18 @@ func TestGarbageCollectDoesntCreateEmptyBlocksWithDeletionMarksOnly(t *testing.T
 			fmt.Println("create", m.ULID)
 			var buf bytes.Buffer
 			require.NoError(t, json.NewEncoder(&buf).Encode(&m))
-			require.NoError(t, bkt.Upload(ctx, path.Join(m.ULID.String(), metadata.MetaFilename), &buf))
+			require.NoError(t, bkt.Upload(ctx, path.Join(m.ULID.String(), block.MetaFilename), &buf))
 		}
 
 		blocksMarkedForDeletion := promauto.With(nil).NewCounter(prometheus.CounterOpts{})
-		ignoreDeletionMarkFilter := NewExcludeMarkedForDeletionFilter(objstore.WithNoopInstr(bkt))
 
 		duplicateBlocksFilter := NewShardAwareDeduplicateFilter()
 		metaFetcher, err := block.NewMetaFetcher(nil, 32, objstore.WithNoopInstr(bkt), "", nil, []block.MetadataFilter{
-			ignoreDeletionMarkFilter,
 			duplicateBlocksFilter,
-		})
+		}, nil)
 		require.NoError(t, err)
 
-		sy, err := NewMetaSyncer(nil, nil, bkt, metaFetcher, duplicateBlocksFilter, ignoreDeletionMarkFilter, blocksMarkedForDeletion)
+		sy, err := newMetaSyncer(nil, nil, bkt, metaFetcher, duplicateBlocksFilter, blocksMarkedForDeletion)
 		require.NoError(t, err)
 
 		// Do one initial synchronization with the bucket.
@@ -570,7 +540,7 @@ func listBlocksMarkedForDeletion(ctx context.Context, bkt objstore.Bucket) ([]ul
 		if !ok {
 			return nil
 		}
-		deletionMarkFile := path.Join(id.String(), metadata.DeletionMarkFilename)
+		deletionMarkFile := path.Join(id.String(), block.DeletionMarkFilename)
 
 		exists, err := bkt.Exists(ctx, deletionMarkFile)
 		if err != nil {
@@ -648,10 +618,10 @@ func createEmptyBlock(dir string, mint, maxt int64, extLset labels.Labels, resol
 		return ulid.ULID{}, errors.Wrap(err, "saving meta.json")
 	}
 
-	if _, err = metadata.InjectThanos(log.NewNopLogger(), filepath.Join(dir, uid.String()), metadata.Thanos{
+	if _, err = block.InjectThanosMeta(log.NewNopLogger(), filepath.Join(dir, uid.String()), block.ThanosMeta{
 		Labels:     extLset.Map(),
-		Downsample: metadata.ThanosDownsample{Resolution: resolution},
-		Source:     metadata.TestSource,
+		Downsample: block.ThanosDownsample{Resolution: resolution},
+		Source:     block.TestSource,
 	}, nil); err != nil {
 		return ulid.ULID{}, errors.Wrap(err, "finalize block")
 	}
@@ -722,27 +692,32 @@ func createBlockWithOptions(
 	if err := g.Wait(); err != nil {
 		return id, err
 	}
-	c, err := tsdb.NewLeveledCompactor(ctx, nil, log.NewNopLogger(), []int64{maxt - mint}, nil, nil, true)
+	c, err := tsdb.NewLeveledCompactor(ctx, nil, promslog.NewNopLogger(), []int64{maxt - mint}, nil, nil)
 	if err != nil {
 		return id, errors.Wrap(err, "create compactor")
 	}
 
-	id, err = c.Write(dir, h, mint, maxt, nil)
+	blocks, err := c.Write(dir, h, mint, maxt, nil)
 	if err != nil {
 		return id, errors.Wrap(err, "write block")
 	}
 
-	if id.Compare(ulid.ULID{}) == 0 {
+	if len(blocks) == 0 || (blocks[0] == ulid.ULID{}) {
 		return id, errors.Errorf("nothing to write, asked for %d samples", numSamples)
 	}
+	if len(blocks) > 1 {
+		return id, errors.Errorf("expected one block, got %d, asked for %d samples", len(blocks), numSamples)
+	}
+
+	id = blocks[0]
 
 	blockDir := filepath.Join(dir, id.String())
 
-	if _, err = metadata.InjectThanos(log.NewNopLogger(), blockDir, metadata.Thanos{
+	if _, err = block.InjectThanosMeta(log.NewNopLogger(), blockDir, block.ThanosMeta{
 		Labels:     extLset.Map(),
-		Downsample: metadata.ThanosDownsample{Resolution: resolution},
-		Source:     metadata.TestSource,
-		Files:      []metadata.File{},
+		Downsample: block.ThanosDownsample{Resolution: resolution},
+		Source:     block.TestSource,
+		Files:      []block.File{},
 	}, nil); err != nil {
 		return id, errors.Wrap(err, "finalize block")
 	}
@@ -754,104 +729,4 @@ func createBlockWithOptions(
 	}
 
 	return id, nil
-}
-
-var indexFilename = "index"
-
-type indexWriterSeries struct {
-	labels labels.Labels
-	chunks []chunks.Meta // series file offset of chunks
-}
-
-type indexWriterSeriesSlice []*indexWriterSeries
-
-// putOutOfOrderIndex updates the index in blockDir with an index containing an out-of-order chunk
-// copied from https://github.com/prometheus/prometheus/blob/b1ed4a0a663d0c62526312311c7529471abbc565/tsdb/index/index_test.go#L346
-func putOutOfOrderIndex(blockDir string, minTime int64, maxTime int64) error {
-
-	if minTime >= maxTime || minTime+4 >= maxTime {
-		return fmt.Errorf("minTime must be at least 4 less than maxTime to not create overlapping chunks")
-	}
-
-	lbls := []labels.Labels{
-		labels.FromStrings("lbl1", "1"),
-	}
-
-	// Sort labels as the index writer expects series in sorted order.
-	sort.Sort(labels.Slice(lbls))
-
-	symbols := map[string]struct{}{}
-	for _, lset := range lbls {
-		for _, l := range lset {
-			symbols[l.Name] = struct{}{}
-			symbols[l.Value] = struct{}{}
-		}
-	}
-
-	var input indexWriterSeriesSlice
-
-	// Generate ChunkMetas for every label set.
-	for _, lset := range lbls {
-		var metas []chunks.Meta
-		// only need two chunks that are out-of-order
-		chk1 := chunks.Meta{
-			MinTime: maxTime - 2,
-			MaxTime: maxTime - 1,
-			Ref:     chunks.ChunkRef(rand.Uint64()),
-			Chunk:   chunkenc.NewXORChunk(),
-		}
-		metas = append(metas, chk1)
-		chk2 := chunks.Meta{
-			MinTime: minTime + 1,
-			MaxTime: minTime + 2,
-			Ref:     chunks.ChunkRef(rand.Uint64()),
-			Chunk:   chunkenc.NewXORChunk(),
-		}
-		metas = append(metas, chk2)
-
-		input = append(input, &indexWriterSeries{
-			labels: lset,
-			chunks: metas,
-		})
-	}
-
-	iw, err := index.NewWriter(context.Background(), filepath.Join(blockDir, indexFilename))
-	if err != nil {
-		return err
-	}
-
-	syms := []string{}
-	for s := range symbols {
-		syms = append(syms, s)
-	}
-	slices.Sort(syms)
-	for _, s := range syms {
-		if err := iw.AddSymbol(s); err != nil {
-			return err
-		}
-	}
-
-	// Population procedure as done by compaction.
-	var (
-		postings = index.NewMemPostings()
-		values   = map[string]map[string]struct{}{}
-	)
-
-	for i, s := range input {
-		if err := iw.AddSeries(storage.SeriesRef(i), s.labels, s.chunks...); err != nil {
-			return err
-		}
-
-		for _, l := range s.labels {
-			valset, ok := values[l.Name]
-			if !ok {
-				valset = map[string]struct{}{}
-				values[l.Name] = valset
-			}
-			valset[l.Value] = struct{}{}
-		}
-		postings.Add(storage.SeriesRef(i), s.labels)
-	}
-
-	return iw.Close()
 }

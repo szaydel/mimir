@@ -12,7 +12,8 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/gogo/status"
+	"github.com/grafana/dskit/grpcutil"
+	"github.com/grafana/dskit/user"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/exemplar"
@@ -21,10 +22,9 @@ import (
 	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/notifier"
 	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/rules"
 	"github.com/prometheus/prometheus/storage"
-	"github.com/weaveworks/common/httpgrpc"
-	"github.com/weaveworks/common/user"
 
 	"github.com/grafana/mimir/pkg/mimirpb"
 	"github.com/grafana/mimir/pkg/querier"
@@ -41,15 +41,20 @@ type PusherAppender struct {
 	failedWrites prometheus.Counter
 	totalWrites  prometheus.Counter
 
-	ctx     context.Context
-	pusher  Pusher
-	labels  []labels.Labels
-	samples []mimirpb.Sample
-	userID  string
+	ctx             context.Context
+	pusher          Pusher
+	labels          [][]mimirpb.LabelAdapter
+	samples         []mimirpb.Sample
+	histogramLabels [][]mimirpb.LabelAdapter
+	histograms      []mimirpb.Histogram
+	userID          string
+}
+
+func (a *PusherAppender) SetOptions(*storage.AppendOptions) {
 }
 
 func (a *PusherAppender) Append(_ storage.SeriesRef, l labels.Labels, t int64, v float64) (storage.SeriesRef, error) {
-	a.labels = append(a.labels, l)
+	a.labels = append(a.labels, mimirpb.FromLabelsToLabelAdapters(l))
 	a.samples = append(a.samples, mimirpb.Sample{
 		TimestampMs: t,
 		Value:       v,
@@ -65,8 +70,24 @@ func (a *PusherAppender) UpdateMetadata(_ storage.SeriesRef, _ labels.Labels, _ 
 	return 0, errors.New("metadata updates are unsupported")
 }
 
-func (a *PusherAppender) AppendHistogram(_ storage.SeriesRef, _ labels.Labels, _ int64, _ *histogram.Histogram, _ *histogram.FloatHistogram) (storage.SeriesRef, error) {
-	return 0, errors.New("histograms are unsupported")
+func (a *PusherAppender) AppendHistogram(_ storage.SeriesRef, l labels.Labels, t int64, h *histogram.Histogram, fh *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	a.histogramLabels = append(a.histogramLabels, mimirpb.FromLabelsToLabelAdapters(l))
+	var hp mimirpb.Histogram
+	if h != nil {
+		hp = mimirpb.FromHistogramToHistogramProto(t, h)
+	} else {
+		hp = mimirpb.FromFloatHistogramToHistogramProto(t, fh)
+	}
+	a.histograms = append(a.histograms, hp)
+	return 0, nil
+}
+
+func (a *PusherAppender) AppendCTZeroSample(_ storage.SeriesRef, _ labels.Labels, _, _ int64) (storage.SeriesRef, error) {
+	return 0, errors.New("CT zero samples are unsupported")
+}
+
+func (a *PusherAppender) AppendHistogramCTZeroSample(storage.SeriesRef, labels.Labels, int64, int64, *histogram.Histogram, *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	return 0, errors.New("CT zero samples are unsupported")
 }
 
 func (a *PusherAppender) Commit() error {
@@ -74,11 +95,14 @@ func (a *PusherAppender) Commit() error {
 
 	// Since a.pusher is distributor, client.ReuseSlice will be called in a.pusher.Push.
 	// We shouldn't call client.ReuseSlice here.
-	_, err := a.pusher.Push(user.InjectOrgID(a.ctx, a.userID), mimirpb.ToWriteRequest(a.labels, a.samples, nil, nil, mimirpb.RULE))
+	req := mimirpb.ToWriteRequest(a.labels, a.samples, nil, nil, mimirpb.RULE)
+	req.AddHistogramSeries(a.histogramLabels, a.histograms, nil)
+	_, err := a.pusher.Push(user.InjectOrgID(a.ctx, a.userID), req)
 
 	if err != nil {
-		// Don't report errors that ended with 4xx HTTP status code (series limits, duplicate samples, out of order, etc.)
-		if resp, ok := httpgrpc.HTTPResponseFromError(err); !ok || resp.Code/100 != 4 {
+		// Don't report client errors, which are the same ones that would be reported with 4xx HTTP status code
+		// (e.g. series limits, duplicate samples, out of order, etc.)
+		if !mimirpb.IsClientError(err) {
 			a.failedWrites.Inc()
 		}
 	}
@@ -103,7 +127,7 @@ type PusherAppendable struct {
 	failedWrites prometheus.Counter
 }
 
-func NewPusherAppendable(pusher Pusher, userID string, limits RulesLimits, totalWrites, failedWrites prometheus.Counter) *PusherAppendable {
+func NewPusherAppendable(pusher Pusher, userID string, totalWrites, failedWrites prometheus.Counter) *PusherAppendable {
 	return &PusherAppendable{
 		pusher:       pusher,
 		userID:       userID,
@@ -124,25 +148,79 @@ func (t *PusherAppendable) Appender(ctx context.Context) storage.Appender {
 	}
 }
 
+type NoopAppender struct{}
+
+func (a *NoopAppender) SetOptions(*storage.AppendOptions) {
+}
+
+func (a *NoopAppender) Append(_ storage.SeriesRef, _ labels.Labels, _ int64, _ float64) (storage.SeriesRef, error) {
+	return 0, nil
+}
+
+func (a *NoopAppender) AppendExemplar(_ storage.SeriesRef, _ labels.Labels, _ exemplar.Exemplar) (storage.SeriesRef, error) {
+	return 0, errors.New("exemplars are unsupported")
+}
+
+func (a *NoopAppender) UpdateMetadata(_ storage.SeriesRef, _ labels.Labels, _ metadata.Metadata) (storage.SeriesRef, error) {
+	return 0, errors.New("metadata updates are unsupported")
+}
+
+func (a *NoopAppender) AppendHistogram(_ storage.SeriesRef, _ labels.Labels, _ int64, _ *histogram.Histogram, _ *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	return 0, nil
+}
+
+func (a *NoopAppender) AppendCTZeroSample(_ storage.SeriesRef, _ labels.Labels, _, _ int64) (storage.SeriesRef, error) {
+	return 0, errors.New("CT zero samples are unsupported")
+}
+
+func (a *NoopAppender) AppendHistogramCTZeroSample(storage.SeriesRef, labels.Labels, int64, int64, *histogram.Histogram, *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	return 0, errors.New("CT zero samples are unsupported")
+}
+
+func (a *NoopAppender) Commit() error {
+	return nil
+}
+
+func (a *NoopAppender) Rollback() error {
+	return nil
+}
+
+type NoopAppendable struct{}
+
+func NewNoopAppendable() *NoopAppendable {
+	return &NoopAppendable{}
+}
+
+// Appender returns a storage.Appender.
+func (t *NoopAppendable) Appender(_ context.Context) storage.Appender {
+	return &NoopAppender{}
+}
+
 // RulesLimits defines limits used by Ruler.
 type RulesLimits interface {
 	EvaluationDelay(userID string) time.Duration
 	RulerTenantShardSize(userID string) int
-	RulerMaxRuleGroupsPerTenant(userID string) int
-	RulerMaxRulesPerRuleGroup(userID string) int
+	RulerMaxRuleGroupsPerTenant(userID, namespace string) int
+	RulerMaxRulesPerRuleGroup(userID, namespace string) int
 	RulerRecordingRulesEvaluationEnabled(userID string) bool
 	RulerAlertingRulesEvaluationEnabled(userID string) bool
+	RulerSyncRulesOnChangesEnabled(userID string) bool
+	RulerProtectedNamespaces(userID string) []string
+	RulerMaxIndependentRuleEvaluationConcurrencyPerTenant(userID string) int64
 }
 
-func MetricsQueryFunc(qf rules.QueryFunc, queries, failedQueries prometheus.Counter) rules.QueryFunc {
+func MetricsQueryFunc(qf rules.QueryFunc, queries, failedQueries prometheus.Counter, remoteQuerier bool) rules.QueryFunc {
 	return func(ctx context.Context, qs string, t time.Time) (promql.Vector, error) {
 		queries.Inc()
 		result, err := qf(ctx, qs, t)
+		if err == nil {
+			return result, nil
+		}
 
 		// We only care about errors returned by underlying Queryable. Errors returned by PromQL engine are "user-errors",
 		// and not interesting here.
 		qerr := QueryableError{}
-		if err != nil && errors.As(err, &qerr) {
+		if errors.As(err, &qerr) {
 			origErr := qerr.Unwrap()
 
 			// Not all errors returned by Queryable are interesting, only those that would result in 500 status code.
@@ -160,10 +238,9 @@ func MetricsQueryFunc(qf rules.QueryFunc, queries, failedQueries prometheus.Coun
 
 			// Return unwrapped error.
 			return result, origErr
-
-		} else if err != nil {
+		} else if remoteQuerier {
 			// When remote querier enabled, consider anything an error except those with 4xx status code.
-			st, ok := status.FromError(err)
+			st, ok := grpcutil.ErrorToStatus(err)
 			if !(ok && st.Code()/100 == 4) {
 				failedQueries.Inc()
 			}
@@ -172,8 +249,8 @@ func MetricsQueryFunc(qf rules.QueryFunc, queries, failedQueries prometheus.Coun
 	}
 }
 
-func RecordAndReportRuleQueryMetrics(qf rules.QueryFunc, queryTime prometheus.Counter, logger log.Logger) rules.QueryFunc {
-	if queryTime == nil {
+func RecordAndReportRuleQueryMetrics(qf rules.QueryFunc, queryTime, zeroFetchedSeriesCount prometheus.Counter, logger log.Logger) rules.QueryFunc {
+	if queryTime == nil || zeroFetchedSeriesCount == nil {
 		return qf
 	}
 
@@ -184,6 +261,7 @@ func RecordAndReportRuleQueryMetrics(qf rules.QueryFunc, queryTime prometheus.Co
 		stats, ctx := querier_stats.ContextWithEmptyStats(ctx)
 		// If we've been passed a counter we want to record the wall time spent executing this request.
 		timer := prometheus.NewTimer(nil)
+		var err error
 		defer func() {
 			// Update stats wall time based on the timer created above.
 			stats.AddWallTime(timer.ObserveDuration())
@@ -195,6 +273,15 @@ func RecordAndReportRuleQueryMetrics(qf rules.QueryFunc, queryTime prometheus.Co
 			shardedQueries := stats.LoadShardedQueries()
 
 			queryTime.Add(wallTime.Seconds())
+			// Do not count queries with errors for zero fetched series, or queries
+			// with no selectors that are not meant to fetch any series.
+			if err == nil && numSeries == 0 {
+				if expr, err := parser.ParseExpr(qs); err == nil {
+					if len(parser.ExtractSelectors(expr)) > 0 {
+						zeroFetchedSeriesCount.Add(1)
+					}
+				}
+			}
 
 			// Log ruler query stats.
 			logMessage := []interface{}{
@@ -224,7 +311,7 @@ type RulesManager interface {
 	Stop()
 
 	// Update rules manager state.
-	Update(interval time.Duration, files []string, externalLabels labels.Labels, externalURL string, ruleGroupPostProcessFunc rules.RuleGroupPostProcessFunc) error
+	Update(interval time.Duration, files []string, externalLabels labels.Labels, externalURL string, groupEvalIterationFunc rules.GroupEvalIterationFunc) error
 
 	// RuleGroups returns current rules groups.
 	RuleGroups() []*rules.Group
@@ -235,9 +322,10 @@ type ManagerFactory func(ctx context.Context, userID string, notifier *notifier.
 
 func DefaultTenantManagerFactory(
 	cfg Config,
-	p Pusher,
-	embeddedQueryable storage.Queryable,
+	pusher Pusher,
+	queryable storage.Queryable,
 	queryFunc rules.QueryFunc,
+	concurrencyController MultiTenantRuleConcurrencyController,
 	overrides RulesLimits,
 	reg prometheus.Registerer,
 ) ManagerFactory {
@@ -259,41 +347,60 @@ func DefaultTenantManagerFactory(
 		Help: "Number of failed queries by ruler.",
 	})
 	var rulerQuerySeconds *prometheus.CounterVec
+	var zeroFetchedSeriesQueries *prometheus.CounterVec
 	if cfg.EnableQueryStats {
 		rulerQuerySeconds = promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: "cortex_ruler_query_seconds_total",
 			Help: "Total amount of wall clock time spent processing queries by the ruler.",
 		}, []string{"user"})
+		zeroFetchedSeriesQueries = promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "cortex_ruler_queries_zero_fetched_series_total",
+			Help: "Number of queries that did not fetch any series by ruler.",
+		}, []string{"user"})
 	}
 	return func(ctx context.Context, userID string, notifier *notifier.Manager, logger log.Logger, reg prometheus.Registerer) RulesManager {
 		var queryTime prometheus.Counter
+		var zeroFetchedSeriesCount prometheus.Counter
 		if rulerQuerySeconds != nil {
 			queryTime = rulerQuerySeconds.WithLabelValues(userID)
+			zeroFetchedSeriesCount = zeroFetchedSeriesQueries.WithLabelValues(userID)
 		}
-		var wrappedQueryFunc rules.QueryFunc
 
-		wrappedQueryFunc = MetricsQueryFunc(queryFunc, totalQueries, failedQueries)
-		wrappedQueryFunc = RecordAndReportRuleQueryMetrics(wrappedQueryFunc, queryTime, logger)
+		// Wrap the query function with our custom logic.
+		wrappedQueryFunc := WrapQueryFuncWithReadConsistency(queryFunc, logger)
+		wrappedQueryFunc = MetricsQueryFunc(wrappedQueryFunc, totalQueries, failedQueries, cfg.QueryFrontend.Address != "")
+		wrappedQueryFunc = RecordAndReportRuleQueryMetrics(wrappedQueryFunc, queryTime, zeroFetchedSeriesCount, logger)
+
+		// Wrap the queryable with our custom logic.
+		wrappedQueryable := WrapQueryableWithReadConsistency(queryable, logger)
+
+		var appendeable storage.Appendable
+		if cfg.RuleEvaluationWriteEnabled {
+			appendeable = NewPusherAppendable(pusher, userID, totalWrites, failedWrites)
+		} else {
+			appendeable = NewNoopAppendable()
+		}
 
 		return rules.NewManager(&rules.ManagerOptions{
-			Appendable:                 NewPusherAppendable(p, userID, overrides, totalWrites, failedWrites),
-			Queryable:                  embeddedQueryable,
+			Appendable:                 appendeable,
+			Queryable:                  wrappedQueryable,
 			QueryFunc:                  wrappedQueryFunc,
 			Context:                    user.InjectOrgID(ctx, userID),
 			GroupEvaluationContextFunc: FederatedGroupContextFunc,
 			ExternalURL:                cfg.ExternalURL.URL,
 			NotifyFunc:                 rules.SendAlerts(notifier, cfg.ExternalURL.String()),
-			Logger:                     log.With(logger, "user", userID),
+			Logger:                     util_log.SlogFromGoKit(log.With(logger, "component", "ruler", "insight", true, "user", userID)),
 			Registerer:                 reg,
 			OutageTolerance:            cfg.OutageTolerance,
 			ForGracePeriod:             cfg.ForGracePeriod,
 			ResendDelay:                cfg.ResendDelay,
 			AlwaysRestoreAlertState:    true,
-			DefaultEvaluationDelay: func() time.Duration {
+			DefaultRuleQueryOffset: func() time.Duration {
 				// Delay the evaluation of all rules by a set interval to give a buffer
 				// to metric that haven't been forwarded to Mimir yet.
 				return overrides.EvaluationDelay(userID)
 			},
+			RuleConcurrencyController: concurrencyController.NewTenantConcurrencyControllerFor(userID),
 		})
 	}
 }

@@ -8,39 +8,59 @@ package integration
 
 import (
 	"bytes"
-	"math"
-	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 
+	"github.com/grafana/e2e"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/prompb"
-	"github.com/prometheus/prometheus/storage/remote"
-	"github.com/prometheus/prometheus/tsdb"
 
-	"github.com/grafana/e2e"
+	"github.com/grafana/mimir/integration/e2ehistograms"
 )
 
 var (
 	// Expose some utilities from the framework so that we don't have to prefix them
 	// with the package name in tests.
-	mergeFlags      = e2e.MergeFlags
-	generateSeries  = e2e.GenerateSeries
-	generateNSeries = e2e.GenerateNSeries
+	mergeFlags = e2e.MergeFlags
 
-	// These are the earliest and latest possible timestamps supported by the Prometheus API -
-	// the Prometheus API does not support omitting a time range from query requests,
-	// so we use these when we want to query over all time.
-	// These values are defined in github.com/prometheus/prometheus/web/api/v1/api.go but
-	// sadly not exported.
-	prometheusMinTime = time.Unix(math.MinInt64/1000+62135596801, 0).UTC()
-	prometheusMaxTime = time.Unix(math.MaxInt64/1000-62135596801, 999999999).UTC()
+	generateFloatSeries  = e2e.GenerateSeries
+	generateNFloatSeries = e2e.GenerateNSeries
+
+	// These are local, because e2e is used by non metric products that do not have native histograms
+	generateHistogramSeries  = e2ehistograms.GenerateHistogramSeries
+	generateNHistogramSeries = e2ehistograms.GenerateNHistogramSeries
 )
+
+// generateSeriesFunc defines what kind of series (and expected vectors/matrices) to generate - float samples or native histograms
+type generateSeriesFunc func(name string, ts time.Time, additionalLabels ...prompb.Label) (series []prompb.TimeSeries, vector model.Vector, matrix model.Matrix)
+
+// Generates different typed series based on an index in i.
+// Use with a large enough number of series, e.g. i>100
+func generateAlternatingSeries(i int) generateSeriesFunc {
+	switch i % 5 {
+	case 0:
+		return generateFloatSeries
+	case 1:
+		return generateHistogramSeries
+	case 2:
+		return e2ehistograms.GenerateFloatHistogramSeries
+	case 3:
+		return e2ehistograms.GenerateGaugeHistogramSeries
+	case 4:
+		return e2ehistograms.GenerateGaugeFloatHistogramSeries
+	default:
+		return nil
+	}
+}
+
+// generateNSeriesFunc defines what kind of n * series (and expected vectors) to generate - float samples or native histograms
+type generateNSeriesFunc func(nSeries, nExemplars int, name func() string, ts time.Time, additionalLabels func() []prompb.Label) (series []prompb.TimeSeries, vector model.Vector)
 
 func getMimirProjectDir() string {
 	if dir := os.Getenv("MIMIR_CHECKOUT_DIR"); dir != "" {
@@ -116,165 +136,96 @@ func getTLSFlagsWithPrefix(prefix string, servername string, http bool) map[stri
 	return flags
 }
 
-func GenerateTestHistogram(i int) *histogram.Histogram {
-	return tsdb.GenerateTestHistograms(i + 1)[i]
-}
+func filterSamplesByTimestamp(input []prompb.Sample, startMs, endMs int64) []prompb.Sample {
+	var filtered []prompb.Sample
 
-func GenerateTestFloatHistogram(i int) *histogram.FloatHistogram {
-	return tsdb.GenerateTestFloatHistograms(i + 1)[i]
-}
-
-// explicit decoded version of GenerateTestHistogram and GenerateTestFloatHistogram
-func GenerateTestSampleHistogram(i int) *model.SampleHistogram {
-	return &model.SampleHistogram{
-		Count: model.FloatString(10 + i*8),
-		Sum:   model.FloatString(18.4 * float64(i+1)),
-		Buckets: model.HistogramBuckets{
-			&model.HistogramBucket{
-				Boundaries: 1,
-				Lower:      -4,
-				Upper:      -2.82842712474619,
-				Count:      model.FloatString(1 + i),
-			},
-			&model.HistogramBucket{
-				Boundaries: 1,
-				Lower:      -2.82842712474619,
-				Upper:      -2,
-				Count:      model.FloatString(1 + i),
-			},
-			&model.HistogramBucket{
-				Boundaries: 1,
-				Lower:      -1.414213562373095,
-				Upper:      -1,
-				Count:      model.FloatString(2 + i),
-			},
-			&model.HistogramBucket{
-				Boundaries: 1,
-				Lower:      -1,
-				Upper:      -0.7071067811865475,
-				Count:      model.FloatString(1 + i),
-			},
-			&model.HistogramBucket{
-				Boundaries: 3,
-				Lower:      -0.001,
-				Upper:      0.001,
-				Count:      model.FloatString(2 + i),
-			},
-			&model.HistogramBucket{
-				Boundaries: 0,
-				Lower:      0.7071067811865475,
-				Upper:      1,
-				Count:      model.FloatString(1 + i),
-			},
-			&model.HistogramBucket{
-				Boundaries: 0,
-				Lower:      1,
-				Upper:      1.414213562373095,
-				Count:      model.FloatString(2 + i),
-			},
-			&model.HistogramBucket{
-				Boundaries: 0,
-				Lower:      2,
-				Upper:      2.82842712474619,
-				Count:      model.FloatString(1 + i),
-			},
-			&model.HistogramBucket{
-				Boundaries: 0,
-				Lower:      2.82842712474619,
-				Upper:      4,
-				Count:      model.FloatString(1 + i),
-			},
-		},
-	}
-}
-
-func GenerateHistogramSeries(name string, ts time.Time, additionalLabels ...prompb.Label) (series []prompb.TimeSeries, vector model.Vector, matrix model.Matrix) {
-	tsMillis := e2e.TimeToMilliseconds(ts)
-
-	value := rand.Intn(1000)
-
-	lbls := append(
-		[]prompb.Label{
-			{Name: labels.MetricName, Value: name},
-		},
-		additionalLabels...,
-	)
-
-	// Generate the series
-	series = append(series, prompb.TimeSeries{
-		Labels: lbls,
-		Exemplars: []prompb.Exemplar{
-			{Value: float64(value), Timestamp: tsMillis, Labels: []prompb.Label{
-				{Name: "trace_id", Value: "1234"},
-			}},
-		},
-		Histograms: []prompb.Histogram{remote.HistogramToHistogramProto(tsMillis, GenerateTestHistogram(value))},
-	})
-
-	// Generate the expected vector and matrix when querying it
-	metric := model.Metric{}
-	metric[labels.MetricName] = model.LabelValue(name)
-	for _, lbl := range additionalLabels {
-		metric[model.LabelName(lbl.Name)] = model.LabelValue(lbl.Value)
+	for _, sample := range input {
+		if sample.Timestamp >= startMs && sample.Timestamp <= endMs {
+			filtered = append(filtered, sample)
+		}
 	}
 
-	vector = append(vector, &model.Sample{
-		Metric:    metric,
-		Timestamp: model.Time(tsMillis),
-		Histogram: GenerateTestSampleHistogram(value),
-	})
-
-	matrix = append(matrix, &model.SampleStream{
-		Metric: metric,
-		Histograms: []model.SampleHistogramPair{
-			{
-				Timestamp: model.Time(tsMillis),
-				Histogram: GenerateTestSampleHistogram(value),
-			},
-		},
-	})
-
-	return
+	return filtered
 }
 
-func GenerateNHistogramSeries(nSeries, nExemplars int, name func() string, ts time.Time, additionalLabels func() []prompb.Label) (series []prompb.TimeSeries, vector model.Vector) {
-	tsMillis := e2e.TimeToMilliseconds(ts)
+func filterHistogramsByTimestamp(input []prompb.Histogram, startMs, endMs int64) []prompb.Histogram {
+	var filtered []prompb.Histogram
 
-	// Generate the series
-	for i := 0; i < nSeries; i++ {
-		lbls := []prompb.Label{
-			{Name: labels.MetricName, Value: name()},
+	for _, sample := range input {
+		if sample.Timestamp >= startMs && sample.Timestamp <= endMs {
+			filtered = append(filtered, sample)
 		}
-		if additionalLabels != nil {
-			lbls = append(lbls, additionalLabels()...)
-		}
+	}
 
-		exemplars := []prompb.Exemplar{}
-		if i < nExemplars {
-			exemplars = []prompb.Exemplar{
-				{Value: float64(i), Timestamp: tsMillis, Labels: []prompb.Label{{Name: "trace_id", Value: "1234"}}},
-			}
-		}
+	return filtered
+}
 
-		series = append(series, prompb.TimeSeries{
-			Labels:     lbls,
-			Histograms: []prompb.Histogram{remote.HistogramToHistogramProto(tsMillis, GenerateTestHistogram(i))},
-			Exemplars:  exemplars,
+func prompbLabelsToMetric(pbLabels []prompb.Label) model.Metric {
+	metric := make(model.Metric, len(pbLabels))
+
+	for _, l := range pbLabels {
+		metric[model.LabelName(l.Name)] = model.LabelValue(l.Value)
+	}
+
+	return metric
+}
+
+func metricToPrompbLabels(metric model.Metric) []prompb.Label {
+	lbls := make([]prompb.Label, 0, len(metric))
+
+	for name, value := range metric {
+		lbls = append(lbls, prompb.Label{
+			Name:  string(name),
+			Value: string(value),
 		})
 	}
 
-	// Generate the expected vector when querying it
-	for i := 0; i < nSeries; i++ {
-		metric := model.Metric{}
-		for _, lbl := range series[i].Labels {
-			metric[model.LabelName(lbl.Name)] = model.LabelValue(lbl.Value)
+	// Sort labels because they're expected to be sorted by contract.
+	slices.SortFunc(lbls, func(a, b prompb.Label) int {
+		cmp := strings.Compare(a.Name, b.Name)
+		if cmp != 0 {
+			return cmp
 		}
 
-		vector = append(vector, &model.Sample{
-			Metric:    metric,
-			Timestamp: model.Time(tsMillis),
-			Histogram: GenerateTestSampleHistogram(i),
+		return strings.Compare(a.Value, b.Value)
+	})
+
+	return lbls
+}
+
+func vectorToPrompbTimeseries(vector model.Vector) []*prompb.TimeSeries {
+	res := make([]*prompb.TimeSeries, 0, len(vector))
+
+	for _, sample := range vector {
+		res = append(res, &prompb.TimeSeries{
+			Labels: metricToPrompbLabels(sample.Metric),
+			Samples: []prompb.Sample{
+				{
+					Value:     float64(sample.Value),
+					Timestamp: int64(sample.Timestamp),
+				},
+			},
 		})
 	}
-	return
+
+	return res
+}
+
+// remoteReadQueryByMetricName generates a prompb.Query to query series by metric name within
+// the given start / end interval.
+func remoteReadQueryByMetricName(metricName string, start, end time.Time) *prompb.Query {
+	return &prompb.Query{
+		Matchers:         remoteReadQueryMatchersByMetricName(metricName),
+		StartTimestampMs: start.UnixMilli(),
+		EndTimestampMs:   end.UnixMilli(),
+		Hints: &prompb.ReadHints{
+			StepMs:  1,
+			StartMs: start.UnixMilli(),
+			EndMs:   end.UnixMilli(),
+		},
+	}
+}
+
+func remoteReadQueryMatchersByMetricName(metricName string) []*prompb.LabelMatcher {
+	return []*prompb.LabelMatcher{{Type: prompb.LabelMatcher_EQ, Name: labels.MetricName, Value: metricName}}
 }

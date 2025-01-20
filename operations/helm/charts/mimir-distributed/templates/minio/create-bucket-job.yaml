@@ -1,13 +1,14 @@
+{{- if .Values.minio.enabled }}
+{{- if .Values.minio.buckets }}
 # Minio provides post-install hook to create bucket
 # however the hook won't be executed if helm install is run
 # with --wait flag. Hence this job is a workaround for that.
 # See https://github.com/grafana/mimir/issues/2464
-{{- if .Values.minio.enabled }}
-{{- if .Values.minio.buckets }}
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "mimir.resourceName" (dict "ctx" . "component" "make-minio-buckets") }}
+  {{- $minioSub := index .Subcharts "minio" }}
+  name: {{ include "mimir.resourceName" (dict "ctx" . "component" "make-minio-buckets") }}-{{ $minioSub.Chart.Version }}
   namespace: {{ .Release.Namespace | quote }}
   labels:
     app: {{ template "minio.name" . }}-make-bucket-job
@@ -15,6 +16,7 @@ metadata:
     release: {{ .Release.Name }}
     heritage: {{ .Release.Service }}
 {{- with .Values.minio.makeBucketJob.annotations }}
+  annotations:
 {{ toYaml . | indent 4 }}
 {{- end }}
 spec:
@@ -56,9 +58,9 @@ spec:
           projected:
             sources:
             - configMap:
-                name: {{ .Release.Name }}-minio
+                name: {{ template "minio.fullname" .Subcharts.minio }}
             - secret:
-                name: {{ .Release.Name }}-minio
+                name: {{ template "minio.fullname" .Subcharts.minio }}
         {{- if .Values.minio.tls.enabled }}
         - name: cert-secret-volume-mc
           secret:
@@ -74,7 +76,7 @@ spec:
         command: ["/bin/sh", "/config/initialize"]
         env:
           - name: MINIO_ENDPOINT
-            value: {{ .Release.Name }}-minio
+            value: {{ template "minio.fullname" .Subcharts.minio }}
           - name: MINIO_PORT
             value: {{ .Values.minio.service.port | quote }}
         volumeMounts:

@@ -1,3 +1,6 @@
+// Provenance-includes-license: Apache-2.0
+// Provenance-includes-copyright: The Thanos Authors.
+
 package cache
 
 import (
@@ -10,43 +13,44 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// RemoteCacheClient is a high level client to interact with remote cache.
-type RemoteCacheClient interface {
-	// GetMulti fetches multiple keys at once from remoteCache. In case of error,
+var (
+	ErrNotStored  = errors.New("item not stored")
+	ErrInvalidTTL = errors.New("invalid TTL")
+)
+
+// Cache is a high level interface to interact with a cache.
+type Cache interface {
+	// GetMulti fetches multiple keys at once from a cache. In case of error,
 	// an empty map is returned and the error tracked/logged. One or more Option
 	// instances may be passed to modify the behavior of this GetMulti call.
 	GetMulti(ctx context.Context, keys []string, opts ...Option) map[string][]byte
 
-	// SetAsync enqueues an asynchronous operation to store a key into memcached.
-	// Returns an error in case it fails to enqueue the operation. In case the
-	// underlying async operation will fail, the error will be tracked/logged.
-	SetAsync(ctx context.Context, key string, value []byte, ttl time.Duration) error
+	// SetAsync enqueues an operation to store a key into a cache. In case the underlying
+	// operation fails, the error will be tracked/logged.
+	SetAsync(key string, value []byte, ttl time.Duration)
 
-	// Delete deletes a key from memcached.
-	// This is a synchronous operation. If an asynchronous set operation for key is still
-	// pending to be processed, it will wait for it to complete before performing deletion.
+	// SetMultiAsync enqueues operations to store a keys and values into a cache. In case
+	// any underlying async operations fail, the errors will be tracked/logged.
+	SetMultiAsync(data map[string][]byte, ttl time.Duration)
+
+	// Set stores a key and value into a cache.
+	Set(ctx context.Context, key string, value []byte, ttl time.Duration) error
+
+	// Add stores a key and value into a cache only if it does not already exist. If the
+	// item was not stored because an entry already exists in the cache, ErrNotStored will
+	// be returned.
+	Add(ctx context.Context, key string, value []byte, ttl time.Duration) error
+
+	// Delete deletes a key from a cache. This is a synchronous operation. If an asynchronous
+	// set operation for key is still pending to be processed, it will wait for it to complete
+	// before performing deletion.
 	Delete(ctx context.Context, key string) error
 
 	// Stop client and release underlying resources.
 	Stop()
-}
 
-// Cache is a generic interface.
-type Cache interface {
-	// Store data into the cache.
-	//
-	// Note that individual byte buffers may be retained by the cache!
-	Store(ctx context.Context, data map[string][]byte, ttl time.Duration)
-
-	// Fetch multiple keys from cache. Returns map of input keys to data.
-	// If key isn't in the map, data for given key was not found. One or more
-	// Option instances may be passed to modify the behavior of this Fetch call.
-	Fetch(ctx context.Context, keys []string, opts ...Option) map[string][]byte
-
+	// Name returns the name of this particular cache instance.
 	Name() string
-
-	// Delete cache entry with the given key if it exists.
-	Delete(ctx context.Context, key string) error
 }
 
 // Options are used to modify the behavior of an individual call to get results
@@ -87,19 +91,22 @@ const (
 )
 
 type BackendConfig struct {
-	Backend   string          `yaml:"backend"`
-	Memcached MemcachedConfig `yaml:"memcached"`
+	Backend   string                `yaml:"backend"`
+	Memcached MemcachedClientConfig `yaml:"memcached"`
+	Redis     RedisClientConfig     `yaml:"redis"`
 }
 
 // Validate the config.
 func (cfg *BackendConfig) Validate() error {
-	if cfg.Backend != "" && cfg.Backend != BackendMemcached {
+	if cfg.Backend != "" && cfg.Backend != BackendMemcached && cfg.Backend != BackendRedis {
 		return fmt.Errorf("unsupported cache backend: %s", cfg.Backend)
 	}
 
 	switch cfg.Backend {
 	case BackendMemcached:
 		return cfg.Memcached.Validate()
+	case BackendRedis:
+		return cfg.Redis.Validate()
 	}
 	return nil
 }
@@ -109,14 +116,10 @@ func CreateClient(cacheName string, cfg BackendConfig, logger log.Logger, reg pr
 	case "":
 		// No caching.
 		return nil, nil
-
 	case BackendMemcached:
-		client, err := NewMemcachedClientWithConfig(logger, cacheName, cfg.Memcached.ToMemcachedClientConfig(), reg)
-		if err != nil {
-			return nil, errors.Wrapf(err, "failed to create memcached client")
-		}
-		return NewMemcachedCache(cacheName, logger, client, reg), nil
-
+		return NewMemcachedClientWithConfig(logger, cacheName, cfg.Memcached, reg)
+	case BackendRedis:
+		return NewRedisClient(logger, cacheName, cfg.Redis, reg)
 	default:
 		return nil, errors.Errorf("unsupported cache type for cache %s: %s", cacheName, cfg.Backend)
 	}

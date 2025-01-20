@@ -11,12 +11,12 @@ metadata:
     app.kubernetes.io/managed-by: Helm
   namespace: "citestns"
 spec:
-  host: mimir.example.com
+  host: "gateway-nginx-values.mimir.example.com"
   to:
     kind: Service
     name: gateway-nginx-values-mimir-gateway
     weight: 100
   port:
-    targetPort: http-metric
+    targetPort: http-metrics
   tls:
     termination: edge
