@@ -9,9 +9,9 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/mimir/pkg/streamingpromql/limiting"
 	"github.com/grafana/mimir/pkg/streamingpromql/operators"
 	"github.com/grafana/mimir/pkg/streamingpromql/testutils"
+	"github.com/grafana/mimir/pkg/util/limiter"
 )
 
 // Most of the functionality of the histogram operator is tested through the test scripts in
@@ -19,7 +19,7 @@ import (
 //
 // The output sorting behaviour is impossible to test through these scripts, so we instead test it here.
 
-func TestHistogramQuantileFunction_ReturnsGroupsFinishedFirstEarliest(t *testing.T) {
+func TestHistogramFunction_ReturnsGroupsFinishedFirstEarliest(t *testing.T) {
 	testCases := map[string]struct {
 		inputSeries               []labels.Labels
 		expectedOutputSeriesOrder []labels.Labels
@@ -113,9 +113,11 @@ func TestHistogramQuantileFunction_ReturnsGroupsFinishedFirstEarliest(t *testing
 
 	for name, testCase := range testCases {
 		t.Run(name, func(t *testing.T) {
-			memoryConsumptionTracker := limiting.NewMemoryConsumptionTracker(0, nil)
-			hOp := &HistogramQuantileFunction{
-				phArg:                    &testScalarOperator{},
+			memoryConsumptionTracker := limiter.NewMemoryConsumptionTracker(0, nil)
+			hOp := &HistogramFunction{
+				f: &histogramQuantile{
+					phArg: &testScalarOperator{},
+				},
 				inner:                    &operators.TestOperator{Series: testCase.inputSeries, MemoryConsumptionTracker: memoryConsumptionTracker},
 				innerSeriesMetricNames:   &operators.MetricNames{},
 				memoryConsumptionTracker: memoryConsumptionTracker,

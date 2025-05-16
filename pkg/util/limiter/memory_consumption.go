@@ -1,14 +1,38 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-package limiting
+package limiter
 
 import (
+	"context"
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
-
-	"github.com/grafana/mimir/pkg/util/limiter"
 )
+
+type contextKey int
+
+const (
+	memoryConsumptionTracker contextKey = 0
+)
+
+// MemoryTrackerFromContextWithFallback returns a MemoryConsumptionTracker that has been added to this
+// context. If there is no MemoryConsumptionTracker in this context, a new no-op tracker that
+// does not enforce any limits is returned.
+func MemoryTrackerFromContextWithFallback(ctx context.Context) *MemoryConsumptionTracker {
+	tracker, ok := ctx.Value(memoryConsumptionTracker).(*MemoryConsumptionTracker)
+	if !ok {
+		return NewMemoryConsumptionTracker(0, nil)
+	}
+
+	return tracker
+}
+
+// AddMemoryTrackerToContext adds a MemoryConsumptionTracker to this context. This is used to propagate
+// per-query memory consumption tracking to parts of the read path that cannot be modified
+// to accept extra parameters.
+func AddMemoryTrackerToContext(ctx context.Context, tracker *MemoryConsumptionTracker) context.Context {
+	return context.WithValue(ctx, interface{}(memoryConsumptionTracker), tracker)
+}
 
 // MemoryConsumptionTracker tracks the current memory utilisation of a single query, and applies any max in-memory bytes limit.
 //
@@ -48,7 +72,7 @@ func (l *MemoryConsumptionTracker) IncreaseMemoryConsumption(b uint64) error {
 			l.rejectionCount.Inc()
 		}
 
-		return limiter.NewMaxEstimatedMemoryConsumptionPerQueryLimitError(l.maxEstimatedMemoryConsumptionBytes)
+		return NewMaxEstimatedMemoryConsumptionPerQueryLimitError(l.maxEstimatedMemoryConsumptionBytes)
 	}
 
 	l.currentEstimatedMemoryConsumptionBytes += b

@@ -21,7 +21,6 @@ import (
 
 type queryStatsMiddleware struct {
 	engine                      *promql.Engine
-	nonAlignedQueries           prometheus.Counter
 	regexpMatcherCount          prometheus.Counter
 	regexpMatcherOptimizedCount prometheus.Counter
 	consistencyCounter          *prometheus.CounterVec
@@ -29,10 +28,6 @@ type queryStatsMiddleware struct {
 }
 
 func newQueryStatsMiddleware(reg prometheus.Registerer, engine *promql.Engine) MetricsQueryMiddleware {
-	nonAlignedQueries := promauto.With(reg).NewCounter(prometheus.CounterOpts{
-		Name: "cortex_query_frontend_non_step_aligned_queries_total",
-		Help: "Total queries sent that are not step aligned.",
-	})
 	regexpMatcherCount := promauto.With(reg).NewCounter(prometheus.CounterOpts{
 		Name: "cortex_query_frontend_regexp_matcher_count",
 		Help: "Total number of regexp matchers",
@@ -49,7 +44,6 @@ func newQueryStatsMiddleware(reg prometheus.Registerer, engine *promql.Engine) M
 	return MetricsQueryMiddlewareFunc(func(next MetricsQueryHandler) MetricsQueryHandler {
 		return &queryStatsMiddleware{
 			engine:                      engine,
-			nonAlignedQueries:           nonAlignedQueries,
 			regexpMatcherCount:          regexpMatcherCount,
 			regexpMatcherOptimizedCount: regexpMatcherOptimizedCount,
 			consistencyCounter:          consistencyCounter,
@@ -59,10 +53,6 @@ func newQueryStatsMiddleware(reg prometheus.Registerer, engine *promql.Engine) M
 }
 
 func (s queryStatsMiddleware) Do(ctx context.Context, req MetricsQueryRequest) (Response, error) {
-	if !isRequestStepAligned(req) {
-		s.nonAlignedQueries.Inc()
-	}
-
 	s.trackRegexpMatchers(req)
 	s.trackReadConsistency(ctx)
 	s.populateQueryDetails(ctx, req)
@@ -71,11 +61,7 @@ func (s queryStatsMiddleware) Do(ctx context.Context, req MetricsQueryRequest) (
 }
 
 func (s queryStatsMiddleware) trackRegexpMatchers(req MetricsQueryRequest) {
-	expr, err := parser.ParseExpr(req.GetQuery())
-	if err != nil {
-		return
-	}
-	for _, selectors := range parser.ExtractSelectors(expr) {
+	for _, selectors := range parser.ExtractSelectors(req.GetParsedQuery()) {
 		for _, matcher := range selectors {
 			if matcher.Type != labels.MatchRegexp && matcher.Type != labels.MatchNotRegexp {
 				continue
