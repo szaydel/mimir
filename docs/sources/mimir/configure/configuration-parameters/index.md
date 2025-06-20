@@ -554,6 +554,10 @@ The `server` block configures the HTTP and gRPC server of the launched service(s
 # CLI flag: -server.grpc-conn-limit
 [grpc_listen_conn_limit: <int> | default = 0]
 
+# If true, the max streams by connection gauge will be collected.
+# CLI flag: -server.grpc-collect-max-streams-by-conn
+[grpc_collect_max_streams_by_conn: <boolean> | default = true]
+
 # (experimental) Enables PROXY protocol.
 # CLI flag: -server.proxy-protocol-enabled
 [proxy_protocol_enabled: <boolean> | default = false]
@@ -757,6 +761,16 @@ grpc_tls_config:
 # CLI flag: -server.log-request-headers-exclude-list
 [log_request_exclude_headers_list: <string> | default = ""]
 
+# Optionally add request headers to tracing spans.
+# CLI flag: -server.trace-request-headers
+[trace_request_headers: <boolean> | default = false]
+
+# Comma separated list of headers to exclude from tracing spans. Only used if
+# server.trace-request-headers is true. The following headers are always
+# excluded: Authorization, Cookie, X-Csrf-Token.
+# CLI flag: -server.trace-request-headers-exclude-list
+[trace_request_exclude_headers_list: <string> | default = ""]
+
 # (advanced) Base path to serve all API routes from (e.g. /v1/)
 # CLI flag: -server.path-prefix
 [http_path_prefix: <string> | default = ""]
@@ -838,23 +852,6 @@ ha_tracker:
   # CLI flag: -distributor.ha-tracker.enable
   [enable_ha_tracker: <boolean> | default = false]
 
-  # (advanced) Update the timestamp in the KV store for a given cluster/replica
-  # only after this amount of time has passed since the current stored
-  # timestamp.
-  # CLI flag: -distributor.ha-tracker.update-timeout
-  [ha_tracker_update_timeout: <duration> | default = 15s]
-
-  # (advanced) Maximum jitter applied to the update timeout, in order to spread
-  # the HA heartbeats over time.
-  # CLI flag: -distributor.ha-tracker.update-timeout-jitter-max
-  [ha_tracker_update_timeout_jitter_max: <duration> | default = 5s]
-
-  # (advanced) If we don't receive any samples from the accepted replica for a
-  # cluster in this amount of time we will failover to the next replica we
-  # receive a sample from. This value must be greater than the update timeout
-  # CLI flag: -distributor.ha-tracker.failover-timeout
-  [ha_tracker_failover_timeout: <duration> | default = 30s]
-
   # Enable the elected_replica_status metric, which shows the current elected
   # replica. It is disabled by default due to the possible high cardinality of
   # the metric.
@@ -899,6 +896,15 @@ ha_tracker:
       # (advanced) Timeout for storing value to secondary store.
       # CLI flag: -distributor.ha-tracker.multi.mirror-timeout
       [mirror_timeout: <duration> | default = 2s]
+
+  # (advanced) Deprecated. Use limits.ha_tracker_update_timeout.
+  [ha_tracker_update_timeout: <duration> | default = ]
+
+  # (advanced) Deprecated. Use limits.ha_tracker_update_timeout_jitter_max.
+  [ha_tracker_update_timeout_jitter_max: <duration> | default = ]
+
+  # (advanced) Deprecated. Use limits.ha_tracker_failover_timeout.
+  [ha_tracker_failover_timeout: <duration> | default = ]
 
 # (advanced) Max message size in bytes that the distributors will accept for
 # incoming push requests to the remote write API. If exceeded, the request will
@@ -1623,12 +1629,8 @@ The `querier` block configures the querier.
 [lookback_delta: <duration> | default = 5m]
 
 mimir_query_engine:
-  # (experimental) Use query planner when evaluating queries.
-  # CLI flag: -querier.mimir-query-engine.use-query-planning
-  [use_query_planning: <boolean> | default = false]
-
   # (experimental) Enable common subexpression elimination when evaluating
-  # queries. Only applies if query planner is enabled.
+  # queries.
   # CLI flag: -querier.mimir-query-engine.enable-common-subexpression-elimination
   [enable_common_subexpression_elimination: <boolean> | default = true]
 ```
@@ -1802,6 +1804,16 @@ client_cluster_validation:
   # (experimental) Optionally define the cluster validation label.
   # CLI flag: -query-frontend.client-cluster-validation.label
   [label: <string> | default = ""]
+
+# (experimental) Query engine to use, either 'prometheus' or 'mimir'
+# CLI flag: -query-frontend.query-engine
+[query_engine: <string> | default = "prometheus"]
+
+# (experimental) If set to true and the Mimir query engine is in use, fall back
+# to using the Prometheus query engine for any queries not supported by the
+# Mimir query engine.
+# CLI flag: -query-frontend.enable-query-engine-fallback
+[enable_query_engine_fallback: <boolean> | default = true]
 ```
 
 ### query_scheduler
@@ -2405,15 +2417,9 @@ sharding_ring:
 # CLI flag: -alertmanager.grafana-alertmanager-compatibility-enabled
 [grafana_alertmanager_compatibility_enabled: <boolean> | default = false]
 
-# (experimental) Skip starting the Alertmanager for tenants matching this suffix
-# unless they have a promoted, non-default Grafana Alertmanager configuration or
-# they are receiving requests.
-# CLI flag: -alertmanager.grafana-alertmanager-conditionally-skip-tenant-suffix
-[grafana_alertmanager_conditionally_skip_tenant_suffix: <string> | default = ""]
-
-# (experimental) Duration to wait before shutting down an idle Alertmanager for
-# a tenant that matches grafana-alertmanager-conditionally-skip-tenant-suffix
-# and is using an unpromoted or default configuration.
+# (experimental) Duration to wait before shutting down an idle Alertmanager
+# using an unpromoted or default configuration when strict initialization is
+# enabled.
 # CLI flag: -alertmanager.grafana-alertmanager-grace-period
 [grafana_alertmanager_idle_grace_period: <duration> | default = 5m]
 
@@ -3325,6 +3331,22 @@ The `limits` block configures default and per-tenant limits imposed by component
 # CLI flag: -distributor.ha-tracker.max-clusters
 [ha_max_clusters: <int> | default = 100]
 
+# (advanced) Update the timestamp in the KV store for a given cluster/replica
+# only after this amount of time has passed since the current stored timestamp.
+# CLI flag: -distributor.ha-tracker.update-timeout
+[ha_tracker_update_timeout: <duration> | default = 15s]
+
+# (advanced) Maximum jitter applied to the update timeout, in order to spread
+# the HA heartbeats over time.
+# CLI flag: -distributor.ha-tracker.update-timeout-jitter-max
+[ha_tracker_update_timeout_jitter_max: <duration> | default = 5s]
+
+# (advanced) If we don't receive any samples from the accepted replica for a
+# cluster in this amount of time we will failover to the next replica we receive
+# a sample from. This value must be greater than the update timeout.
+# CLI flag: -distributor.ha-tracker.failover-timeout
+[ha_tracker_failover_timeout: <duration> | default = 30s]
+
 # (advanced) This flag can be used to specify label names that to drop during
 # sample ingestion within the distributor and can be repeated in order to drop
 # multiple labels.
@@ -3659,6 +3681,12 @@ The `limits` block configures default and per-tenant limits imposed by component
 [max_query_expression_size_bytes: <int> | default = 0]
 
 # (experimental) List of queries to block.
+# Example:
+#   The following configuration blocks the query "rate(metric_counter[5m])".
+#   Setting the pattern to ".*" and regex to true blocks all queries.
+#   blocked_queries:
+#       - pattern: rate(metric_counter[5m])
+#         reason: because the query is misconfigured
 [blocked_queries: <list of pattern (string), regex (bool), and, optionally, reason (string)> | default = ]
 
 # (experimental) List of queries to limit and duration to limit them for.
@@ -3711,6 +3739,11 @@ The `limits` block configures default and per-tenant limits imposed by component
 # /api/v1/cardinality/label_values API call.
 # CLI flag: -querier.label-values-max-cardinality-label-names-per-request
 [label_values_max_cardinality_label_names_per_request: <int> | default = 100]
+
+# (experimental) Maximum number of series that can be requested in a single
+# cardinality API request.
+# CLI flag: -querier.cardinality-api-max-series-limit
+[cardinality_analysis_max_results: <int> | default = 500]
 
 # (experimental) Maximum size of an active series or active native histogram
 # series request result shard in bytes. 0 to disable.
@@ -3920,6 +3953,10 @@ ruler_alertmanager_client_config:
   # as OAuth token requests.
   # CLI flag: -ruler.alertmanager-client.proxy-url
   [proxy_url: <string> | default = ""]
+
+# (experimental) Minimum allowable evaluation interval for rule groups.
+# CLI flag: -ruler.min-rule-evaluation-interval
+[ruler_min_rule_evaluation_interval: <duration> | default = 0s]
 
 # The tenant's shard size, used when store-gateway sharding is enabled. Value of
 # 0 disables shuffle sharding for the tenant, that is all tenant blocks are
