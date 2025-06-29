@@ -318,8 +318,14 @@ func (p *QueryPlanner) nodeFromExpr(expr parser.Expr) (planning.Node, error) {
 			},
 		}
 
-		if expr.Func.Name == "absent" || expr.Func.Name == "absent_over_time" {
+		switch expr.Func.Name {
+		case "absent", "absent_over_time":
 			f.AbsentLabels = mimirpb.FromLabelsToLabelAdapters(functions.CreateLabelsForAbsentFunction(expr.Args[0]))
+		case "timestamp":
+			vs, isVectorSelector := args[0].(*core.VectorSelector)
+			if isVectorSelector {
+				vs.VectorSelectorDetails.ReturnSampleTimestamps = true
+			}
 		}
 
 		return f, nil
@@ -439,6 +445,7 @@ func (e *Engine) Materialize(ctx context.Context, plan *planning.QueryPlan, quer
 		MemoryConsumptionTracker: q.memoryConsumptionTracker,
 		Annotations:              q.annotations,
 		LookbackDelta:            q.lookbackDelta,
+		EagerLoadSelectors:       q.engine.eagerLoadSelectors,
 	}
 
 	q.statement = &parser.EvalStmt{

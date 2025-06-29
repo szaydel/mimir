@@ -39,9 +39,7 @@
       'ingest-storage.kafka.producer-max-buffered-bytes': std.clamp(10 * $._config.ruler_remote_evaluation_max_query_response_size_bytes, 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024),
     } else {},
 
-  ruler_env_map:: {
-    JAEGER_REPORTER_MAX_QUEUE_SIZE: '1000',
-  },
+  ruler_env_map:: {},
 
   ruler_node_affinity_matchers:: [],
 
@@ -54,7 +52,7 @@
       $.util.resourcesRequests('1', '6Gi') +
       $.util.resourcesLimits('16', '16Gi') +
       $.util.readinessProbe +
-      $.jaeger_mixin
+      $.tracing_env_mixin
     else {},
 
   local deployment = $.apps.v1.deployment,
