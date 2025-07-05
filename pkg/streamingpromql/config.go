@@ -18,13 +18,19 @@ type EngineOpts struct {
 	// Should only be used in tests.
 	Pedantic bool `yaml:"-"`
 
-	UseQueryPlanning                     bool `yaml:"use_query_planning" category:"experimental"`
+	// Prometheus' engine evaluates all selectors (ie. calls Querier.Select()) before evaluating any part of the query.
+	// We rely on this behavior in query-frontends when evaluating shardable queries so that all selectors are evaluated in parallel.
+	// When sharding is just another optimization pass, we'll be able to trigger this eager loading from the sharding operator,
+	// but for now, we use this option to change the behavior of selectors.
+	EagerLoadSelectors bool `yaml:"-"`
+
 	EnableCommonSubexpressionElimination bool `yaml:"enable_common_subexpression_elimination" category:"experimental"`
+	EnableSkippingHistogramDecoding      bool `yaml:"enable_skipping_histogram_decoding" category:"experimental"`
 }
 
 func (o *EngineOpts) RegisterFlags(f *flag.FlagSet) {
-	f.BoolVar(&o.UseQueryPlanning, "querier.mimir-query-engine.use-query-planning", false, "Use query planner when evaluating queries.")
-	f.BoolVar(&o.EnableCommonSubexpressionElimination, "querier.mimir-query-engine.enable-common-subexpression-elimination", true, "Enable common subexpression elimination when evaluating queries. Only applies if query planner is enabled.")
+	f.BoolVar(&o.EnableCommonSubexpressionElimination, "querier.mimir-query-engine.enable-common-subexpression-elimination", true, "Enable common subexpression elimination when evaluating queries.")
+	f.BoolVar(&o.EnableSkippingHistogramDecoding, "querier.mimir-query-engine.enable-skipping-histogram-decoding", true, "Enable skipping decoding native histograms when evaluating queries that do not require full histograms.")
 }
 
 func NewTestEngineOpts() EngineOpts {
@@ -41,8 +47,7 @@ func NewTestEngineOpts() EngineOpts {
 
 		Pedantic: true,
 
-		// Don't enable query planning by default, but do enable common subexpression elimination if query planning is enabled.
-		UseQueryPlanning:                     false,
 		EnableCommonSubexpressionElimination: true,
+		EnableSkippingHistogramDecoding:      true,
 	}
 }

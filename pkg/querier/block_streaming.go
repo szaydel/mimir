@@ -144,8 +144,8 @@ func (bqs *blockStreamingQuerierSeries) Iterator(reuse chunkenc.Iterator) chunke
 }
 
 type memoryConsumptionTracker interface {
-	IncreaseMemoryConsumption(b uint64) error
-	DecreaseMemoryConsumption(b uint64)
+	IncreaseMemoryConsumption(b uint64, source limiter.MemoryConsumptionSource) error
+	DecreaseMemoryConsumption(b uint64, source limiter.MemoryConsumptionSource)
 }
 
 // storeGatewayStreamReader is responsible for managing the streaming of chunks from a storegateway and buffering
@@ -156,7 +156,7 @@ type storeGatewayStreamReader struct {
 	expectedSeriesCount int
 	queryLimiter        *limiter.QueryLimiter
 	memoryTracker       memoryConsumptionTracker
-	stats               *stats.Stats
+	stats               *stats.SafeStats
 	metrics             *blocksStoreQueryableMetrics
 	log                 log.Logger
 
@@ -168,7 +168,7 @@ type storeGatewayStreamReader struct {
 	err                    error
 }
 
-func newStoreGatewayStreamReader(ctx context.Context, client storegatewaypb.StoreGateway_SeriesClient, expectedSeriesCount int, queryLimiter *limiter.QueryLimiter, memoryTracker memoryConsumptionTracker, stats *stats.Stats, metrics *blocksStoreQueryableMetrics, log log.Logger) *storeGatewayStreamReader {
+func newStoreGatewayStreamReader(ctx context.Context, client storegatewaypb.StoreGateway_SeriesClient, expectedSeriesCount int, queryLimiter *limiter.QueryLimiter, memoryTracker memoryConsumptionTracker, stats *stats.SafeStats, metrics *blocksStoreQueryableMetrics, log log.Logger) *storeGatewayStreamReader {
 	return &storeGatewayStreamReader{
 		ctx:                 ctx,
 		client:              client,
@@ -196,7 +196,7 @@ func (s *storeGatewayStreamReader) Close() {
 // It is safe to call FreeBuffer multiple times, or to alternate GetChunks and FreeBuffer calls.
 func (s *storeGatewayStreamReader) FreeBuffer() {
 	if s.lastMessage != nil {
-		s.memoryTracker.DecreaseMemoryConsumption(uint64(s.lastMessage.Size()))
+		s.memoryTracker.DecreaseMemoryConsumption(uint64(s.lastMessage.Size()), limiter.StoreGatewayChunks)
 		s.lastMessage.FreeBuffer()
 		s.lastMessage = nil
 	}
@@ -209,7 +209,7 @@ func (s *storeGatewayStreamReader) setLastMessage(msg *storepb.SeriesResponse) e
 	if s.lastMessage != nil {
 		return fmt.Errorf("must call FreeBuffer() before storing the next message - this indicates a bug")
 	}
-	if err := s.memoryTracker.IncreaseMemoryConsumption(uint64(msg.Size())); err != nil {
+	if err := s.memoryTracker.IncreaseMemoryConsumption(uint64(msg.Size()), limiter.StoreGatewayChunks); err != nil {
 		return err
 	}
 	s.lastMessage = msg

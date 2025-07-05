@@ -87,6 +87,7 @@ The following features are currently experimental:
   - Allow control over rule sync intervals.
     - `ruler.outbound-sync-queue-poll-interval`
     - `ruler.inbound-sync-queue-poll-interval`
+  - `-ruler.min-rule-evaluation-interval`
 - Distributor
   - Influx ingestion
     - `/api/v1/push/influx/write` endpoint
@@ -112,6 +113,8 @@ The following features are currently experimental:
     - `-distributor.otel-keep-identifying-resource-attributes`
   - Enable conversion of OTel explicit bucket histograms into native histograms with custom buckets.
     - `-distributor.otel-convert-histograms-to-nhcb`
+  - Enable promotion of OTel scope metadata to metric labels
+    - `-distributor.otel-promote-scope-metadata`
 - Hash ring
   - Disabling ring heartbeat timeouts
     - `-distributor.ring.heartbeat-timeout=0`
@@ -218,6 +221,8 @@ The following features are currently experimental:
   - Support for cluster validation via `-query-frontend.client-cluster-validation.label` or `-common.client-cluster-validation.label`.
     Requests with invalid cluster validation labels are tracked via the `cortex_client_invalid_cluster_validation_label_requests_total` metric.
   - Support for duration expressions in PromQL, which are simple arithmetics on numbers in offset and range specification.
+  - Support for configuring the maximum series limit for cardinality API requests on a per-tenant basis via `cardinality_analysis_max_results`.
+  - [Mimir query engine](https://grafana.com/docs/mimir/<MIMIR_VERSION>/references/architecture/mimir-query-engine) (`-query-frontend.query-engine` and `-query-frontend.enable-query-engine-fallback`)
 - Query-scheduler
   - `-query-scheduler.querier-forget-delay`
 - Store-gateway
@@ -281,6 +286,11 @@ For details about what _deprecated_ means, see [Parameter lifecycle](../configur
 
 The following features or configuration parameters are currently deprecated and will be **removed in a future release (to be announced)**:
 
+- Distributor's HA tracker timeouts can now be configured on a per-tenant basis. To support this, their configuration has moved from [`distributor.ha_tracker`](../configuration-parameters/#distributor) to [`limits`](../configuration-parameters/#limits) (deprecated since Mimir 2.17)
+- Tracing configuration through Jaeger `JAEGER_*` environment variables and Jaeger tracing exposition protocol (deprecated since Mimir 2.17)
+  - Use OpenTelemetry configuration instead, as Jaeger supports OTLP ingestion natively
 - Rule group configuration file
   - `evaluation_delay` field: use `query_offset` instead
 - Support for Redis-based caching
+- The `-ingester.stream-chunks-when-using-blocks` CLI flag, and `ingester_stream_chunks_when_using_blocks` runtime configuration option
+- The `-store-gateway.sharding-ring.auto-forget-enabled` is deprecated and will be removed in a future release. Set the `-store-gateway.sharding-ring.auto-forget-unhealthy-periods` flag to 0 to disable the auto-forget feature. Deprecated since Mimir 2.17.

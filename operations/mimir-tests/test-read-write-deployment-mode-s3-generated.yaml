@@ -536,6 +536,7 @@ spec:
         - -querier.frontend-client.grpc-max-send-msg-size=104857600
         - -querier.max-concurrent=8
         - -querier.max-partial-query-length=768h
+        - -querier.store-gateway-client.grpc-max-recv-msg-size=209715200
         - -query-frontend.cache-results=true
         - -query-frontend.max-cache-freshness=10m
         - -query-frontend.max-total-query-length=12000h
@@ -563,10 +564,8 @@ spec:
         - -store-gateway.sharding-ring.zone-awareness-enabled=true
         - -target=read
         - -usage-stats.installation-mode=jsonnet
-        env:
-        - name: JAEGER_REPORTER_MAX_QUEUE_SIZE
-          value: "5000"
-        image: grafana/mimir:2.16.0
+        env: []
+        image: grafana/mimir:2.16.1
         imagePullPolicy: IfNotPresent
         name: mimir-read
         ports:
@@ -630,7 +629,7 @@ spec:
         - -kubernetes.namespace=default
         - -use-zone-tracker=true
         - -zone-tracker.config-map-name=rollout-operator-zone-tracker
-        image: grafana/rollout-operator:v0.26.0
+        image: grafana/rollout-operator:v0.28.0
         imagePullPolicy: IfNotPresent
         name: rollout-operator
         ports:
@@ -700,6 +699,12 @@ spec:
         ports:
         - containerPort: 9150
           name: http-metrics
+        resources:
+          limits:
+            memory: 250Mi
+          requests:
+            cpu: "0.05"
+            memory: 50Mi
   updateStrategy:
     type: RollingUpdate
 ---
@@ -753,6 +758,12 @@ spec:
         ports:
         - containerPort: 9150
           name: http-metrics
+        resources:
+          limits:
+            memory: 250Mi
+          requests:
+            cpu: "0.05"
+            memory: 50Mi
   updateStrategy:
     type: RollingUpdate
 ---
@@ -806,6 +817,12 @@ spec:
         ports:
         - containerPort: 9150
           name: http-metrics
+        resources:
+          limits:
+            memory: 250Mi
+          requests:
+            cpu: "0.05"
+            memory: 50Mi
   updateStrategy:
     type: RollingUpdate
 ---
@@ -859,6 +876,12 @@ spec:
         ports:
         - containerPort: 9150
           name: http-metrics
+        resources:
+          limits:
+            memory: 250Mi
+          requests:
+            cpu: "0.05"
+            memory: 50Mi
   updateStrategy:
     type: RollingUpdate
 ---
@@ -988,6 +1011,7 @@ spec:
         - -ruler.ring.store=memberlist
         - -ruler.rule-path=/rules
         - -runtime-config.file=/etc/mimir/overrides.yaml
+        - -server.grpc-max-send-msg-size-bytes=209715200
         - -server.grpc.keepalive.min-time-between-pings=10s
         - -server.grpc.keepalive.ping-without-stream-allowed=true
         - -server.http-idle-timeout=6m
@@ -1004,10 +1028,7 @@ spec:
         - -store-gateway.sharding-ring.zone-awareness-enabled=true
         - -target=backend
         - -usage-stats.installation-mode=jsonnet
-        env:
-        - name: JAEGER_REPORTER_MAX_QUEUE_SIZE
-          value: "1000"
-        image: grafana/mimir:2.16.0
+        image: grafana/mimir:2.16.1
         imagePullPolicy: IfNotPresent
         name: mimir-backend
         ports:
@@ -1182,6 +1203,7 @@ spec:
         - -ruler.ring.store=memberlist
         - -ruler.rule-path=/rules
         - -runtime-config.file=/etc/mimir/overrides.yaml
+        - -server.grpc-max-send-msg-size-bytes=209715200
         - -server.grpc.keepalive.min-time-between-pings=10s
         - -server.grpc.keepalive.ping-without-stream-allowed=true
         - -server.http-idle-timeout=6m
@@ -1198,10 +1220,7 @@ spec:
         - -store-gateway.sharding-ring.zone-awareness-enabled=true
         - -target=backend
         - -usage-stats.installation-mode=jsonnet
-        env:
-        - name: JAEGER_REPORTER_MAX_QUEUE_SIZE
-          value: "1000"
-        image: grafana/mimir:2.16.0
+        image: grafana/mimir:2.16.1
         imagePullPolicy: IfNotPresent
         name: mimir-backend
         ports:
@@ -1376,6 +1395,7 @@ spec:
         - -ruler.ring.store=memberlist
         - -ruler.rule-path=/rules
         - -runtime-config.file=/etc/mimir/overrides.yaml
+        - -server.grpc-max-send-msg-size-bytes=209715200
         - -server.grpc.keepalive.min-time-between-pings=10s
         - -server.grpc.keepalive.ping-without-stream-allowed=true
         - -server.http-idle-timeout=6m
@@ -1392,10 +1412,7 @@ spec:
         - -store-gateway.sharding-ring.zone-awareness-enabled=true
         - -target=backend
         - -usage-stats.installation-mode=jsonnet
-        env:
-        - name: JAEGER_REPORTER_MAX_QUEUE_SIZE
-          value: "1000"
-        image: grafana/mimir:2.16.0
+        image: grafana/mimir:2.16.1
         imagePullPolicy: IfNotPresent
         name: mimir-backend
         ports:
@@ -1517,6 +1534,7 @@ spec:
         - -ingester.ring.tokens-file-path=/data/tokens
         - -ingester.ring.unregister-on-shutdown=true
         - -ingester.ring.zone-awareness-enabled=true
+        - -memberlist.abort-if-fast-join-fails=true
         - -memberlist.bind-port=7946
         - -memberlist.join=dns+gossip-ring.default.svc.cluster.local.:7946
         - -runtime-config.file=/etc/mimir/overrides.yaml
@@ -1530,10 +1548,7 @@ spec:
         - -shutdown-delay=90s
         - -target=write
         - -usage-stats.installation-mode=jsonnet
-        env:
-        - name: JAEGER_REPORTER_MAX_QUEUE_SIZE
-          value: "1000"
-        image: grafana/mimir:2.16.0
+        image: grafana/mimir:2.16.1
         imagePullPolicy: IfNotPresent
         name: mimir-write
         ports:
@@ -1655,6 +1670,7 @@ spec:
         - -ingester.ring.tokens-file-path=/data/tokens
         - -ingester.ring.unregister-on-shutdown=true
         - -ingester.ring.zone-awareness-enabled=true
+        - -memberlist.abort-if-fast-join-fails=true
         - -memberlist.bind-port=7946
         - -memberlist.join=dns+gossip-ring.default.svc.cluster.local.:7946
         - -runtime-config.file=/etc/mimir/overrides.yaml
@@ -1668,10 +1684,7 @@ spec:
         - -shutdown-delay=90s
         - -target=write
         - -usage-stats.installation-mode=jsonnet
-        env:
-        - name: JAEGER_REPORTER_MAX_QUEUE_SIZE
-          value: "1000"
-        image: grafana/mimir:2.16.0
+        image: grafana/mimir:2.16.1
         imagePullPolicy: IfNotPresent
         name: mimir-write
         ports:
@@ -1793,6 +1806,7 @@ spec:
         - -ingester.ring.tokens-file-path=/data/tokens
         - -ingester.ring.unregister-on-shutdown=true
         - -ingester.ring.zone-awareness-enabled=true
+        - -memberlist.abort-if-fast-join-fails=true
         - -memberlist.bind-port=7946
         - -memberlist.join=dns+gossip-ring.default.svc.cluster.local.:7946
         - -runtime-config.file=/etc/mimir/overrides.yaml
@@ -1806,10 +1820,7 @@ spec:
         - -shutdown-delay=90s
         - -target=write
         - -usage-stats.installation-mode=jsonnet
-        env:
-        - name: JAEGER_REPORTER_MAX_QUEUE_SIZE
-          value: "1000"
-        image: grafana/mimir:2.16.0
+        image: grafana/mimir:2.16.1
         imagePullPolicy: IfNotPresent
         name: mimir-write
         ports:

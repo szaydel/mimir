@@ -45,10 +45,6 @@ func (g *CountGroupAggregationGroup) AccumulateSeries(data types.InstantVectorSe
 		if err != nil {
 			return err
 		}
-
-		if err != nil {
-			return err
-		}
 		g.values = g.values[:timeRange.StepCount]
 	}
 
@@ -91,6 +87,5 @@ func (g *CountGroupAggregationGroup) ComputeOutputSeries(_ types.ScalarData, tim
 }
 
 func (g *CountGroupAggregationGroup) Close(memoryConsumptionTracker *limiter.MemoryConsumptionTracker) {
-	types.Float64SlicePool.Put(g.values, memoryConsumptionTracker)
-	g.values = nil
+	types.Float64SlicePool.Put(&g.values, memoryConsumptionTracker)
 }

@@ -435,6 +435,11 @@ overrides_exporter:
     # CLI flag: -overrides-exporter.ring.wait-stability-max-duration
     [wait_stability_max_duration: <duration> | default = 5m]
 
+    # (advanced) Number of consecutive timeout periods an unhealthy instance in
+    # the ring is automatically removed after. Set to 0 to disable auto-forget.
+    # CLI flag: -overrides-exporter.ring.auto-forget-unhealthy-periods
+    [auto_forget_unhealthy_periods: <int> | default = 4]
+
   # Comma-separated list of metrics to include in the exporter. Allowed metric
   # names: ingestion_rate, ingestion_burst_size, ingestion_artificial_delay,
   # max_global_series_per_user, max_global_series_per_metric,
@@ -553,6 +558,10 @@ The `server` block configures the HTTP and gRPC server of the launched service(s
 # (advanced) Maximum number of simultaneous grpc connections, <=0 to disable
 # CLI flag: -server.grpc-conn-limit
 [grpc_listen_conn_limit: <int> | default = 0]
+
+# If true, the max streams by connection gauge will be collected.
+# CLI flag: -server.grpc-collect-max-streams-by-conn
+[grpc_collect_max_streams_by_conn: <boolean> | default = true]
 
 # (experimental) Enables PROXY protocol.
 # CLI flag: -server.proxy-protocol-enabled
@@ -757,6 +766,16 @@ grpc_tls_config:
 # CLI flag: -server.log-request-headers-exclude-list
 [log_request_exclude_headers_list: <string> | default = ""]
 
+# Optionally add request headers to tracing spans.
+# CLI flag: -server.trace-request-headers
+[trace_request_headers: <boolean> | default = false]
+
+# Comma separated list of headers to exclude from tracing spans. Only used if
+# server.trace-request-headers is true. The following headers are always
+# excluded: Authorization, Cookie, X-Csrf-Token.
+# CLI flag: -server.trace-request-headers-exclude-list
+[trace_request_exclude_headers_list: <string> | default = ""]
+
 # (advanced) Base path to serve all API routes from (e.g. /v1/)
 # CLI flag: -server.path-prefix
 [http_path_prefix: <string> | default = ""]
@@ -838,31 +857,14 @@ ha_tracker:
   # CLI flag: -distributor.ha-tracker.enable
   [enable_ha_tracker: <boolean> | default = false]
 
-  # (advanced) Update the timestamp in the KV store for a given cluster/replica
-  # only after this amount of time has passed since the current stored
-  # timestamp.
-  # CLI flag: -distributor.ha-tracker.update-timeout
-  [ha_tracker_update_timeout: <duration> | default = 15s]
-
-  # (advanced) Maximum jitter applied to the update timeout, in order to spread
-  # the HA heartbeats over time.
-  # CLI flag: -distributor.ha-tracker.update-timeout-jitter-max
-  [ha_tracker_update_timeout_jitter_max: <duration> | default = 5s]
-
-  # (advanced) If we don't receive any samples from the accepted replica for a
-  # cluster in this amount of time we will failover to the next replica we
-  # receive a sample from. This value must be greater than the update timeout
-  # CLI flag: -distributor.ha-tracker.failover-timeout
-  [ha_tracker_failover_timeout: <duration> | default = 30s]
-
   # Enable the elected_replica_status metric, which shows the current elected
   # replica. It is disabled by default due to the possible high cardinality of
   # the metric.
   # CLI flag: -distributor.ha-tracker.enable-elected-replica-metric
   [enable_elected_replica_metric: <boolean> | default = false]
 
-  # Backend storage to use for the ring. Note that memberlist support is
-  # experimental.
+  # Backend storage to use for the ring. Supported values are: consul, etcd,
+  # inmemory, memberlist, multi.
   kvstore:
     # Backend storage to use for the ring. Supported values are: consul, etcd,
     # inmemory, memberlist, multi.
@@ -899,6 +901,15 @@ ha_tracker:
       # (advanced) Timeout for storing value to secondary store.
       # CLI flag: -distributor.ha-tracker.multi.mirror-timeout
       [mirror_timeout: <duration> | default = 2s]
+
+  # (advanced) Deprecated. Use limits.ha_tracker_update_timeout.
+  [ha_tracker_update_timeout: <duration> | default = ]
+
+  # (advanced) Deprecated. Use limits.ha_tracker_update_timeout_jitter_max.
+  [ha_tracker_update_timeout_jitter_max: <duration> | default = ]
+
+  # (advanced) Deprecated. Use limits.ha_tracker_failover_timeout.
+  [ha_tracker_failover_timeout: <duration> | default = ]
 
 # (advanced) Max message size in bytes that the distributors will accept for
 # incoming push requests to the remote write API. If exceeded, the request will
@@ -987,6 +998,11 @@ ring:
   # (advanced) Enable using a IPv6 instance address. (default false)
   # CLI flag: -distributor.ring.instance-enable-ipv6
   [instance_enable_ipv6: <boolean> | default = false]
+
+  # (advanced) Number of consecutive timeout periods an unhealthy instance in
+  # the ring is automatically removed after. Set to 0 to disable auto-forget.
+  # CLI flag: -distributor.ring.auto-forget-unhealthy-periods
+  [auto_forget_unhealthy_periods: <int> | default = 10]
 
 instance_limits:
   # (advanced) Max ingestion rate (samples/sec) that this distributor will
@@ -1593,6 +1609,11 @@ The `querier` block configures the querier.
 # CLI flag: -querier.filter-queryables-enabled
 [filter_queryables_enabled: <boolean> | default = false]
 
+# (advanced) Maximum number of remote read queries that can be executed
+# concurrently. 0 or negative values mean unlimited concurrency.
+# CLI flag: -querier.max-concurrent-remote-read-queries
+[max_concurrent_remote_read_queries: <int> | default = 2]
+
 # The number of workers running in each querier process. This setting limits the
 # maximum number of concurrent queries in each querier. The minimum value is
 # four; lower values are ignored and set to the minimum
@@ -1623,14 +1644,15 @@ The `querier` block configures the querier.
 [lookback_delta: <duration> | default = 5m]
 
 mimir_query_engine:
-  # (experimental) Use query planner when evaluating queries.
-  # CLI flag: -querier.mimir-query-engine.use-query-planning
-  [use_query_planning: <boolean> | default = false]
-
   # (experimental) Enable common subexpression elimination when evaluating
-  # queries. Only applies if query planner is enabled.
+  # queries.
   # CLI flag: -querier.mimir-query-engine.enable-common-subexpression-elimination
   [enable_common_subexpression_elimination: <boolean> | default = true]
+
+  # (experimental) Enable skipping decoding native histograms when evaluating
+  # queries that do not require full histograms.
+  # CLI flag: -querier.mimir-query-engine.enable-skipping-histogram-decoding
+  [enable_skipping_histogram_decoding: <boolean> | default = true]
 ```
 
 ### frontend
@@ -1794,6 +1816,10 @@ results_cache:
 # CLI flag: -query-frontend.query-result-response-format
 [query_result_response_format: <string> | default = "protobuf"]
 
+# Cache statistics of processed samples on results cache.
+# CLI flag: -query-frontend.cache-samples-processed-stats
+[cache_samples_processed_stats: <boolean> | default = false]
+
 # (advanced) URL of downstream Prometheus.
 # CLI flag: -query-frontend.downstream-url
 [downstream_url: <string> | default = ""]
@@ -1802,6 +1828,16 @@ client_cluster_validation:
   # (experimental) Optionally define the cluster validation label.
   # CLI flag: -query-frontend.client-cluster-validation.label
   [label: <string> | default = ""]
+
+# (experimental) Query engine to use, either 'prometheus' or 'mimir'
+# CLI flag: -query-frontend.query-engine
+[query_engine: <string> | default = "prometheus"]
+
+# (experimental) If set to true and the Mimir query engine is in use, fall back
+# to using the Prometheus query engine for any queries not supported by the
+# Mimir query engine.
+# CLI flag: -query-frontend.enable-query-engine-fallback
+[enable_query_engine_fallback: <boolean> | default = true]
 ```
 
 ### query_scheduler
@@ -1886,6 +1922,11 @@ ring:
   # and queriers.
   # CLI flag: -query-scheduler.ring.heartbeat-timeout
   [heartbeat_timeout: <duration> | default = 1m]
+
+  # (advanced) Number of consecutive timeout periods an unhealthy instance in
+  # the ring is automatically removed after. Set to 0 to disable auto-forget.
+  # CLI flag: -query-scheduler.ring.auto-forget-unhealthy-periods
+  [auto_forget_unhealthy_periods: <int> | default = 10]
 
   # (advanced) Instance ID to register in the ring.
   # CLI flag: -query-scheduler.ring.instance-id
@@ -2127,6 +2168,11 @@ ring:
   # (advanced) Enable using a IPv6 instance address. (default false)
   # CLI flag: -ruler.ring.instance-enable-ipv6
   [instance_enable_ipv6: <boolean> | default = false]
+
+  # (advanced) Number of consecutive timeout periods an unhealthy instance in
+  # the ring is automatically removed after. Set to 0 to disable auto-forget.
+  # CLI flag: -ruler.ring.auto-forget-unhealthy-periods
+  [auto_forget_unhealthy_periods: <int> | default = 2]
 
   # (advanced) Number of tokens for each ruler.
   # CLI flag: -ruler.ring.num-tokens
@@ -2405,15 +2451,9 @@ sharding_ring:
 # CLI flag: -alertmanager.grafana-alertmanager-compatibility-enabled
 [grafana_alertmanager_compatibility_enabled: <boolean> | default = false]
 
-# (experimental) Skip starting the Alertmanager for tenants matching this suffix
-# unless they have a promoted, non-default Grafana Alertmanager configuration or
-# they are receiving requests.
-# CLI flag: -alertmanager.grafana-alertmanager-conditionally-skip-tenant-suffix
-[grafana_alertmanager_conditionally_skip_tenant_suffix: <string> | default = ""]
-
-# (experimental) Duration to wait before shutting down an idle Alertmanager for
-# a tenant that matches grafana-alertmanager-conditionally-skip-tenant-suffix
-# and is using an unpromoted or default configuration.
+# (experimental) Duration to wait before shutting down an idle Alertmanager
+# using an unpromoted or default configuration when strict initialization is
+# enabled.
 # CLI flag: -alertmanager.grafana-alertmanager-grace-period
 [grafana_alertmanager_idle_grace_period: <duration> | default = 5m]
 
@@ -3197,20 +3237,20 @@ The `memberlist` block configures the Gossip memberlist.
 
 # (advanced) Timeout used when connecting to other nodes to send packet.
 # CLI flag: -memberlist.packet-dial-timeout
-[packet_dial_timeout: <duration> | default = 2s]
+[packet_dial_timeout: <duration> | default = 500ms]
 
 # (advanced) Timeout for writing 'packet' data.
 # CLI flag: -memberlist.packet-write-timeout
-[packet_write_timeout: <duration> | default = 5s]
+[packet_write_timeout: <duration> | default = 500ms]
 
 # (advanced) Maximum number of concurrent writes to other nodes.
 # CLI flag: -memberlist.max-concurrent-writes
-[max_concurrent_writes: <int> | default = 3]
+[max_concurrent_writes: <int> | default = 5]
 
 # (advanced) Timeout for acquiring one of the concurrent write slots. After this
 # time, the message will be dropped.
 # CLI flag: -memberlist.acquire-writer-timeout
-[acquire_writer_timeout: <duration> | default = 250ms]
+[acquire_writer_timeout: <duration> | default = 1s]
 
 # (advanced) Enable TLS on the memberlist transport layer.
 # CLI flag: -memberlist.tls-enabled
@@ -3324,6 +3364,22 @@ The `limits` block configures default and per-tenant limits imposed by component
 # tenant. 0 to disable the limit.
 # CLI flag: -distributor.ha-tracker.max-clusters
 [ha_max_clusters: <int> | default = 100]
+
+# (advanced) Update the timestamp in the KV store for a given cluster/replica
+# only after this amount of time has passed since the current stored timestamp.
+# CLI flag: -distributor.ha-tracker.update-timeout
+[ha_tracker_update_timeout: <duration> | default = 15s]
+
+# (advanced) Maximum jitter applied to the update timeout, in order to spread
+# the HA heartbeats over time.
+# CLI flag: -distributor.ha-tracker.update-timeout-jitter-max
+[ha_tracker_update_timeout_jitter_max: <duration> | default = 5s]
+
+# (advanced) If we don't receive any samples from the accepted replica for a
+# cluster in this amount of time we will failover to the next replica we receive
+# a sample from. This value must be greater than the update timeout.
+# CLI flag: -distributor.ha-tracker.failover-timeout
+[ha_tracker_failover_timeout: <duration> | default = 30s]
 
 # (advanced) This flag can be used to specify label names that to drop during
 # sample ingestion within the distributor and can be repeated in order to drop
@@ -3659,6 +3715,12 @@ The `limits` block configures default and per-tenant limits imposed by component
 [max_query_expression_size_bytes: <int> | default = 0]
 
 # (experimental) List of queries to block.
+# Example:
+#   The following configuration blocks the query "rate(metric_counter[5m])".
+#   Setting the pattern to ".*" and regex to true blocks all queries.
+#   blocked_queries:
+#       - pattern: rate(metric_counter[5m])
+#         reason: because the query is misconfigured
 [blocked_queries: <list of pattern (string), regex (bool), and, optionally, reason (string)> | default = ]
 
 # (experimental) List of queries to limit and duration to limit them for.
@@ -3711,6 +3773,11 @@ The `limits` block configures default and per-tenant limits imposed by component
 # /api/v1/cardinality/label_values API call.
 # CLI flag: -querier.label-values-max-cardinality-label-names-per-request
 [label_values_max_cardinality_label_names_per_request: <int> | default = 100]
+
+# (experimental) Maximum number of series that can be requested in a single
+# cardinality API request.
+# CLI flag: -querier.cardinality-api-max-series-limit
+[cardinality_analysis_max_results: <int> | default = 500]
 
 # (experimental) Maximum size of an active series or active native histogram
 # series request result shard in bytes. 0 to disable.
@@ -3921,6 +3988,10 @@ ruler_alertmanager_client_config:
   # CLI flag: -ruler.alertmanager-client.proxy-url
   [proxy_url: <string> | default = ""]
 
+# (experimental) Minimum allowable evaluation interval for rule groups.
+# CLI flag: -ruler.min-rule-evaluation-interval
+[ruler_min_rule_evaluation_interval: <duration> | default = 0s]
+
 # The tenant's shard size, used when store-gateway sharding is enabled. Value of
 # 0 disables shuffle sharding for the tenant, that is all tenant blocks are
 # sharded across all store-gateway replicas.
@@ -4113,6 +4184,12 @@ ruler_alertmanager_client_config:
 # histograms with custom buckets.
 # CLI flag: -distributor.otel-convert-histograms-to-nhcb
 [otel_convert_histograms_to_nhcb: <boolean> | default = false]
+
+# (experimental) Whether to promote OTel scope metadata (scope name, version,
+# schema URL, attributes) to corresponding metric labels, prefixed with
+# otel_scope_.
+# CLI flag: -distributor.otel-promote-scope-metadata
+[otel_promote_scope_metadata: <boolean> | default = false]
 
 # (experimental) The default consistency level to enforce for queries when using
 # the ingest storage. Supports values: strong, eventual.
@@ -5036,6 +5113,11 @@ sharding_ring:
   # CLI flag: -compactor.ring.wait-active-instance-timeout
   [wait_active_instance_timeout: <duration> | default = 10m]
 
+  # (advanced) Number of consecutive timeout periods an unhealthy instance in
+  # the ring is automatically removed after. Set to 0 to disable auto-forget.
+  # CLI flag: -compactor.ring.auto-forget-unhealthy-periods
+  [auto_forget_unhealthy_periods: <int> | default = 10]
+
 # (advanced) The sorting to use when deciding which compaction jobs should run
 # first for a given tenant. Supported values are:
 # smallest-range-oldest-blocks-first, newest-blocks-first.
@@ -5108,6 +5190,21 @@ sharding_ring:
   # CLI flag: -store-gateway.sharding-ring.heartbeat-timeout
   [heartbeat_timeout: <duration> | default = 1m]
 
+  # (deprecated) When enabled, a store-gateway is automatically removed from the
+  # ring after failing to heartbeat the ring for a period longer than the
+  # configured -store-gateway.sharding-ring.auto-forget-unhealthy-periods times
+  # the configured -store-gateway.sharding-ring.heartbeat-timeout. This setting
+  # is deprecated. Set
+  # -store-gateway.sharding-ring.auto-forget-unhealthy-periods to 0 to disable
+  # auto-forget.
+  # CLI flag: -store-gateway.sharding-ring.auto-forget-enabled
+  [auto_forget_enabled: <boolean> | default = true]
+
+  # (advanced) Number of consecutive timeout periods an unhealthy instance in
+  # the ring is automatically removed after. Set to 0 to disable auto-forget.
+  # CLI flag: -store-gateway.sharding-ring.auto-forget-unhealthy-periods
+  [auto_forget_unhealthy_periods: <int> | default = 10]
+
   # (advanced) The replication factor to use when sharding blocks. This option
   # needs be set both on the store-gateway, querier and ruler when running in
   # microservices mode.
@@ -5128,12 +5225,6 @@ sharding_ring:
   # querier and ruler when running in microservices mode.
   # CLI flag: -store-gateway.sharding-ring.zone-awareness-enabled
   [zone_awareness_enabled: <boolean> | default = false]
-
-  # When enabled, a store-gateway is automatically removed from the ring after
-  # failing to heartbeat the ring for a period longer than 10 times the
-  # configured -store-gateway.sharding-ring.heartbeat-timeout.
-  # CLI flag: -store-gateway.sharding-ring.auto-forget-enabled
-  [auto_forget_enabled: <boolean> | default = true]
 
   # (advanced) Minimum time to wait for ring stability at startup, if set to
   # positive value.

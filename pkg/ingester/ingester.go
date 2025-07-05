@@ -194,7 +194,7 @@ type Config struct {
 	TSDBConfigUpdatePeriod time.Duration `yaml:"tsdb_config_update_period" category:"experimental"`
 
 	BlocksStorageConfig         mimir_tsdb.BlocksStorageConfig `yaml:"-"`
-	StreamChunksWhenUsingBlocks bool                           `yaml:"-" category:"advanced"`
+	StreamChunksWhenUsingBlocks bool                           `yaml:"-" category:"deprecated"`
 	// Runtime-override for type of streaming query to use (chunks or samples).
 	StreamTypeFn func() QueryStreamType `yaml:"-"`
 
@@ -338,6 +338,9 @@ type Ingester struct {
 
 	// Number of series in memory, across all tenants.
 	seriesCount atomic.Int64
+
+	// Tracks if a forced compaction is in progress
+	numCompactionsInProgress atomic.Uint32
 
 	// For storing metadata ingested.
 	usersMetadataMtx sync.RWMutex
@@ -1630,13 +1633,7 @@ func (i *Ingester) pushSamplesToAppender(userID string, timeseries []mimirpb.Pre
 				lastNativeHistogram := ts.Histograms[numNativeHistograms-1]
 				numFloats := len(ts.Samples)
 				if numFloats == 0 || ts.Samples[numFloats-1].TimestampMs < lastNativeHistogram.Timestamp {
-					numNativeHistogramBuckets = 0
-					for _, span := range lastNativeHistogram.PositiveSpans {
-						numNativeHistogramBuckets += int(span.Length)
-					}
-					for _, span := range lastNativeHistogram.NegativeSpans {
-						numNativeHistogramBuckets += int(span.Length)
-					}
+					numNativeHistogramBuckets = lastNativeHistogram.BucketCount()
 				}
 			}
 		}
@@ -2200,9 +2197,8 @@ const queryStreamBatchMessageSize = 1 * 1024 * 1024
 func (i *Ingester) QueryStream(req *client.QueryRequest, stream client.Ingester_QueryStreamServer) (err error) {
 	defer func() { err = i.mapReadErrorToErrorWithStatus(err) }()
 
-	spanlog, ctx := spanlogger.New(stream.Context(), i.logger, tracer, "Ingester.QueryStream")
-	defer spanlog.Finish()
-
+	ctx := stream.Context()
+	spanlog := spanlogger.FromContext(ctx, i.logger)
 	userID, err := tenant.TenantID(ctx)
 	if err != nil {
 		return err
@@ -3222,6 +3218,10 @@ func (i *Ingester) compactionServiceRunning(ctx context.Context) error {
 	for ctx.Err() == nil {
 		select {
 		case <-tickerChan:
+			// Prepare compaction before the periodic head compaction is triggered.
+			cleanup := i.prepareCompaction()
+			defer cleanup()
+
 			// The forcedCompactionMaxTime has no meaning because force=false.
 			i.compactBlocks(ctx, false, 0, nil)
 
@@ -3239,6 +3239,12 @@ func (i *Ingester) compactionServiceRunning(ctx context.Context) error {
 			}
 
 		case req := <-i.forceCompactTrigger:
+			// Note:
+			// Prepare compaction is not done here but before the force compaction is triggered.
+			// This is because we want to track the number of compactions accurately before the
+			// downscale handler is called. This ensures that the ingester will never leave the
+			// read-only state. (See [Ingester.FlushHandler])
+
 			// Always pass math.MaxInt64 as forcedCompactionMaxTime because we want to compact the whole TSDB head.
 			i.compactBlocks(ctx, true, math.MaxInt64, req.users)
 			close(req.callback) // Notify back.
@@ -3271,15 +3277,28 @@ func (i *Ingester) compactionServiceInterval() (firstInterval, standardInterval 
 	return
 }
 
+// prepareCompaction is incrementing the atomic counter of the number of compactions in progress.
+// It also exposes a metric tracking the number of compactions in progress.
+// It returns a callback that should be called when the compaction is finished, e.g. in defer statement.
+// This callback is decrementing the atomic counter of the number of compactions in progress.
+func (i *Ingester) prepareCompaction() func() {
+	// Increment the number of compactions in progress.
+	// This is used to ensure that the ingester will never leave the read-only state.
+	// (See [Ingester.PrepareInstanceRingDownscaleHandler])
+	i.numCompactionsInProgress.Inc()
+
+	// Expose a metric tracking whether there's a TSDB head compaction in progress.
+	// This metric can be used in alerts and when troubleshooting.
+	i.metrics.numCompactionsInProgress.Inc()
+
+	return func() {
+		i.numCompactionsInProgress.Dec()
+		i.metrics.numCompactionsInProgress.Dec()
+	}
+}
+
 // Compacts all compactable blocks. Force flag will force compaction even if head is not compactable yet.
 func (i *Ingester) compactBlocks(ctx context.Context, force bool, forcedCompactionMaxTime int64, allowed *util.AllowList) {
-	// Expose a metric tracking whether there's a forced head compaction in progress.
-	// This metric can be used in alerts and when troubleshooting.
-	if force {
-		i.metrics.forcedCompactionInProgress.Set(1)
-		defer i.metrics.forcedCompactionInProgress.Set(0)
-	}
-
 	_ = concurrency.ForEachUser(ctx, i.getTSDBUsers(), i.cfg.BlocksStorageConfig.TSDB.HeadCompactionConcurrency, func(_ context.Context, userID string) error {
 		if !allowed.IsAllowed(userID) {
 			return nil
@@ -3606,6 +3625,10 @@ func (i *Ingester) FlushHandler(w http.ResponseWriter, r *http.Request) {
 			level.Info(i.logger).Log("msg", "flushing TSDB blocks: ingester not running, ignoring flush request")
 			return
 		}
+
+		// Prepare compaction before the force compaction is triggered.
+		cleanup := i.prepareCompaction()
+		defer cleanup()
 
 		compactionCallbackCh := make(chan struct{})
 
