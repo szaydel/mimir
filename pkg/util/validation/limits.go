@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/grafana/dskit/flagext"
+	"github.com/grafana/dskit/tenant"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/otlptranslator"
 	"github.com/prometheus/prometheus/model/relabel"
@@ -307,7 +308,7 @@ type Limits struct {
 	AlertmanagerNotifyHookTimeout              model.Duration         `yaml:"alertmanager_notify_hook_timeout" json:"alertmanager_notify_hook_timeout"`
 
 	// OpenTelemetry
-	OTelMetricSuffixesEnabled                bool                         `yaml:"otel_metric_suffixes_enabled" json:"otel_metric_suffixes_enabled" category:"advanced"`
+	OTelMetricSuffixesEnabled                *bool                        `yaml:"otel_metric_suffixes_enabled" json:"otel_metric_suffixes_enabled" category:"advanced"`
 	OTelCreatedTimestampZeroIngestionEnabled bool                         `yaml:"otel_created_timestamp_zero_ingestion_enabled" json:"otel_created_timestamp_zero_ingestion_enabled" category:"experimental"`
 	PromoteOTelResourceAttributes            flagext.StringSliceCSV       `yaml:"promote_otel_resource_attributes" json:"promote_otel_resource_attributes" category:"experimental"`
 	OTelKeepIdentifyingResourceAttributes    bool                         `yaml:"otel_keep_identifying_resource_attributes" json:"otel_keep_identifying_resource_attributes" category:"experimental"`
@@ -365,7 +366,8 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 	f.Var(&l.CreationGracePeriod, CreationGracePeriodFlag, "Controls how far into the future incoming samples and exemplars are accepted compared to the wall clock. Any sample or exemplar will be rejected if its timestamp is greater than '(now + creation_grace_period)'. This configuration is enforced in the distributor and ingester.")
 	f.Var(&l.PastGracePeriod, PastGracePeriodFlag, "Controls how far into the past incoming samples and exemplars are accepted compared to the wall clock. Any sample or exemplar will be rejected if its timestamp is lower than '(now - OOO window - past_grace_period)'. This configuration is enforced in the distributor and ingester. 0 to disable.")
 	f.BoolVar(&l.EnforceMetadataMetricName, "validation.enforce-metadata-metric-name", true, "Enforce every metadata has a metric name.")
-	f.BoolVar(&l.OTelMetricSuffixesEnabled, "distributor.otel-metric-suffixes-enabled", false, "Whether to enable automatic suffixes to names of metrics ingested through OTLP.")
+	l.OTelMetricSuffixesEnabled = new(bool)
+	f.BoolVar(l.OTelMetricSuffixesEnabled, "distributor.otel-metric-suffixes-enabled", false, "Whether to enable automatic suffixes to names of metrics ingested through OTLP.")
 	f.BoolVar(&l.OTelCreatedTimestampZeroIngestionEnabled, "distributor.otel-created-timestamp-zero-ingestion-enabled", false, "Whether to enable translation of OTel start timestamps to Prometheus zero samples in the OTLP endpoint.")
 	f.Var(&l.PromoteOTelResourceAttributes, "distributor.otel-promote-resource-attributes", "Optionally specify OTel resource attributes to promote to labels.")
 	f.BoolVar(&l.OTelKeepIdentifyingResourceAttributes, "distributor.otel-keep-identifying-resource-attributes", false, "Whether to keep identifying OTel resource attributes in the target_info metric on top of converting to job and instance labels.")
@@ -563,6 +565,10 @@ func (l *Limits) unmarshal(decode func(any) error) error {
 
 		// Reset the merged custom active series trackers config, to not interfere with the default limits.
 		l.activeSeriesMergedCustomTrackersConfig = atomic.NewPointer[asmodel.CustomTrackersConfig](nil)
+
+		// Reset these params to be nil, since they are set during RegisterFlags.
+		l.OTelMetricSuffixesEnabled = nil
+		l.NameValidationScheme = model.UnsetValidation
 	}
 
 	// Decode into a reflection-crafted struct that has fields for the extensions.
@@ -600,15 +606,16 @@ func (l *Limits) MarshalYAML() (interface{}, error) {
 
 // Validate the Limits.
 func (l *Limits) Validate() error {
+	validationScheme := model.LegacyValidation
 	switch l.NameValidationScheme {
 	case model.UTF8Validation, model.LegacyValidation:
+		validationScheme = l.NameValidationScheme
 	case model.UnsetValidation:
-		l.NameValidationScheme = model.LegacyValidation
+		// Do nothing.
 	default:
 		return fmt.Errorf("unrecognized name validation scheme: %s", l.NameValidationScheme)
 	}
 
-	validationScheme := l.NameValidationScheme
 	switch otlptranslator.TranslationStrategyOption(l.OTelTranslationStrategy) {
 	case otlptranslator.UnderscoreEscapingWithoutSuffixes:
 		if validationScheme != model.LegacyValidation {
@@ -617,7 +624,7 @@ func (l *Limits) Validate() error {
 				l.OTelTranslationStrategy, model.LegacyValidation,
 			)
 		}
-		if l.OTelMetricSuffixesEnabled {
+		if l.OTelMetricSuffixesEnabled != nil && *l.OTelMetricSuffixesEnabled {
 			return fmt.Errorf("OTLP translation strategy %s is not allowed unless metric suffixes are disabled", l.OTelTranslationStrategy)
 		}
 	case otlptranslator.UnderscoreEscapingWithSuffixes:
@@ -627,7 +634,7 @@ func (l *Limits) Validate() error {
 				l.OTelTranslationStrategy, model.LegacyValidation,
 			)
 		}
-		if !l.OTelMetricSuffixesEnabled {
+		if l.OTelMetricSuffixesEnabled == nil || !*l.OTelMetricSuffixesEnabled {
 			return fmt.Errorf("OTLP translation strategy %s is not allowed unless metric suffixes are enabled", l.OTelTranslationStrategy)
 		}
 	case otlptranslator.NoUTF8EscapingWithSuffixes:
@@ -637,7 +644,7 @@ func (l *Limits) Validate() error {
 				l.OTelTranslationStrategy, model.UTF8Validation,
 			)
 		}
-		if !l.OTelMetricSuffixesEnabled {
+		if l.OTelMetricSuffixesEnabled == nil || !*l.OTelMetricSuffixesEnabled {
 			return fmt.Errorf("OTLP translation strategy %s is not allowed unless metric suffixes are enabled", l.OTelTranslationStrategy)
 		}
 	case otlptranslator.NoTranslation:
@@ -647,7 +654,7 @@ func (l *Limits) Validate() error {
 				l.OTelTranslationStrategy, model.UTF8Validation,
 			)
 		}
-		if l.OTelMetricSuffixesEnabled {
+		if l.OTelMetricSuffixesEnabled != nil && *l.OTelMetricSuffixesEnabled {
 			return fmt.Errorf("OTLP translation strategy %s is not allowed unless metric suffixes are disabled", l.OTelTranslationStrategy)
 		}
 	case "":
@@ -775,8 +782,8 @@ func (o *Overrides) RequestBurstSize(userID string) int {
 }
 
 // IngestionRate returns the limit on ingester rate (samples per second).
-func (o *Overrides) IngestionRate(userID string) float64 {
-	return o.getOverridesForUser(userID).IngestionRate
+func (o *Overrides) IngestionRate(limitsKey string) float64 {
+	return o.getOverridesForLimitsKey(limitsKey).IngestionRate
 }
 
 // LabelNamesAndValuesResultsMaxSizeBytes returns the maximum size in bytes of distinct label names and values
@@ -798,12 +805,12 @@ func (o *Overrides) LabelValuesMaxCardinalityLabelNamesPerRequest(userID string)
 }
 
 // IngestionBurstSize returns the burst size for ingestion rate.
-func (o *Overrides) IngestionBurstSize(userID string) int {
-	return o.getOverridesForUser(userID).IngestionBurstSize
+func (o *Overrides) IngestionBurstSize(limitsKey string) int {
+	return o.getOverridesForLimitsKey(limitsKey).IngestionBurstSize
 }
 
-func (o *Overrides) IngestionBurstFactor(userID string) float64 {
-	burstFactor := o.getOverridesForUser(userID).IngestionBurstFactor
+func (o *Overrides) IngestionBurstFactor(limitsKey string) float64 {
+	burstFactor := o.getOverridesForLimitsKey(limitsKey).IngestionBurstFactor
 	if burstFactor < 1 {
 		return 0
 	}
@@ -896,8 +903,8 @@ func (o *Overrides) PastGracePeriod(userID string) time.Duration {
 // And for tenants without overrides it's just:
 // - Default MaxActiveSeriesPerUser
 // - Default MaxGlobalSeriesPerUser
-func (o *Overrides) MaxActiveOrGlobalSeriesPerUser(userID string) int {
-	overrides := o.getOverridesForUser(userID)
+func (o *Overrides) MaxActiveOrGlobalSeriesPerUser(limitsKey string) int {
+	overrides := o.getOverridesForLimitsKey(limitsKey)
 	if maxActive := overrides.MaxActiveSeriesPerUser; maxActive > 0 {
 		return maxActive
 	}
@@ -1529,8 +1536,13 @@ func (o *Overrides) Prom2RangeCompat(userID string) bool {
 	return o.getOverridesForUser(userID).Prom2RangeCompat
 }
 
-func (o *Overrides) OTelMetricSuffixesEnabled(tenantID string) bool {
-	return o.getOverridesForUser(tenantID).OTelMetricSuffixesEnabled
+func (o *Overrides) OTelMetricSuffixesEnabled(limitsKey string) bool {
+	v := o.getOverridesForLimitsKey(limitsKey).OTelMetricSuffixesEnabled
+	if v != nil {
+		return *v
+	}
+	v = o.defaultLimits.OTelMetricSuffixesEnabled
+	return v != nil && *v
 }
 
 func (o *Overrides) OTelCreatedTimestampZeroIngestionEnabled(tenantID string) bool {
@@ -1557,15 +1569,15 @@ func (o *Overrides) OTelNativeDeltaIngestion(tenantID string) bool {
 	return o.getOverridesForUser(tenantID).OTelNativeDeltaIngestion
 }
 
-func (o *Overrides) OTelTranslationStrategy(tenantID string) otlptranslator.TranslationStrategyOption {
-	strategy := otlptranslator.TranslationStrategyOption(o.getOverridesForUser(tenantID).OTelTranslationStrategy)
+func (o *Overrides) OTelTranslationStrategy(limitsKey string) otlptranslator.TranslationStrategyOption {
+	strategy := otlptranslator.TranslationStrategyOption(o.getOverridesForLimitsKey(limitsKey).OTelTranslationStrategy)
 	if strategy != "" {
 		return strategy
 	}
 
 	// Generate translation strategy based on other settings.
-	suffixesEnabled := o.OTelMetricSuffixesEnabled(tenantID)
-	switch scheme := o.NameValidationScheme(tenantID); scheme {
+	suffixesEnabled := o.OTelMetricSuffixesEnabled(limitsKey)
+	switch scheme := o.NameValidationScheme(limitsKey); scheme {
 	case model.LegacyValidation:
 		if suffixesEnabled {
 			strategy = otlptranslator.UnderscoreEscapingWithSuffixes
@@ -1641,8 +1653,15 @@ func (o *Overrides) LabelsQueryOptimizerEnabled(userID string) bool {
 }
 
 // NameValidationScheme returns the name validation scheme to use for a particular tenant.
-func (o *Overrides) NameValidationScheme(userID string) model.ValidationScheme {
-	return o.getOverridesForUser(userID).NameValidationScheme
+func (o *Overrides) NameValidationScheme(limitsKey string) model.ValidationScheme {
+	scheme := o.getOverridesForLimitsKey(limitsKey).NameValidationScheme
+	if scheme != model.UnsetValidation {
+		return scheme
+	}
+	if s := o.defaultLimits.NameValidationScheme; s != model.UnsetValidation {
+		return s
+	}
+	return model.LegacyValidation
 }
 
 // CardinalityAnalysisMaxResults returns the maximum number of results that
@@ -1652,6 +1671,7 @@ func (o *Overrides) CardinalityAnalysisMaxResults(userID string) int {
 }
 
 func (o *Overrides) getOverridesForUser(userID string) *Limits {
+	userID = tenant.TrimMetadata(userID)
 	if o.tenantLimits != nil {
 		l := o.tenantLimits.ByUserID(userID)
 		if l != nil {
@@ -1659,6 +1679,73 @@ func (o *Overrides) getOverridesForUser(userID string) *Limits {
 		}
 	}
 	return o.defaultLimits
+}
+
+func (o *Overrides) getOverridesForLimitsKey(limitsKey string) *Limits {
+	limits := o.getOverridesForUser(limitsKey)
+	if o.tenantLimits == nil {
+		return limits
+	}
+	userID, tenantMd, err := tenant.ParseWithMetadata(limitsKey)
+	if err != nil {
+		return limits
+	}
+	if userID == limitsKey {
+		return limits
+	}
+
+	// The limitsKey includes metadata. Iterate KV pairs and merge limits.
+	dst := copyLimits(o.getOverridesForUser(userID))
+	tmpMd := tenant.NewMetadata()
+	for key, val := range tenantMd.Iter() {
+		tmpMd.Set(key, val)
+		full := tmpMd.WithTenant(userID)
+		suffix := full[len(userID):]
+		dst = mergeLimits(dst, o.tenantLimits.ByUserID(suffix))
+		dst = mergeLimits(dst, o.tenantLimits.ByUserID(full))
+		tmpMd.Remove(key)
+	}
+	dst = mergeLimits(dst, o.tenantLimits.ByUserID(limitsKey))
+	return dst
+}
+
+// mergeLimits merges overlay into dst in place. If dst is nil, a copy of
+// overlay is returned. Only non-zero fields from overlay are applied.
+func mergeLimits(dst, overlay *Limits) *Limits {
+	if overlay == nil {
+		return dst
+	}
+	if dst == nil {
+		return copyLimits(overlay)
+	}
+	if overlay.MaxActiveSeriesPerUser > 0 {
+		dst.MaxActiveSeriesPerUser = overlay.MaxActiveSeriesPerUser
+	}
+	if overlay.IngestionRate > 0 {
+		dst.IngestionRate = overlay.IngestionRate
+	}
+	if overlay.IngestionBurstSize > 0 {
+		dst.IngestionBurstSize = overlay.IngestionBurstSize
+	}
+	if overlay.IngestionBurstFactor > 0 {
+		dst.IngestionBurstFactor = overlay.IngestionBurstFactor
+	}
+	if overlay.OTelMetricSuffixesEnabled != nil {
+		v := *overlay.OTelMetricSuffixesEnabled
+		dst.OTelMetricSuffixesEnabled = &v
+	}
+	if overlay.NameValidationScheme != model.UnsetValidation {
+		dst.NameValidationScheme = overlay.NameValidationScheme
+	}
+	if overlay.OTelTranslationStrategy != "" {
+		dst.OTelTranslationStrategy = overlay.OTelTranslationStrategy
+	}
+	return dst
+}
+
+func copyLimits(l *Limits) *Limits {
+	cp := *l
+	return &cp
 }
 
 // AllTrueBooleansPerTenant returns true only if limit func is true for all given tenants
