@@ -372,6 +372,7 @@
 * [BUGFIX] Distributor: Fix type error in multi-zone distributor container constructor's env map. #14403
 * [BUGFIX] Native histograms: Fix PromQL query example for `histogram_fraction` to filter NaN results when there are no observations. #14433
 * [BUGFIX] OTLP: Exponential histograms over OTLP are not experimental. #14437
+* [ENHANCEMENT] Kafka: Document that Apache Kafka and Confluent Kafka require `message.max.bytes=16000000` to support Mimir's default producer record size. #14875
 
 ### Tools
 
