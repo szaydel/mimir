@@ -23,8 +23,6 @@ import (
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunks"
-	"github.com/thanos-io/objstore"
-	"github.com/thanos-io/objstore/providers/filesystem"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/grafana/mimir/pkg/mimirpb"
@@ -441,7 +439,7 @@ func (b *TSDBBuilder) CompactAndUpload(ctx context.Context, uploadBlocks blockUp
 			}
 
 			if b.cfg.GenerateSparseIndexHeaders {
-				if err := b.buildSparseIndexHeaders(ctx, dbDir, localMetas); err != nil {
+				if err := b.buildSparseIndexHeaders(dbDir, localMetas); err != nil {
 					return err
 				}
 			}
@@ -544,9 +542,9 @@ func (u *userTSDB) compactBlocks(ctx context.Context) error {
 }
 
 // buildSparseIndexHeaders builds sparse index-headers for all blocks in the metas list in the directory.
-func (b *TSDBBuilder) buildSparseIndexHeaders(ctx context.Context, dbDir string, metas []tsdb.BlockMeta) error {
+func (b *TSDBBuilder) buildSparseIndexHeaders(dbDir string, metas []tsdb.BlockMeta) error {
 	for _, m := range metas {
-		if err := b.buildSparseIndexHeader(ctx, dbDir, m.ULID); err != nil {
+		if err := b.buildSparseIndexHeader(dbDir, m.ULID); err != nil {
 			return err
 		}
 	}
@@ -554,29 +552,17 @@ func (b *TSDBBuilder) buildSparseIndexHeaders(ctx context.Context, dbDir string,
 }
 
 // prepareSparseIndexHeader builds a sparse index-header for a single block.
-func (b *TSDBBuilder) buildSparseIndexHeader(ctx context.Context, dbDir string, id ulid.ULID) error {
-	// Indexheader code uses a bucket client to read;
-	// construct local-filesystem-backed bucket to read from disk.
-	fsBkt, err := filesystem.NewBucket(dbDir)
-	if err != nil {
-		return err
-	}
-	fsInstrBkt := objstore.WithNoopInstr(fsBkt)
+func (b *TSDBBuilder) buildSparseIndexHeader(dbDir string, blockID ulid.ULID) (err error) {
+	ll := log.With(b.logger, "id", blockID)
+	start := time.Now()
 
-	// Calling NewStreamBinaryReader reads a block's index and writes a sparse-index-header to disk.
-	metrics := indexheader.NewStreamBinaryReaderMetrics(nil)
-	logger := log.With(b.logger, "id", id)
-	br, err := indexheader.NewStreamBinaryReader(
-		ctx,
-		logger,
-		fsInstrBkt,
-		dbDir,
-		id,
-		b.cfg.BlocksStorage.BucketStore.PostingOffsetsInMemSampling,
-		metrics,
-		b.cfg.BlocksStorage.BucketStore.IndexHeader)
-	if err != nil {
-		return err
+	if err := indexheader.BuildAndWriteSparseHeaderFromTSDBIndex(
+		blockID, dbDir, b.cfg.BlocksStorage.BucketStore.PostingOffsetsInMemSampling, ll); err != nil {
+		return fmt.Errorf("failed to build and write to disk in protobuf format: %w", err)
 	}
-	return br.Close()
+
+	level.Info(ll).Log("msg", "built and wrote sparse index-header to disk in protobuf format",
+		"elapsed", time.Since(start),
+	)
+	return nil
 }
