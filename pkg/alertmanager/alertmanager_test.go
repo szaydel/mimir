@@ -15,7 +15,6 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/grafana/alerting/definition"
-	alertingReceivers "github.com/grafana/alerting/receivers"
 	alertingTemplates "github.com/grafana/alerting/templates"
 	"github.com/grafana/dskit/concurrency"
 	"github.com/grafana/dskit/test"
@@ -94,8 +93,7 @@ route:
 	cfg, err := definition.LoadCompat([]byte(cfgRaw))
 	require.NoError(t, err)
 	tmpls := make([]alertingTemplates.TemplateDefinition, 0)
-	var emailCfg alertingReceivers.EmailSenderConfig
-	require.NoError(t, am.ApplyConfig(cfg, tmpls, cfgRaw, &url.URL{}, emailCfg, false))
+	require.NoError(t, am.ApplyConfig(cfg, tmpls, cfgRaw))
 
 	now := time.Now()
 
@@ -180,8 +178,7 @@ route:
 	cfg, err := definition.LoadCompat([]byte(cfgRaw))
 	require.NoError(t, err)
 	tmpls := make([]alertingTemplates.TemplateDefinition, 0)
-	var emailCfg alertingReceivers.EmailSenderConfig
-	require.NoError(t, am.ApplyConfig(cfg, tmpls, cfgRaw, &url.URL{}, emailCfg, false))
+	require.NoError(t, am.ApplyConfig(cfg, tmpls, cfgRaw))
 
 	now := time.Now()
 	inputAlerts := []*types.Alert{
