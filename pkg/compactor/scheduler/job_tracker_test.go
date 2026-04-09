@@ -272,12 +272,49 @@ func TestJobTracker_ByteTracking(t *testing.T) {
 	assertTrackerBytes(t, reg, "merge job complete", 0, 0)
 }
 
+func TestJobTracker_PlanJobTracking(t *testing.T) {
+	clk := clock.NewMock()
+	clk.Set(at(3, 0))
+	jt, reg := newTestJobTracker(clk)
+
+	assertIncompletePlanJobs := func(label string, expected int) {
+		t.Helper()
+		require.NoError(t, prom_testutil.GatherAndCompare(reg, strings.NewReader(fmt.Sprintf(`
+			# HELP cortex_compactor_incomplete_plan_jobs The total number of plan jobs that have not yet completed (pending or active).
+			# TYPE cortex_compactor_incomplete_plan_jobs gauge
+			cortex_compactor_incomplete_plan_jobs %d
+		`, expected)), "cortex_compactor_incomplete_plan_jobs"), label)
+	}
+
+	assertIncompletePlanJobs("no plan jobs yet", 0)
+
+	_, err := jt.Maintenance(time.Minute, false, true, time.Hour, 0)
+	require.NoError(t, err)
+	assertIncompletePlanJobs("plan job pending", 1)
+
+	leaseResp, _, err := jt.Lease()
+	require.NoError(t, err)
+	require.Equal(t, planJobId, leaseResp.Key.Id)
+	assertIncompletePlanJobs("plan job active (still incomplete)", 1)
+
+	canceled, _, err := jt.CancelLease(leaseResp.Key.Id, leaseResp.Key.Epoch)
+	require.NoError(t, err)
+	require.True(t, canceled)
+	assertIncompletePlanJobs("plan job revived to pending (unchanged)", 1)
+
+	leaseResp, _, err = jt.Lease()
+	require.NoError(t, err)
+	_, _, err = jt.Remove(leaseResp.Key.Id, leaseResp.Key.Epoch, true)
+	require.NoError(t, err)
+	assertIncompletePlanJobs("plan job complete", 0)
+}
+
 func TestJobTracker_Cleanup(t *testing.T) {
 	clk := clock.NewMock()
 	reg := prometheus.NewPedanticRegistry()
 	sm := newSchedulerMetrics(reg)
 
-	// Two tenants share the same incompleteJobsBytes gauge
+	// Two tenants share the same incompleteJobsBytes and incompletePlanJobs gauges.
 	jt1 := NewJobTracker(&NopJobPersister{}, "tenant1", clk, infiniteLeases, infiniteLeases, sm.newTrackerMetricsForTenant("tenant1"), log.NewNopLogger())
 	jt2 := NewJobTracker(&NopJobPersister{}, "tenant2", clk, infiniteLeases, infiniteLeases, sm.newTrackerMetricsForTenant("tenant2"), log.NewNopLogger())
 
@@ -289,15 +326,32 @@ func TestJobTracker_Cleanup(t *testing.T) {
 	}, nil)
 	assertTrackerBytes(t, reg, "both tenants contributing before cleanup", 100, 200)
 
-	// Cleaning up tenant1 should only subtract its bytes, not zero the shared gauge
+	// Set time past the first planning window to force planning on Maintenance()
+	clk.Set(at(3, 0))
+	_, err := jt1.Maintenance(time.Minute, false, true, time.Hour, 0)
+	require.NoError(t, err)
+	_, err = jt2.Maintenance(time.Minute, false, true, time.Hour, 0)
+	require.NoError(t, err)
+
+	require.NoError(t, prom_testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP cortex_compactor_incomplete_plan_jobs The total number of plan jobs that have not yet completed (pending or active).
+		# TYPE cortex_compactor_incomplete_plan_jobs gauge
+		cortex_compactor_incomplete_plan_jobs 2
+	`), "cortex_compactor_incomplete_plan_jobs"), "both tenants have a pending plan job")
+
+	// Cleaning up tenant1 should only subtract its contribution, not zero the shared gauges.
 	jt1.CleanupMetrics()
 	assertTrackerBytes(t, reg, "only tenant1 bytes removed", 0, 200)
 	require.NoError(t, prom_testutil.GatherAndCompare(reg, strings.NewReader(`
 		# HELP cortex_compactor_scheduler_pending_jobs The number of queued pending jobs.
 		# TYPE cortex_compactor_scheduler_pending_jobs gauge
-		cortex_compactor_scheduler_pending_jobs{job_type="compaction",user="tenant2"} 1
-		cortex_compactor_scheduler_pending_jobs{job_type="plan",user="tenant2"} 0
+		cortex_compactor_scheduler_pending_jobs{user="tenant2"} 2
 	`), "cortex_compactor_scheduler_pending_jobs"), "only tenant2 pending jobs remain")
+	require.NoError(t, prom_testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP cortex_compactor_incomplete_plan_jobs The total number of plan jobs that have not yet completed (pending or active).
+		# TYPE cortex_compactor_incomplete_plan_jobs gauge
+		cortex_compactor_incomplete_plan_jobs 1
+	`), "cortex_compactor_incomplete_plan_jobs"), "only tenant2 plan job remains")
 }
 
 func TestJobTracker_CancelLease_PlanJobAlwaysRevives(t *testing.T) {
