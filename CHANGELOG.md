@@ -187,6 +187,7 @@
 * [ENHANCEMENT] Distributor: OTLP endpoint now returns partial success (HTTP 200) instead of HTTP 429 when the usage tracker rejects some series due to the active series limit but other series are successfully ingested. The `RejectedDataPoints` field reports the count of distributor-side rejections (usage tracker filtering). #14789
 * [ENHANCEMENT] MQE: Account for memory consumption of labels returned by binary operations in query memory consumption estimate earlier. #15033
 * [ENHANCEMENT] Query-frontend: Log the number of series and samples returned for queries in `query stats` log lines. #15044
+* [ENHANCEMENT] Querier and query-frontend: When remote execution is enabled, send series metadata in batches, rather than in a single large message. The batch size can be configured with `-query-frontend.remote-execution-series-metadata-batch-size`. #15047
 * [ENHANCEMENT] Ingest storage: Update the default configuration to enable ingest storage concurrency: #15072
   * `-ingest-storage.kafka.fetch-concurrency-max` from `0` to `12`
   * `-ingest-storage.kafka.ingestion-concurrency-max` from `0` to `8`
