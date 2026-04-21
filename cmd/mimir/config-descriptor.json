@@ -6077,7 +6077,7 @@
                 "kind": "field",
                 "name": "pattern",
                 "required": false,
-                "desc": "PromQL expression pattern to match.",
+                "desc": "PromQL expression pattern to match. Rules without a pattern are a configuration error.",
                 "fieldValue": null,
                 "fieldDefaultValue": "",
                 "fieldType": "string"
@@ -6086,7 +6086,7 @@
                 "kind": "field",
                 "name": "regex",
                 "required": false,
-                "desc": "If true, the pattern is treated as a regular expression. If false, the pattern is treated as a literal match.",
+                "desc": "If true, the pattern is treated as a regular expression; an invalid regular expression is a configuration error. If false, the pattern is treated as a literal match.",
                 "fieldValue": null,
                 "fieldDefaultValue": false,
                 "fieldType": "boolean"
