@@ -40,7 +40,6 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
-	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/scrape"
 	"github.com/prometheus/prometheus/storage"
 	"go.opentelemetry.io/otel"
@@ -141,7 +140,9 @@ type Distributor struct {
 
 	costAttributionMgr *costattribution.Manager
 	// For handling HA replicas.
-	HATracker haTracker
+	HATracker  haTracker
+	perRequest *perRequestDedupe
+	perSample  *perSampleDedupe
 
 	// Per-user rate limiters.
 	requestRateLimiter   *limiter.RateLimiter
@@ -749,6 +750,22 @@ func New(cfg Config, clientConfig ingester_client.Config, limits *validation.Ove
 	d.distributorsLifecycler = distributorsLifecycler
 	d.distributorsRing = distributorsRing
 	d.HATracker = haTrackerImpl
+	d.perRequest = &perRequestDedupe{
+		limits:                            limits,
+		haTracker:                         haTrackerImpl,
+		dedupedSamples:                    d.dedupedSamples,
+		nonHASamples:                      d.nonHASamples,
+		discardedSamplesTooManyHaClusters: d.discardedSamplesTooManyHaClusters,
+		costAttributionMgr:                costAttributionMgr,
+	}
+	d.perSample = &perSampleDedupe{
+		limits:                            limits,
+		haTracker:                         haTrackerImpl,
+		dedupedSamples:                    d.dedupedSamples,
+		nonHASamples:                      d.nonHASamples,
+		discardedSamplesTooManyHaClusters: d.discardedSamplesTooManyHaClusters,
+		costAttributionMgr:                costAttributionMgr,
+	}
 
 	d.activeUsers = util.NewActiveUsersCleanupWithDefaultValues(d.cleanupInactiveUser)
 	d.activeGroups = activeGroupsCleanupService
@@ -942,34 +959,6 @@ func (d *Distributor) RemoveGroupMetricsForUser(userID, group string) {
 // Called after distributor is asked to stop via StopAsync.
 func (d *Distributor) stopping(_ error) error {
 	return services.StopManagerAndAwaitStopped(context.Background(), d.subservices)
-}
-
-// Returns a boolean that indicates whether or not we want to remove the replica label going forward,
-// and an error that indicates whether we want to accept samples based on the cluster/replica found in ts.
-// nil for the error means accept the sample.
-func (d *Distributor) checkSample(ctx context.Context, userID, cluster, replica string, ts int64) (removeReplicaLabel bool, _ error) {
-	// If the sample doesn't have either HA label, accept it.
-	// At the moment we want to accept these samples by default.
-	if cluster == "" || replica == "" {
-		return false, nil
-	}
-
-	// If replica label is too long, don't use it. We accept the sample here, but it will fail validation later anyway.
-	if len(replica) > d.limits.MaxLabelValueLength(userID) {
-		return false, nil
-	}
-
-	// At this point we know we have both HA labels, we should lookup
-	// the cluster/instance here to see if we want to accept this sample.
-	// Convert the timestamp to a time.Time for checking the replica
-	sampleTime := timestamp.Time(ts)
-	err := d.HATracker.checkReplica(ctx, userID, cluster, replica, time.Now(), sampleTime)
-	// checkReplica would have returned an error if there was a real error talking to Consul,
-	// or if the replica is not the currently elected replica.
-	if err != nil { // Don't accept the sample.
-		return false, err
-	}
-	return true, nil
 }
 
 // validateSamples validates samples of a single timeseries and removes the ones with duplicated timestamps.
@@ -1173,90 +1162,6 @@ func (d *Distributor) wrapPushWithMiddlewares(next PushFunc) PushFunc {
 	// The delay middleware must take into account total runtime of all other middlewares and the push func, hence why we wrap all others.
 	return d.outerMaybeDelayMiddleware(next)
 
-}
-
-func (d *Distributor) prePushHaDedupeMiddleware(next PushFunc) PushFunc {
-	return WithCleanup(next, func(next PushFunc, ctx context.Context, pushReq *Request) error {
-		req, err := pushReq.WriteRequest()
-		if err != nil {
-			return err
-		}
-
-		userID, err := tenant.TenantID(ctx)
-		if err != nil {
-			return err
-		}
-
-		if len(req.Timeseries) == 0 || !d.limits.AcceptHASamples(userID) {
-			return next(ctx, pushReq)
-		}
-
-		haReplicaLabel := d.limits.HAReplicaLabel(userID)
-		cluster, replica := findHALabels(haReplicaLabel, d.limits.HAClusterLabel(userID), req.Timeseries[0].Labels)
-		// Make a copy of these, since they may be retained as labels on our metrics, e.g. dedupedSamples.
-		cluster, replica = strings.Clone(cluster), strings.Clone(replica)
-
-		span := trace.SpanFromContext(ctx)
-		span.SetAttributes(
-			attribute.String("cluster", cluster),
-			attribute.String("replica", replica),
-		)
-
-		numSamples := 0
-		now := time.Now()
-		group := d.activeGroups.UpdateActiveGroupTimestamp(userID, validation.GroupLabel(d.limits, userID, req.Timeseries), now)
-		sampleTimestamp := timestamp.FromTime(now)
-		if d.limits.HATrackerUseSampleTimeForFailover(userID) {
-			earliestSampleTimestamp := sampleTimestamp
-			for _, ts := range req.Timeseries {
-				if len(ts.Samples) > 0 {
-					tsms := ts.Samples[0].TimestampMs
-					if tsms < earliestSampleTimestamp {
-						earliestSampleTimestamp = tsms
-					}
-				}
-				if len(ts.Histograms) > 0 {
-					tsms := ts.Histograms[0].Timestamp
-					if tsms < earliestSampleTimestamp {
-						earliestSampleTimestamp = tsms
-					}
-				}
-			}
-			sampleTimestamp = earliestSampleTimestamp
-		}
-		for _, ts := range req.Timeseries {
-			numSamples += len(ts.Samples) + len(ts.Histograms)
-		}
-
-		removeReplica, err := d.checkSample(ctx, userID, cluster, replica, sampleTimestamp)
-		if err != nil {
-			if errors.As(err, &replicasDidNotMatchError{}) {
-				// These samples have been deduped.
-				d.dedupedSamples.WithLabelValues(userID, cluster).Add(float64(numSamples))
-			}
-
-			if errors.As(err, &tooManyClustersError{}) {
-				d.discardedSamplesTooManyHaClusters.WithLabelValues(userID, group).Add(float64(numSamples))
-				d.costAttributionMgr.SampleTracker(userID).IncrementDiscardedSamples(req.Timeseries[0].Labels, float64(numSamples), reasonTooManyHAClusters, now)
-			}
-
-			return err
-		}
-
-		if removeReplica {
-			// If we found both the cluster and replica labels, we only want to include the cluster label when
-			// storing series in Mimir. If we kept the replica label we would end up with another series for the same
-			// series we're trying to dedupe when HA tracking moves over to a different replica.
-			for ix := range req.Timeseries {
-				req.Timeseries[ix].RemoveLabel(haReplicaLabel)
-			}
-		} else {
-			// If there wasn't an error but removeReplica is false that means we didn't find both HA labels.
-			d.nonHASamples.WithLabelValues(userID).Add(float64(numSamples))
-		}
-
-		return next(ctx, pushReq)
-	})
 }
 
 func (d *Distributor) prePushRelabelMiddleware(next PushFunc) PushFunc {
