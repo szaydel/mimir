@@ -5,6 +5,7 @@ package commonsubexpressionelimination
 import (
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -119,11 +120,11 @@ func MaterializeDuplicate(d *Duplicate, materializer *planning.Materializer, tim
 	switch inner := inner.(type) {
 	case types.InstantVectorOperator:
 		return &InstantVectorDuplicationConsumerOperatorFactory{
-			Buffer: NewInstantVectorDuplicationBuffer(inner, params.MemoryConsumptionTracker),
+			Buffer: NewInstantVectorDuplicationBuffer(inner, params.MemoryConsumptionTracker, timeRange, params.Logger),
 		}, nil
 	case types.RangeVectorOperator:
 		return &RangeVectorDuplicationConsumerOperatorFactory{
-			Buffer: NewRangeVectorDuplicationBuffer(inner, params.MemoryConsumptionTracker),
+			Buffer: NewRangeVectorDuplicationBuffer(inner, params.MemoryConsumptionTracker, timeRange, params.Logger),
 		}, nil
 	default:
 		return nil, fmt.Errorf("expected InstantVectorOperator or RangeVectorOperator as child of Duplicate, got %T", inner)
@@ -212,6 +213,9 @@ func (f *DuplicateFilter) Describe() string {
 	builder := &strings.Builder{}
 	core.FormatMatchers(builder, f.Filters)
 
+	builder.WriteString(", subset index: ")
+	builder.WriteString(strconv.FormatInt(f.SubsetIndex, 10))
+
 	return builder.String()
 }
 
@@ -255,11 +259,11 @@ func MaterializeDuplicateFilter(f *DuplicateFilter, materializer *planning.Mater
 		return nil, err
 	}
 
-	filterable.SetFilters(filters)
+	filterable.SetFilters(filters, int(f.SubsetIndex))
 
 	return planning.NewSingleUseOperatorFactory(operator), nil
 }
 
 type Filterable interface {
-	SetFilters(filters []*labels.Matcher)
+	SetFilters(filters []*labels.Matcher, subsetIndex int)
 }
